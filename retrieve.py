@@ -25,8 +25,7 @@ def get_embed_memmap(memmap_dir, dim):
 
 
 def allrank(args):
-    doc_embedding_memmap, doc_id_memmap = get_embed_memmap(
-        args.doc_embedding_dir, args.embedding_dim)
+    doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
     assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))
 
     query_embedding_memmap, query_id_memmap = get_embed_memmap(

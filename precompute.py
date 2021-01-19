@@ -8,34 +8,35 @@ import numpy as np
 from tqdm import tqdm
 from timeit import default_timer as timer
 from collections import namedtuple, defaultdict
-from transformers import BertTokenizer, BertConfig
+from transformers import BertTokenizer, BertConfig, RobertaTokenizer
 from torch.utils.data import DataLoader, Dataset
-from dataset import (load_querydoc_pairs, load_queries, CollectionDataset, pack_tensor_2D, MSMARCODataset)
+from dataset import load_queries, CollectionDataset, pack_tensor_2D
 from modeling import RepBERT
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(format = '%(asctime)s-%(levelname)s-%(name)s- %(message)s',
-                        datefmt = '%d %H:%M:%S',
-                        level = logging.INFO)
+logging.basicConfig(format='%(asctime)s-%(levelname)s-%(name)s- %(message)s',
+                    datefmt='%d %H:%M:%S',
+                    level=logging.INFO)
 
 
-def create_embed_memmap(ids, memmap_dir, dim):
+def create_embed_memmap(ids, memmap_dir, dim, file_prefix=''):
+
     if not os.path.exists(memmap_dir):
         os.makedirs(memmap_dir)
-    embedding_path = f"{memmap_dir}/embedding.memmap"
-    id_path = f"{memmap_dir}/ids.memmap"
-    embed_open_mode = "r+" if os.path.exists(embedding_path) else "w+"
-    id_open_mode = "r+" if  os.path.exists(id_path) else "w+"
-    logger.warning(f"Open Mode: embedding-{embed_open_mode} ids-{id_open_mode}")
 
-    embedding_memmap = np.memmap(embedding_path, dtype='float32', 
-        mode=embed_open_mode, shape=(len(ids), dim))
-    id_memmap = np.memmap(id_path, dtype='int32', 
-        mode=id_open_mode, shape=(len(ids),))
-    id_memmap[:] = ids
-    # not writable
-    id_memmap = np.memmap(id_path, dtype='int32', 
-        shape=(len(ids),))
+    embedding_path = os.path.join(memmap_dir, file_prefix + "embedding.memmap")
+    id_path = os.path.join(memmap_dir, file_prefix + "ids.memmap")
+    embed_open_mode = "r+" if os.path.exists(embedding_path) else "w+"  # 'w+' will initialize with 0s
+    id_open_mode = "r+" if os.path.exists(id_path) else "w+"
+    logger.warning(f"Open Mode: doc embeddings: {embed_open_mode}, ids: {id_open_mode}")
+
+    embedding_memmap = np.memmap(embedding_path, dtype='float32', mode=embed_open_mode, shape=(len(ids), dim))
+    id_memmap = np.memmap(id_path, dtype='int32', mode=id_open_mode, shape=(len(ids),))
+    id_memmap[:] = ids[:]
+    # # not writable
+    # id_memmap = np.memmap(id_path, dtype='int32', shape=(len(ids),))  # TODO: Why do this again?
+    id_memmap.flush()
+
     return embedding_memmap, id_memmap
 
 
@@ -50,7 +51,7 @@ class MSMARCO_QueryDataset(Dataset):
         self.sep_id = tokenizer.sep_token_id
         self.all_ids = self.qids
 
-    def __len__(self):  
+    def __len__(self):
         return len(self.qids)
 
     def __getitem__(self, item):
@@ -60,12 +61,15 @@ class MSMARCO_QueryDataset(Dataset):
         query_input_ids = [self.cls_id] + query_input_ids + [self.sep_id]
         ret_val = {
             "input_ids": query_input_ids,
-            "id" : qid
+            "id": qid
         }
         return ret_val
 
 
 class MSMARCO_DocDataset(Dataset):
+    """The difference from CollectionDataset is that it adds special tokens.
+    It can also further limit max sequence length"""
+
     def __init__(self, collection_memmap_dir, max_doc_length):
         self.max_doc_length = max_doc_length
         self.collection = CollectionDataset(collection_memmap_dir)
@@ -75,7 +79,7 @@ class MSMARCO_DocDataset(Dataset):
         self.sep_id = tokenizer.sep_token_id
         self.all_ids = self.collection.pids
 
-    def __len__(self):  
+    def __len__(self):
         return len(self.pids)
 
     def __getitem__(self, item):
@@ -86,7 +90,7 @@ class MSMARCO_DocDataset(Dataset):
 
         ret_val = {
             "input_ids": doc_input_ids,
-            "id" : pid
+            "id": pid
         }
         return ret_val
 
@@ -94,39 +98,37 @@ class MSMARCO_DocDataset(Dataset):
 def get_collate_function():
     def collate_function(batch):
         input_ids_lst = [x["input_ids"] for x in batch]
-        valid_mask_lst = [[1]*len(input_ids) for input_ids in input_ids_lst]
+        valid_mask_lst = [[1] * len(input_ids) for input_ids in input_ids_lst]
         data = {
-            "input_ids": pack_tensor_2D(input_ids_lst, default=0, 
-                dtype=torch.int64),
-            "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, 
-                dtype=torch.int64),
+            "input_ids": pack_tensor_2D(input_ids_lst, default=0, dtype=torch.int64),
+            "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
         }
         id_lst = [x['id'] for x in batch]
         return data, id_lst
-    return collate_function  
+
+    return collate_function
 
 
 def generate_embeddings(args, model, task):
     if task == "doc":
         dataset = MSMARCO_DocDataset(args.collection_memmap_dir, args.max_doc_length)
         memmap_dir = args.doc_embedding_dir
-    else: 
+    else:
         query_str, mode = task.split("_")
         assert query_str == "query"
         dataset = MSMARCO_QueryDataset(args.tokenize_dir, args.msmarco_dir, mode, args.max_query_length)
         memmap_dir = args.query_embedding_dir
-    embedding_memmap, ids_memmap = create_embed_memmap(
-        dataset.all_ids, memmap_dir, model.config.hidden_size)
-    id2pos = {identity:i for i, identity in enumerate(ids_memmap)}
-    
+    embedding_memmap, ids_memmap = create_embed_memmap(dataset.all_ids, memmap_dir, model.config.hidden_size)
+    id2pos = {identity: i for i, identity in enumerate(ids_memmap)}
+
     batch_size = args.per_gpu_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
+    # Note that DistributedSampler samples randomly  # TODO: So what?
     collate_fn = get_collate_function()
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)  # TODO: Why not more workers?
 
     # multi-gpu eval
     if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model)  # automatically splits the batch into chunks for each process/GPU
     # Eval!
     logger.info("  Num examples = %d", len(dataset))
     logger.info("  Batch size = %d", batch_size)
@@ -135,13 +137,13 @@ def generate_embeddings(args, model, task):
     for batch, ids in tqdm(dataloader, desc="Evaluating"):
         model.eval()
         with torch.no_grad():
-            batch = {k:v.to(args.device) for k, v in batch.items()}
+            batch = {k: v.to(args.device) for k, v in batch.items()}
             output = model(**batch)
             sequence_embeddings = output.detach().cpu().numpy()
-            poses = [id2pos[identity] for identity in ids]
-            embedding_memmap[poses] = sequence_embeddings
+            positions = [id2pos[identity] for identity in ids]
+            embedding_memmap[positions] = sequence_embeddings
     end = timer()
-    print(task, "time:", end-start)
+    print(task, "time:", end - start)
 
 
 if __name__ == "__main__":
@@ -149,12 +151,17 @@ if __name__ == "__main__":
     ## Required parameters
     parser.add_argument("--load_model_path", type=str, required=True)
     parser.add_argument("--task", choices=["query_dev.small", "query_eval.small", "doc"],
-        required=True)
+                        required=True)
     parser.add_argument("--output_dir", type=str, default="./data/precompute")
 
     parser.add_argument("--msmarco_dir", type=str, default=f"./data/msmarco-passage")
     parser.add_argument("--collection_memmap_dir", type=str, default="./data/collection_memmap")
     parser.add_argument("--tokenize_dir", type=str, default="./data/tokenize")
+    parser.add_argument("--tokenizer_type", type=str, choices=['bert', 'roberta'], default='bert',
+                        help="""Type of tokenizer for the model component used for encoding queries (and passages)""")
+    parser.add_argument("--tokenizer_from", type=str, default=None,
+                        help="""A path of a directory containing a saved custom tokenizer (vocabulary and added tokens).
+                        It is optional and used together with `tokenizer_type`.""")
     parser.add_argument("--max_query_length", type=int, default=20)
     parser.add_argument("--max_doc_length", type=int, default=256)
     parser.add_argument("--per_gpu_batch_size", default=100, type=int)
@@ -184,6 +191,3 @@ if __name__ == "__main__":
 
     logger.info(args)
     generate_embeddings(args, model, args.task)
-
-
-    

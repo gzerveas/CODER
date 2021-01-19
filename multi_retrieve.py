@@ -26,8 +26,7 @@ def raise_immediately(func):
 
 @raise_immediately
 def writer(args, finish_queue_lst):
-    _, query_id_memmap = get_embed_memmap(
-        args.query_embedding_dir, args.embedding_dim)
+    _, query_id_memmap = get_embed_memmap(args.query_embedding_dir, args.embedding_dim)
     with open(args.output_path, 'w') as outFile:
         for qid in query_id_memmap:
             score_docid_lst = []
@@ -65,8 +64,9 @@ def allrank(gpu_queue, doc_begin_index, doc_end_index, finish_queue):
         query_embedding = query_embedding_memmap[qid2pos[qid]]
         query_embedding = torch.from_numpy(query_embedding)
         query_embedding = query_embedding.to(device)
-    
-        all_scores = torch.sum(query_embedding * doc_embeddings, dim=-1)
+
+        # TODO(GEO): insane that this works...
+        all_scores = torch.sum(query_embedding * doc_embeddings, dim=-1)  # equivalent to matmul(query_embedding, doc_embeddings.T)
         
         k = min(args.hit, len(doc_embeddings))
         top_scores, top_indices = torch.topk(all_scores, k, largest=True, sorted=True)
@@ -75,7 +75,7 @@ def allrank(gpu_queue, doc_begin_index, doc_end_index, finish_queue):
         cur_q_queue = results_dict[qid]
         for score, docid in zip(top_scores, top_doc_ids):
             score, docid = score.item(), docid.item()
-            if cur_q_queue.full():
+            if cur_q_queue.full():  # TODO(GEO): I don't get this. if it's full, it must be that the size of the queue == k == args.hits
                 lowest_score, lowest_docid = cur_q_queue.get_nowait()
                 if lowest_score >= score:
                     cur_q_queue.put_nowait((lowest_score, lowest_docid))
@@ -109,28 +109,27 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    doc_size = len(get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)[1])
+    num_docs = len(get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)[1])
     if args.per_gpu_doc_num is None:
-        args.per_gpu_doc_num = math.ceil(doc_size / len(args.gpus))
+        args.per_gpu_doc_num = math.ceil(num_docs / len(args.gpus))
 
-    num_rounds = math.ceil(doc_size / args.per_gpu_doc_num)
+    num_rounds = math.ceil(num_docs / args.per_gpu_doc_num)  # this is roughly the number of GPUs
     doc_arguments = []
     for i in range(num_rounds):
-        doc_begin_index = int(doc_size *  i / num_rounds)
-        doc_end_index = int(doc_size * (i+1) / num_rounds)
+        doc_begin_index = int(num_docs * i / num_rounds)
+        doc_end_index = int(num_docs * (i + 1) / num_rounds)
         doc_arguments.append((doc_begin_index, doc_end_index))
 
     manager = Manager()
     finished_queue_lst = [manager.Queue() for _ in range(num_rounds)]
-    gpu_queue = manager.Queue()
+    gpu_queue = manager.Queue()  # used to share GPU IDs
     for gpu in args.gpus:
         gpu_queue.put_nowait(gpu)
 
     pool = Pool(num_rounds+1)
     start = timer()
     for finish_queue, (doc_begin_index, doc_end_index) in zip(finished_queue_lst, doc_arguments):
-        pool.apply_async(allrank, 
-            args=(gpu_queue, doc_begin_index, doc_end_index, finish_queue))
+        pool.apply_async(allrank, args=(gpu_queue, doc_begin_index, doc_end_index, finish_queue))
     pool.apply_async(writer, args=(args, finished_queue_lst))
     pool.close()
     pool.join()
