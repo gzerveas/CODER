@@ -42,7 +42,7 @@ class RepBERT_Train(BertPreTrainedModel):
     """
     Instead of bi-encoder, a single encoder is used, and token_type_ids with attention masking is applied to separate
     query self-attention and doc self-attention. There is no query-doc token interaction in self-attention calculations.
-    Depending on HF BERT implementation, this may be inefficient: attention masks typically are just added, instead
+    Based on HF BERT implementation, this may be inefficient: attention masks (apparently) are just added, instead
     of preventing computations altogether. This means that the full O(seq_len^2) cost is there, and is therefore worse
     than O(query_len^2) + O(doc_len^2). Some minor benefit comes from avoiding separate padding for query.
     """
@@ -51,9 +51,20 @@ class RepBERT_Train(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.init_weights()
 
-    def forward(self, input_ids, token_type_ids, valid_mask,
-                position_ids, labels=None):
-        # labels: (batch_size, batch_size) padded (with -1) tensor of relevant doc in-batch (local) indices
+    def forward(self, input_ids, token_type_ids, valid_mask, position_ids, labels=None):
+        """
+        :param input_ids:
+        :param token_type_ids:
+        :param valid_mask: (batch_size, batch_seq_length)
+        :param position_ids:
+        :param labels: (batch_size, batch_size) padded (with -1) tensor of relevant doc in-batch (local) indices
+        :return: Tuple[(  loss,
+                        (batch_size, batch_size) tensor of similarities between each query in the batch and
+                            each document in the batch
+                        (batch_size, hidden_size) tensor of averaged query token embeddings
+                        (batch_size, hidden_size) tensor of averaged document token embeddings
+                        )]
+        """
         attention_mask = _mask_both_directions(valid_mask, token_type_ids)  # (batch_size, seq_len, seq_len), 1-use, 0-mask
 
         # (batch_size, sequence_length, hidden_size)
@@ -88,7 +99,7 @@ def _average_sequence_embeddings(sequence_output, valid_mask):
 
 class RepBERT(BertPreTrainedModel):
     """
-    Takes a single type of input (either query or doc)
+    Takes a single type of input (either query or doc) and returns embedding
     """
     def __init__(self, config):
         super(RepBERT, self).__init__(config)
