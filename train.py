@@ -152,11 +152,11 @@ def train(args, model, val_dataloader):
     utils.set_seed(args)  # Added here for reproducibility
     for epoch_idx, _ in enumerate(epoch_iterator):
         batch_iterator = tqdm(train_dataloader, desc="Batch")
-        for step, (batch, _, _) in enumerate(batch_iterator):
+        for step, (model_inp, _, _) in enumerate(batch_iterator):
 
-            batch = {k: v.to(args.device) for k, v in batch.items()}
+            model_inp = {k: v.to(args.device) for k, v in model_inp.items()}
             model.train()
-            outputs = model(**batch)
+            outputs = model(**model_inp)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
             if args.n_gpu > 1:
@@ -184,7 +184,6 @@ def train(args, model, val_dataloader):
                 if args.save_steps > 0 and global_step % args.save_steps == 0:
                     # Save model checkpoint
                     utils.save_model(args.model_save_dir, global_step, model, optimizer, scheduler)
-                    # utils.save_HF_model_and_args(model, args.model_save_dir, 'ckpt-{}'.format(global_step), args)
 
 
 def evaluate(args, model, dataloader, mode, prefix):
@@ -231,7 +230,7 @@ def main():
 
     # Initialize model
     if args.model_type == 'repbert':
-        # keep configuration setup like RepBERT. The model is a common BERT query-document encoder, without interactions
+        # keep configuration setup like RepBERT. The model is a common/shared BERT query-document encoder, without interactions
         # between query and document token representations
         load_model_path = "bert-base-uncased" if args.load_model_path is None else args.load_model_path
         # Works with either directory path containing HF config file, or JSON HF config file,  or pre-defined model string

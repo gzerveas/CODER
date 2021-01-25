@@ -1,12 +1,14 @@
 import math
 import logging
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 
 import numpy as np
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from transformers.modeling_bert import BertModel, BertPreTrainedModel, RobertaModel
+
+from dataset import assemble_3D_tensors
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +128,30 @@ class RepBERT(BertPreTrainedModel):
         return text_embeddings
 
 
+class CrossAttentionScorer(nn.Module):
+    """
+    Exploits decoder cross-attention between encoded query states and documents.
+    The decoder creates its Queries from the layer below it, and takes the Keys and Values from the output of the encoder
+    TODO: What is the effect of LayerNormalization? Doesn't it flatten the scores distribution?
+    TODO: consider modifying the final cross-attention layer, to allow interactions between decoder's Values
+    """
+
+    def __init__(self, d_model):
+        super(CrossAttentionScorer, self).__init__()
+
+        self.linear = nn.Linear(d_model, 1)
+
+    def forward(self, output_emb, query_emb=None):
+        """
+        :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
+        :param query_emb: not used
+        :return: (batch_size, num_docs) relevance scores in [0, 1]
+        """
+
+        return F.sigmoid(self.linear(output_emb))
+
+
+
 class MDSTransformer(nn.Module):
     r"""Multiple Document Scoring Transformer. By default, consists of a Roberta query enconder (Huggingface implementation),
     and a "decoder" using self-attention over a sequence (set) of document representations and cross-attention over
@@ -152,10 +178,11 @@ class MDSTransformer(nn.Module):
         >>> model = MDSTransformer(custom_encoder=my_HF_encoder, nhead=16, num_decoder_layers=4)
     """
 
-    def __init__(self, encoder_config=None, d_model: int = 512, num_heads: int = 8,
+    def __init__(self, encoder_config=None, d_model: int = 768, num_heads: int = 8,
                  num_decoder_layers: int = 6, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: str = "relu", positional_encoding=None,
-                 custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None) -> None:
+                 custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
+                 scoring_mode=None, loss_type=None) -> None:
         super(MDSTransformer, self).__init__()
 
         if custom_encoder is not None:
@@ -174,54 +201,94 @@ class MDSTransformer(nn.Module):
         self.num_heads = num_heads
 
         self.query_dim = self.encoder.config.hidden_size  # e.g. 768 for BERT-base
-        if self.query_dim != self.d_model:  # project query representation vectors to match dimensionality of doc embeddings
+
+        # project query representation vectors to match dimensionality of doc embeddings (for cross-attention)
+        if self.query_dim != self.d_model:
             self.project_query = nn.Linear(self.query_dim, self.d_model)
+
+        self.score_docs = self.get_scoring_module(scoring_mode)
+
+        self.loss_func = self.get_loss_func(loss_type)
 
         # Without any init call, weight parameters are initialized as by default when creating torch layers (Kaiming uniform)
         # self._reset_parameters()
 
-    def forward(self, query_token_ids: Tensor, doc_emb: Tensor, query_mask: Optional[Tensor] = None,
-                doc_attention_mat_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None, src_key_padding_mask: Optional[Tensor] = None,
-                doc_padding_mask: Optional[Tensor] = None) -> Tensor:
-        r"""Take in and process masked source/target sequences.
+    def get_scoring_module(self, scoring_mode):
 
-        Args:
-            query_token_ids: (batch_size, query_length) padded sequence of token IDs fed to the encoder
-            doc_emb: (num_docs, batch_size, doc_emb_size) sequence of document embeddings fed to the decoder
-            query_mask: (batch_size, query_length) attention mask for query tokens. 0 means ignore, non-0 means use
-            doc_attention_mat_mask: (num_docs, num_docs) float additive mask for the decoder sequence (optional).
-                This is for causality and is directly added on top of the attention matrix
-            doc_padding_mask: (batch_size, num_docs) boolean/ByteTensor mask in case the number of input documents
-                is less than the max. doc. pool size, i.e. decoder sequence length (optional).
+        if scoring_mode == 'cross_attention':
+            return CrossAttentionScorer(self.d_model)
+
+    def get_loss_func(self, loss_type):
+        return nn.MultiLabelMarginLoss()
+
+    def forward(self, query_token_ids: Tensor, query_mask: Tensor = None, doc_emb: Tensor = None,
+                docinds: Tensor = None, local_emb_mat: Tensor = None, doc_padding_mask: Tensor = None,
+                doc_attention_mat_mask: Tensor = None, labels: Tensor = None) -> Tensor:
+        r"""
+        num_docs is the number of candidate docs per query and corresponds to the length of the padded "decoder" sequence
+        :param  query_token_ids: (batch_size, max_query_len) tensor of padded sequence of token IDs fed to the encoder
+        :param  query_mask: (batch_size, query_length) attention mask bool tensor for query tokens; 0 ignore, non-0 use
+        :param  doc_emb: (batch_size, num_docs, doc_emb_dim) sequence of document embeddings fed to the "decoder".
+                    Mutually exclusive with `docinds`.
+        :param  docinds: (batch_size, num_docs) tensor of local indices of documents corresponding to rows of the
+                    `local_emb_mat` used to lookup document vectors in nn.Embedding. Mutually exclusive with `doc_emb`.
+        :param  local_emb_mat: (num_unique_docIDs, doc_emb_dim) tensor of local doc embedding matrix containing emb. vectors
+                    of all unique documents in the batch.  Used with `docinds` to lookup document vectors in nn.Embedding on the GPU.
+                    This is done to avoid replicating embedding vectors of in-batch negatives, thus sparing GPU bandwidth.
+                    Global matrix cannot be used, because the collection size is in the order of 10M: GPU memory!
+        :param  doc_padding_mask: (batch_size, num_docs) boolean/ByteTensor mask with 0 at positions of missing input
+                    documents (decoder sequence length is less than the max. doc. pool size in the batch)
+        :param  doc_attention_mat_mask: (num_docs, num_docs) float additive mask for the decoder sequence (optional).
+                    This is for causality and is directly added on top of the attention matrix
+        :param  labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices of the
+                relevant documents within its corresponding pool of candidates (docinds).
 
         :returns:
             out_doc_emb: (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
-        Examples:
-            >>> output = transformer_model(query_token_ids, doc_emb, src_mask=src_mask, tgt_mask=doc_attention_mat_mask)
         """
 
-        if query_token_ids.size(1) != doc_emb.size(1):
-            raise RuntimeError("the batch number of src and tgt must be equal")
+        if 'doc_emb' is None:  # happens only in training, when additionally there is in-batch negative sampling
+            doc_emb = self.lookup_doc_emb(docinds, local_emb_mat)  # (batch_size, max_docs_per_query, doc_emb_dim)
+        # permute because pytorch convention for transformers is [seq_length, batch_size, feat_dim]
+        doc_emb = doc_emb.permute(1, 0, 2)  # (max_docs_per_query, batch_size, doc_emb_dim) document embeddings
 
-        if query_token_ids.size(2) != self.d_model or doc_emb.size(2) != self.d_model:
-            raise RuntimeError("the feature number of src and tgt must be equal to d_model")
+        if query_token_ids.size(0) != doc_emb.size(1):
+            raise RuntimeError("the batch size for queries and documents must be equal")
 
-        enc_hidden_states = self.encoder(query_token_ids, attention_mask=query_mask)
+        enc_hidden_states = self.encoder(query_token_ids.to(torch.int64), attention_mask=query_mask)  # int64 required by torch nn.Embedding
         if self.query_dim != self.d_model:  # project query representation vectors to match dimensionality of doc embeddings
             enc_hidden_states = self.project_query(enc_hidden_states)
 
         # The nn.MultiHeadAttention expects ByteTensor or Boolean and uses the convention that non-0 is ignored
         # and 0 is used in attention, which is the opposite of HuggingFace.
         memory_key_padding_mask = ~(query_mask.bool())
-        output = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,
+
+        # (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
+        output_emb = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,
                               tgt_key_padding_mask=doc_padding_mask,
                               memory_key_padding_mask=memory_key_padding_mask)
-        return output
+        # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
+        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
+
+        rel_scores = self.score_docs(output_emb)  # (batch_size, num_docs) relevance scores in [0, 1]
+
+        if labels is not None:
+            loss = self.loss_func(rel_scores, labels)  # scalar
+            return loss, rel_scores
+        return rel_scores
+
+    def lookup_doc_emb(self, docinds, local_emb_mat):
+        """
+        Lookup document vectors in `local_emb_mat` corresponding to rows given in `docinds`.
+        This is done to avoid replicating embedding vectors of in-batch negatives, thus sparing GPU bandwidth.
+        Global matrix cannot be used, because the collection size is in the order of 10M: GPU memory!
+        """
+        embedding = torch.nn.Embedding.from_pretrained(local_emb_mat, freeze=True, padding_idx=local_emb_mat.shape[0]-1)
+        return embedding(docinds.to(torch.int64))
 
     def generate_square_subsequent_mask(self, sz: int) -> Tensor:
         r"""Generate a square mask for the sequence. The masked positions are filled with float('-inf').
-            Unmasked positions are filled with float(0.0).
+            Unmasked positions are filled with 0.
         """
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
