@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 BERT_BASE_DIM = 768
 
 
+# only used by RepBERT
 class CollectionDataset:
     """Document / passage collection"""
 
@@ -42,14 +43,14 @@ class CollectionDataset:
 class EmbeddedCollection:
     """Document / passage collection in the form of document embedding memmap"""
 
-    def __init__(self, embedding_memmap_dir, emb_dim=None, sorted=False):
+    def __init__(self, embedding_memmap_dir, emb_dim=None, sorted_nat_ids=False):
         """
         :param embedding_memmap_dir: directory containing memmap file of precomputed document embeddings, and the
             corresponding passage/doc IDs in another memmpap file
         :param emb_dim: dimensionality of document vectors. If None, `embedding_memmap_dir` will be used to infer it,
             and in case this is not possible, the default value BERT_BASE_DIM will be used
-        :param sorted: whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1, and
-            doc embeddings are stored exactly in that order (is True  for MSMARCO passage collection)
+        :param sorted_nat_ids: whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1, and
+            doc embeddings are stored exactly in that order (is True for MSMARCO passage collection). A bit more efficient.
         """
 
         if emb_dim is None:
@@ -66,7 +67,7 @@ class EmbeddedCollection:
 
         pids = np.memmap(os.path.join(embedding_memmap_dir, "pids.memmap"), mode='r', dtype='int32')
 
-        self.sorted = sorted  # whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1
+        self.sorted_nat_ids = sorted_nat_ids  # whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1
         self.pid2ind = None  # no mapping dictionary in case sorted == True
         self.map_pid_to_ind = self.get_pid_to_ind_mapping(pids)  # pID-to-matrix_index mapping function
 
@@ -77,7 +78,7 @@ class EmbeddedCollection:
 
     def get_pid_to_ind_mapping(self, pids):
         """Returns function used to map a list of passage IDs to the corresponding integer indices of the embedding matrix"""
-        if self.sorted:
+        if self.sorted_nat_ids:
             assert np.array_equal(pids, np.array(range(len(pids)), dtype=int))  # TODO: REMOVE as soon as verified
             return lambda x: x
         else:
@@ -103,12 +104,13 @@ def load_query_tokenids(query_tokenids_path):
     """
     queries = dict()
     with open(query_tokenids_path) as f:
-        for line in tqdm(f, desc="queries"):
+        for line in tqdm(f, desc="Queries"):
             data = json.loads(line)
             queries[int(data['id'])] = data['ids']  # already tokenized and numerized!
     return queries
 
 
+# only used by RepBERT
 def load_querydoc_pairs(msmarco_dir, mode):
     """
     Has 2 separate modes with very different behavior
@@ -165,7 +167,7 @@ def load_qrels(filepath):
     return qrels
 
 
-# Not used currently
+# Not used currently, load_candidates_pandas is used instead
 def load_candidates(path_to_candidates):
     """
     Load candidate (retrieved) documents/passages from a file.
@@ -206,38 +208,57 @@ def load_candidates_pandas(path_to_candidates):
     return candidates_df.iloc[:, 0]  # select only 1st column (pIDs), ignoring ranking and scores
 
 
-# Flow
-# From top1000 results file, 1a) make a precomputed (num_queries, topN) mmap of qid -> topN pids
-# or 1b) read qid -> topN pids dict into memory
-# 2) precompute (num_docs, doc_emb_dim) memmap "doc_emb"
 class MYMARCO_Dataset(Dataset):
+    """
+    Used for passages (the terms passage/document used interchangeably in the documentation).
+    Only considers queries existing in file of retrieved candidate passages for each query!
+    Requires:
+        1. memmap array of doc embeddings and an accompanying memmap array of doc/passage IDs, precomputed by
+            precompute.py *on the entire collection of passages*.
+        2. JSON file of {int qid: tokenized and numerized query} pairs, produced by convert_text_to_tokenized.py
+        3. text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini
+            (This is output usually submitted to TREC)
+        4. qrels file of ground truth relevant passages (if used for training or validation)
+    """
     def __init__(self, mode,
                  embedding_memmap_dir, queries_tokenids_path, candidates_path, qrels_path=None,
-                 tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None):
+                 tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
+                 limit_size=None):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
-            embeddings and an accompanying (num_docs_in_collection,) memmap array of doc IDs
-        :param queries_tokenids_path: path to JSON file of {int qid: tokenized and numerized query} pairs
+            embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs
+        :param queries_tokenids_path: path to dir or JSON file of {int qid: tokenized and numerized query} pairs
         :param candidates_path: file of candidate (retrieved) documents/passages per query, in the format of
             "qID1 \t pID1\n qID1 \t pID2\n ...". Only 1st column (pIDs) is used, rest are ignored.
-        :param qrels_path: path to file of ground truth relevant passages in the following format:
+        :param qrels_path: dir or path to file of ground truth relevant passages in the following format:
             "qID1 \t Q0 \t pID1 \t 1\n qID1 \t Q0 \t pID2 \t 1\n ..."
         :param tokenizer: HuggingFace Tokenizer object. Must be the same as the one used for pre-tokenizing queries.
         :param max_query_length: max. number of query tokens, excluding special tokens
         :param num_candidates: number of document IDs to sample from all document IDs corresponding to a query and found
             in `candidates_path` file. If None, all found document IDs will be used
         :param candidate_sampling: method to use for sampling candidates. If None, the top `num_candidates` will be used
+        :param limit_size: If set, limit dataset size to a smaller subset, e.g. for debugging. If in [0,1], it will
+            be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
         """
 
-        self.emb_collection = EmbeddedCollection(embedding_memmap_dir, emb_dim=None, sorted=True)
-        self.queries = load_query_tokenids(queries_tokenids_path)  # dict: {qID : list of token IDs}
-        self.candidates_df = load_candidates_pandas(
-            candidates_path)  # pandas dataframe of candidate pIDs indexed by qID
-        self.qids = self.candidates_df.index.unique()  # Series of qIDs as found in retrieved candidates file
-
         self.mode = mode  # "train", "dev", "eval"
-        if mode == 'train':
+        logger.info("Opening collection document embeddings memmap in '{}' ...".format(embedding_memmap_dir))
+        self.emb_collection = EmbeddedCollection(embedding_memmap_dir, emb_dim=None, sorted_nat_ids=True)
+
+        if os.path.isdir(queries_tokenids_path):
+            queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
+        logger.info("Loading tokenized queries in '{}' ...".format(queries_tokenids_path))
+        self.queries = load_query_tokenids(queries_tokenids_path)  # dict: {qID : list of token IDs}
+        logger.info("Loading retrieved candidates for queries in '{}' ...".format(candidates_path))
+        self.candidates_df = load_candidates_pandas(candidates_path)  # pandas dataframe of candidate pIDs indexed by qID
+        self.qids = self.candidates_df.index.unique()  # Series of qIDs as found in retrieved candidates file
+        self.limit_dataset_size(limit_size)  # Potentially changes candidates_df, qids
+
+        if mode != 'eval':
+            if os.path.isdir(qrels_path):
+                qrels_path = os.path.join(qrels_path, "qrels.{}.tsv".format(mode))
+            logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
             self.qrels = load_qrels(qrels_path)  # dict: {qID : set of ground truth relevant pIDs}
         else:
             self.qrels = None
@@ -253,15 +274,25 @@ class MYMARCO_Dataset(Dataset):
         self.num_candidates = num_candidates
         self.candidate_sampling = candidate_sampling
 
+    def limit_dataset_size(self, limit_size):
+        """Changes dataset to a smaller subset, e.g. for debugging"""
+        if limit_size is not None:
+            if limit_size > 1:
+                limit_size = int(limit_size)
+            else:  # interpret as proportion if in (0, 1]
+                limit_size = int(limit_size * len(self.qids))
+            self.qids = self.qids[:limit_size]  # covers case limit_size > len(self.qids)
+            self.candidates_df = self.candidates_df.loc[self.qids]
+        return
+
     def __len__(self):
         return len(self.qids)
 
     def __getitem__(self, ind):
         """
-        For a given integer index corresponding to a sample (query), returns a tuple of model input data
-        Args:
-            ind: integer index of sample (query) in dataset
-        Returns:
+        For a given integer index corresponding to a single sample (query), returns a tuple of model input data
+        :param ind: integer index of sample (query) in dataset
+        :return:
             qid: (int) query ID
             query_token_ids: list of token IDs corresponding to query (unpadded, includes start/stop tokens)
             doc_ids: iterable of candidate document/passage IDs in order of relevance
@@ -306,7 +337,13 @@ class MYMARCO_Dataset(Dataset):
             return candidates
 
     def get_collate_func(self, num_inbatch_neg=0, max_candidates=1000):
-
+        """
+        :param num_inbatch_neg: number of negatives to randomly sample from other queries in the batch.
+            Can only be > 0 if mode == 'train'
+        :param max_candidates: maximum number of candidates per query to be scored by the model (capacity of model)
+            `num_candidates` will be reduced accordingly, if necessary.
+        :return: function with a single argument, which corresponds to a list of individual sample data. Used by DataLoader
+        """
         if self.mode != 'train':
             num_inbatch_neg = 0
         return partial(collate_function, mode=self.mode, pad_token_id=self.pad_id, num_inbatch_neg=num_inbatch_neg,
@@ -314,9 +351,9 @@ class MYMARCO_Dataset(Dataset):
 
 
 # TODO: can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
-def collate_function(batch, mode, pad_token_id, num_inbatch_neg=0, max_candidates=1000):
+def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=1000):
     """
-    :param batch: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, <rel_docs>)
+    :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, <rel_docs>)
     :param mode: 'train', 'dev', or 'eval'
     :param pad_token_id: ID of token used for padding queries
     :param num_inbatch_neg: number of negatives to randomly sample from other queries in the batch.
@@ -329,28 +366,25 @@ def collate_function(batch, mode, pad_token_id, num_inbatch_neg=0, max_candidate
         data: dict to serve as input to the model. Contains:
             query_token_ids: (batch_size, max_query_len) int tensor of query token IDs
             query_mask: (batch_size, max_query_len) bool tensor of padding mask corresponding to query; 1 use, 0 ignore
-
+            doc_padding_mask: (batch_size, max_docs_per_query) boolean tensor indicating padding (0) or valid (1) elements
+                in `doc_emb` or `docinds`
             If num_inbatch_neg > 0, additionally contains:
             local_emb_mat: (num_unique_docIDs, emb_dim) tensor of local doc embedding matrix containing emb. vectors
                 of all unique documents in the batch.  Used to lookup document vectors in nn.Embedding on the GPU
                 This is done to avoid replicating embedding vectors of in-batch negatives, thus sparing GPU bandwidth.
-            docID_to_localind: OrderedDict mapping unique docIDs to rows of `local_emb_mat`. Used to assemble tensors
-                on the GPU.
             docinds: (batch_size, max_docs_per_query) local indices of documents corresponding to `local_emb_mat`
             else:
             doc_emb: (batch_size, max_docs_per_query, emb_dim) float tensor of document embeddings corresponding
                 to the pool of candidates for each query
-            doc_padding_mask: (batch_size, max_docs_per_query) boolean tensor indicating padding (0) or valid (1) elements
-                in `doc_emb` or `docinds`
 
             If 'train', additionally contains:
             labels: (batch_size, max_docs_per_query) int tensor which for each query (row) contains the indices of the
-                relevant doc IDs within its corresponding pool of candidates, `doc_ids`
+                relevant documents within its corresponding pool of candidates, `doc_ids`. Padded with -1.
     """
 
-    batch_size = len(batch)
+    batch_size = len(batch_samples)
 
-    qids, query_token_ids, doc_ids, doc_embeddings, rel_docs = zip(*batch)
+    qids, query_token_ids, doc_ids, doc_embeddings, rel_docs = zip(*batch_samples)
     query_lengths = [len(seq) for seq in query_token_ids]
     max_query_length = max(query_lengths)
     query_masks = [[1] * ql for ql in query_lengths]  # 1 use, 0 ignore
@@ -374,8 +408,7 @@ def collate_function(batch, mode, pad_token_id, num_inbatch_neg=0, max_candidate
 
         # augment doc_ids with randomly sampled document IDs from candidates retrieved for other qIDs in the batch
         doc_ids = [(cands + list(
-            np.random.choice(list(unique_candidates - set(cands)), size=num_inbatch_neg, replace=False)))[
-                   :max_candidates]
+            np.random.choice(list(unique_candidates - set(cands)), size=num_inbatch_neg, replace=False)))[:max_candidates]
                    for cands in doc_ids]
 
         # local doc embedding matrix. It is only slightly smaller than `assembled_emb_mat`, because the chance of
@@ -436,6 +469,7 @@ def prepare_docinds_and_mask(doc_ids, docID_to_localind, padding_idx, length=Non
         docinds_mask[i, :len(docids)] = True
     return docinds, docinds_mask
 
+
 # Not used! We use nn.Embedding instead! ~10 times faster!
 def assemble_3D_tensors(doc_ids, local_emb_mat, docID_to_localind):
     """Pack 3D tensors for doc embeddings and corresponding padding mask
@@ -462,12 +496,15 @@ def assemble_3D_tensors(doc_ids, local_emb_mat, docID_to_localind):
     return doc_emb_tensor, doc_emb_mask
 
 
+# only used by RepBERT
 class MSMARCODataset(Dataset):
     def __init__(self, mode, msmarco_dir,
-                 collection_memmap_dir, tokenize_dir,
+                 collection_memmap_dir, queries_tokenids_path,
                  max_query_length=20, max_doc_length=256):
         self.collection = CollectionDataset(collection_memmap_dir)
-        self.queries = load_queries(tokenize_dir, mode)  # dict: {qID : list of token IDs}
+        if os.path.isdir(queries_tokenids_path):
+            queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
+        self.queries = load_query_tokenids(queries_tokenids_path)  # dict: {qID : list of token IDs}
         # qids, pids, labels: corresponding lists of query IDs, passage IDs, 1 / 0 relevance labels
         # each query ID is contained 2 consecutive times in qids, once corresponding to the positive and once to the negative pid
         # qrels is the ground truth dict: {qID : set of relevant pIDs}
@@ -510,6 +547,7 @@ def pack_tensor_2D(lstlst, default, dtype, length=None):
     return tensor
 
 
+# only used by RepBERT
 def get_collate_function(mode):
     def collate_function(batch):
         input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]

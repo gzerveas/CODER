@@ -6,9 +6,7 @@ import numpy as np
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from transformers.modeling_bert import BertModel, BertPreTrainedModel, RobertaModel
-
-from dataset import assemble_3D_tensors
+from transformers import BertModel, BertPreTrainedModel, RobertaModel
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +85,6 @@ class RepBERT_Train(BertPreTrainedModel):
             loss = loss_fct(similarities, labels)
             output = loss, *output
         return output
-        
 
 
 def _average_sequence_embeddings(sequence_output, valid_mask):
@@ -149,7 +146,6 @@ class CrossAttentionScorer(nn.Module):
         """
 
         return F.sigmoid(self.linear(output_emb))
-
 
 
 class MDSTransformer(nn.Module):
@@ -244,7 +240,9 @@ class MDSTransformer(nn.Module):
                 relevant documents within its corresponding pool of candidates (docinds).
 
         :returns:
-            out_doc_emb: (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
+            rel_scores: (batch_size, num_docs) relevance scores in [0, 1]
+            additionally, if `labels` is provided:
+            loss: scalar mean loss over entire batch
         """
 
         if 'doc_emb' is None:  # happens only in training, when additionally there is in-batch negative sampling

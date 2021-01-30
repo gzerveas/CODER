@@ -38,6 +38,7 @@ def generate_rank(input_path, output_path):
 def eval_results(run_file_path,
                  eval_script="./ms_marco_eval.py",
                  qrels="./data/msmarco-passage/qrels.dev.small.tsv"):
+    """Runs the MSMARCO evaluation script on a file with retrieved results and uses regex to find MRR in its output"""
     assert os.path.exists(eval_script) and os.path.exists(qrels)
     result = subprocess.check_output(['python', eval_script, qrels, run_file_path])
     match = re.search(r'MRR @10: ([\d.]+)', result.decode('utf-8'))
@@ -78,6 +79,19 @@ def save_model(path: str, global_step: int, model: object, optimizer: object = N
     torch.save(checkpoint, path)
 
 
+def remove_oldest_checkpoint(dirpath, num_keep):
+    """Removes oldest checkpoint, if existing checkpoints in `dirpath` are more than `num_keep`"""
+
+    filelist = os.listdir(dirpath)
+    suffices = map(lambda x: re.search(r"model_(\d*)\.", x), filelist)
+    stepnums = sorted([int(matchobj.group(1)) for matchobj in suffices if matchobj])
+
+    if len(stepnums) >= num_keep:
+        os.remove("model_{}.cpt".format(stepnums[0]))
+
+    return
+
+
 def load_model(model, model_path, optimizer=None, scheduler=None, resume=False, change_output=False):
     global_step = 0
     checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)  # Load all tensors onto the CPU
@@ -108,6 +122,16 @@ def load_model(model, model_path, optimizer=None, scheduler=None, resume=False, 
             has been passed as an argument to `load_model`, and that the respective state(s) exist in the checkpoint.""")
 
     return model, global_step, optimizer, scheduler
+
+
+class Obj(object):
+    def __init__(self, dict_):
+        self.__dict__.update(dict_)
+
+
+def dict2obj(d):
+    """Convert dict `d` into an object ("struct")"""
+    return json.loads(json.dumps(d), object_hook=Obj)
 
 
 def load_config(config_filepath):
@@ -244,7 +268,7 @@ class Printer(object):
         sys.stdout.flush()
 
 
-def human_readable_duration(time_difference):
+def readable_time(time_difference):
     """Convert a float measuring time difference in seconds into a tuple of (hours, minutes, seconds)"""
 
     hours = time_difference // 3600

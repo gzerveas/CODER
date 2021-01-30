@@ -12,7 +12,7 @@ def get_tokenizer(args):
     if args.tokenizer_type == 'bert':
         if args.tokenizer_from is None:  # if not a directory path
             args.tokenizer_from = 'bert-base-uncased'
-        return BertTokenizer.from_pretrained(args.query_encoder_from)
+        return BertTokenizer.from_pretrained(args.tokenizer_from)
     elif args.tokenizer_type == 'roberta':
         if args.tokenizer_from is None:  # if not a directory path
             args.tokenizer_from = 'roberta-base'
@@ -20,7 +20,7 @@ def get_tokenizer(args):
 
 
 def tokenize_file(tokenizer, input_file, output_file):
-    total_size = sum(1 for _ in open(input_file))
+    total_size = sum(1 for _ in open(input_file))  # simply to get number of lines
     with open(output_file, 'w') as outFile:
         for line in tqdm(open(input_file), total=total_size, desc=f"Tokenize: {os.path.basename(input_file)}"):
             seq_id, text = line.split("\t")
@@ -31,7 +31,7 @@ def tokenize_file(tokenizer, input_file, output_file):
     
 
 def tokenize_queries(args, tokenizer):
-    for mode in ["eval.small", "dev", "eval", "train"]:
+    for mode in ["train", "dev", "eval", "eval.small"]:
         output_path = f"{args.output_dir}/queries.{mode}.json"
         tokenize_file(tokenizer, f"{args.msmarco_dir}/queries.{mode}.tsv", output_path)
 
@@ -44,7 +44,7 @@ def tokenize_collection(args, tokenizer):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--msmarco_dir", type=str, default="./data/msmarco-passage")
-    parser.add_argument("--output_dir", type=str, default="./data/tokenize")
+    parser.add_argument("--output_dir", type=str, default="./data/tokenized")
     parser.add_argument("--tokenize_queries", action="store_true")
     parser.add_argument("--tokenize_collection", action="store_true")
     parser.add_argument("--tokenizer_type", type=str, choices=['bert', 'roberta'], default='bert',
@@ -63,3 +63,5 @@ if __name__ == "__main__":
         tokenize_queries(args, tokenizer)  
     if args.tokenize_collection:
         tokenize_collection(args, tokenizer) 
+
+    tokenizer.save_pretrained(args.output_dir)
