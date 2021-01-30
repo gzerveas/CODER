@@ -4,6 +4,7 @@ import logging
 from collections import defaultdict, OrderedDict
 from functools import partial
 from itertools import chain
+import time
 
 import numpy as np
 from tqdm import tqdm
@@ -248,10 +249,15 @@ class MYMARCO_Dataset(Dataset):
 
         if os.path.isdir(queries_tokenids_path):
             queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
+        start_time = time.time()
         logger.info("Loading tokenized queries in '{}' ...".format(queries_tokenids_path))
         self.queries = load_query_tokenids(queries_tokenids_path)  # dict: {qID : list of token IDs}
+        logger.info("Done in {:.3f} sec".format(time.time() - start_time))
+
+        start_time = time.time()
         logger.info("Loading retrieved candidates for queries in '{}' ...".format(candidates_path))
         self.candidates_df = load_candidates_pandas(candidates_path)  # pandas dataframe of candidate pIDs indexed by qID
+        logger.info("Done in {:.3f} sec".format(time.time() - start_time))
         self.qids = self.candidates_df.index.unique()  # Series of qIDs as found in retrieved candidates file
         self.limit_dataset_size(limit_size)  # Potentially changes candidates_df, qids
 
@@ -297,8 +303,7 @@ class MYMARCO_Dataset(Dataset):
             query_token_ids: list of token IDs corresponding to query (unpadded, includes start/stop tokens)
             doc_ids: iterable of candidate document/passage IDs in order of relevance
             doc_embeddings: (len(doc_ids), emb_dim) slice of numpy.memmap embedding vectors corresponding to `doc_ids`
-        if self.mode == 'train':
-            rel_docs: set of ground truth relevant passage IDs corresponding to query ID
+            rel_docs: set of ground truth relevant passage IDs corresponding to query ID; None if mode == 'eval'
         """
 
         qid = self.qids[ind]
@@ -309,19 +314,18 @@ class MYMARCO_Dataset(Dataset):
         doc_ids = self.candidates_df.loc[qid]  # iterable of candidate document/passage IDs in order of relevance
         doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
-        if self.mode == "train":
+        if self.mode != "eval":
             rel_docs = self.qrels[qid]
             # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
             # while ensuring that they are only included once
             num_candidates = len(doc_ids)
             new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:num_candidates]
             doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
-
-            doc_embeddings = self.emb_collection[doc_ids]  # (num_doc_ids, emb_dim) slice of numpy.memmap embeddings
-            return qid, query_token_ids, doc_ids, doc_embeddings, rel_docs
         else:
-            doc_embeddings = self.emb_collection[doc_ids]  # (num_doc_ids, emb_dim) slice of numpy.memmap embeddings
-            return qid, query_token_ids, doc_ids, doc_embeddings
+            rel_docs = None
+
+        doc_embeddings = self.emb_collection[doc_ids]  # (num_doc_ids, emb_dim) slice of numpy.memmap embeddings
+        return qid, query_token_ids, doc_ids, doc_embeddings, rel_docs
 
     def sample_candidates(self, candidates):
         """
@@ -353,7 +357,7 @@ class MYMARCO_Dataset(Dataset):
 # TODO: can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
 def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=1000):
     """
-    :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, <rel_docs>)
+    :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, rel_docs)
     :param mode: 'train', 'dev', or 'eval'
     :param pad_token_id: ID of token used for padding queries
     :param num_inbatch_neg: number of negatives to randomly sample from other queries in the batch.
@@ -377,7 +381,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
             doc_emb: (batch_size, max_docs_per_query, emb_dim) float tensor of document embeddings corresponding
                 to the pool of candidates for each query
 
-            If 'train', additionally contains:
+            If mode != 'eval', additionally contains:
             labels: (batch_size, max_docs_per_query) int tensor which for each query (row) contains the indices of the
                 relevant documents within its corresponding pool of candidates, `doc_ids`. Padded with -1.
     """
@@ -436,7 +440,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
-    if mode == "train":
+    if mode != "eval":
         # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
         # It is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
         # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)

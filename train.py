@@ -1,5 +1,5 @@
 import logging
-logging.basicConfig(format='%(asctime)s | $(name)s - %(levelname)s : %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s | %(name)s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
 logger.info("Loading packages ...")
 import os
@@ -33,7 +33,7 @@ import metrics
 
 NEG_METRICS = {}
 METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']
-METRICS.extend(m + '@' for m in METRICS)
+METRICS.extend(m + '@' for m in METRICS[:])
 
 
 def run_parse_args():
@@ -48,6 +48,8 @@ def run_parse_args():
                         help='A string identifier/name for the experiment to be run '
                              '- it will be appended to the output directory name, before the timestamp')
     parser.add_argument('--comment', type=str, default='', help='A comment/description of the experiment')
+    parser.add_argument('--no_timestamp', action='store_true',
+                        help='If set, a timestamp and random suffix will not be appended to the output directory name')
     parser.add_argument("--task", choices=["train", "dev", "eval"], required=True)
     parser.add_argument('--resume', action='store_true',
                         help='If set, will load `start_step` and state of optimizer, scheduler besides model weights.')
@@ -57,7 +59,9 @@ def run_parse_args():
                         help='Root output directory. Must exist. Time-stamped directories will be created inside.')
     parser.add_argument("--msmarco_dir", type=str, default="~/data/MS_MARCO",
                         help="Directory where qrels, queries files can be found")
-    parser.add_argument("--candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv",
+    parser.add_argument("--train_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv",
+                        help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini")
+    parser.add_argument("--eval_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.dev.tsv",
                         help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini")
     parser.add_argument("--embedding_memmap_dir", type=str, default="repbert/representations/doc_embedding",
                         help="Directory containing (num_docs_in_collection, doc_emb_dim) memmap array of document "
@@ -102,8 +106,8 @@ def run_parse_args():
     parser.add_argument("--num_keep", default=1, type=int, help="How many (latest) checkpoints to keep, besides the best.")
 
     ## Training process
-    parser.add_argument("--per_gpu_eval_batch_size", default=26, type=int)
-    parser.add_argument("--per_gpu_train_batch_size", default=26, type=int)
+    parser.add_argument("--per_gpu_eval_batch_size", default=32, type=int)
+    parser.add_argument("--per_gpu_train_batch_size", default=32, type=int)
     parser.add_argument("--grad_accum_steps", type=int, default=1,
                         help="Gradient accumulation steps. The model parameters will be updated every this many batches")
     parser.add_argument("--validation_steps", type=int, default=10000,
@@ -131,13 +135,30 @@ def run_parse_args():
                         help="""Type of the entire (end-to-end) information retrieval model""")
     parser.add_argument("--query_encoder_type", type=str, choices=['bert', 'roberta'], default='bert',
                         help="""Type of the model component used for encoding queries""")
+    # The following refer to the transformer "decoder" (which processes an input sequence of document embeddings)
+    parser.add_argument('--d_model', type=int, default=64,
+                        help='Internal dimension of transformer decoder embeddings')
+    parser.add_argument('--dim_feedforward', type=int, default=256,
+                        help='Dimension of dense feedforward part of transformer decoder layer')
+    parser.add_argument('--num_heads', type=int, default=8,
+                        help='Number of multi-headed attention heads for the transformer decoder')
+    parser.add_argument('--num_layers', type=int, default=3,
+                        help="Number of transformer decoder 'layers' (blocks)")
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout applied to most transformer decoder layers')
+    parser.add_argument('--pos_encoding', choices={'fixed', 'learnable', 'none'}, default='none',
+                        help='What kind of positional encoding to use for the transformer decoder input sequence')
+    parser.add_argument('--activation', choices={'relu', 'gelu'}, default='gelu',
+                        help='Activation to be used in transformer decoder')
+    parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm'}, default='BatchNorm',
+                        help='Normalization layer to be used internally in the transformer decoder')
 
     args = parser.parse_args()
 
-    # User can enter e.g. 'MRR@', indicating that they want to use the provided k
-    metric_name, k = args.key_metric.split('@')
-    if len(k):
-        args.key_metric += str(args.metric_k)
+    # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
+    components = args.key_metric.split('@')
+    if len(components) > 1:
+        args.key_metric = components[0] + "@{}".format(args.metrics_k)
 
     if args.resume and (args.load_model_path is None):
         raise ValueError("You can only use option '--resume' when also specifying a model to load!")
@@ -147,12 +168,15 @@ def run_parse_args():
 
 def train(args, model, val_dataloader, tokenizer=None):
     """Prepare training dataset, train the model and handle results"""
+
+    utils.set_seed(args)  # for reproducibility
+
     tb_writer = SummaryWriter(args.tensorboard_dir)
 
     train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     logger.info("Preparing {} dataset ...".format('train'))
     start_time = time.time()
-    train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_dir, args.candidates_path,
+    train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_dir, args.train_candidates_path,
                                     qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                     max_query_length=args.max_query_length, num_candidates=args.num_candidates,
                                     limit_size=args.limit_size)
@@ -168,7 +192,7 @@ def train(args, model, val_dataloader, tokenizer=None):
                                   batch_size=train_batch_size, num_workers=args.data_num_workers,
                                   collate_fn=collate_fn)
 
-    epoch_steps = (len(train_dataloader) // args.grad_accum_steps)  # num. actual steps per epoch
+    epoch_steps = (len(train_dataloader) // args.grad_accum_steps)  # num. actual steps (param. updates) per epoch
     total_training_steps = epoch_steps * args.num_train_epochs
 
     start_step = 0  # which step training started from
@@ -219,15 +243,17 @@ def train(args, model, val_dataloader, tokenizer=None):
     model.zero_grad()
     model.train()
     epoch_iterator = trange(start_epoch, int(args.num_train_epochs), desc="Epoch")
-    utils.set_seed(args)  # Added here for reproducibility
+
+    batch_time = 0  # average time for the model to train (forward + backward pass) on a single batch of queries
     for epoch_idx in epoch_iterator:
-        start_time = time.time()
+        epoch_start_time = time.time()
         batch_iterator = tqdm(train_dataloader, desc="Batch")
         for step, (model_inp, _, _) in enumerate(batch_iterator):  # step can be a "sub-step", if grad. accum. > 1
             if args.resume and ((epoch_idx * epoch_steps) + step < args.grad_accum_steps * global_step):
                 continue  # this is done to continue dataloader from the correct step, when using args.resume
 
             model_inp = {k: v.to(args.device) for k, v in model_inp.items()}
+            start_time = time.perf_counter()
             outputs = model(**model_inp)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
@@ -237,8 +263,10 @@ def train(args, model, val_dataloader, tokenizer=None):
                 loss = loss / args.grad_accum_steps
             loss.backward()  # calculate gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
             train_loss += loss.item()
+
+            batch_time += time.perf_counter() - start_time
+
             if (step + 1) % args.grad_accum_steps == 0:
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
@@ -261,12 +289,12 @@ def train(args, model, val_dataloader, tokenizer=None):
                     metrics_names, metrics_values = zip(*val_metrics.items())
                     running_metrics.append(list(metrics_values))
 
-                if args.save_steps and (global_step % args.save_steps == 0):
+                if (args.save_steps and (global_step % args.save_steps == 0)) or global_step == total_training_steps:
                     # Save model checkpoint
                     utils.remove_oldest_checkpoint(args.save_dir, args.num_keep)
                     utils.save_model(os.path.join(args.save_dir, 'model_{}.pth'.format(global_step)),
                                      global_step, model, optimizer, scheduler)
-        epoch_runtime = time.time() - start_time
+        epoch_runtime = time.time() - epoch_start_time
         logger.info("Epoch runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(epoch_runtime)))
 
     # Export evolution of metrics over epochs
@@ -277,7 +305,8 @@ def train(args, model, val_dataloader, tokenizer=None):
     # Export record metrics to a file accumulating records from all experiments
     utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
                           best_metrics, val_metrics, comment=args.comment)
-
+    batch_time = batch_time / (epoch_idx * epoch_steps + step)
+    logger.info("Average time to train on 1 batch ({} samples): {:.3f} sec".format(train_batch_size, batch_time))
     logger.info('Best {} was {}. Other metrics: {}'.format(args.key_metric, best_value, best_metrics))
 
     return
@@ -328,21 +357,24 @@ def evaluate(args, model, dataloader):
         eval_metrics: dict containing metrics (at least 1, batch processing time)
         rank_df: dataframe with indexed by qID (shared by multiple rows) and columns: PID, rank, score
     """
-    labels_exist = hasattr(dataloader, 'qrels')
+    labels_exist = dataloader.qrels is not None
 
     # num_docs is the (potentially variable) number of candidates per query
     relevances = []  # (total_num_queries) list of (num_docs) lists with 1 at the indices corresponding to actually relevant passages
     num_relevant = []  # (total_num_queries) list of number of ground truth relevant documents per query
     df_chunks = []  # (total_num_queries) list of dataframes, each with index a single qID and corresponding (num_docs) columns PID, rank, score
-    batch_time = 0  # average time for the model to score candidates for a single batch of queries
+    query_time = 0  # average time for the model to score candidates for a single query
+    total_loss = 0  # total loss over dataset
 
     with torch.no_grad():
         for batch_data, qids, docids in tqdm(dataloader, desc="Evaluating"):
             batch_data = {k: v.to(args.device) for k, v in batch_data.items()}
             start_time = time.perf_counter()
-            rel_scores = model(**batch_data)  # (batch_size, num_docs) relevance scores in [0, 1], because not 'train'
-            batch_time += time.perf_counter() - start_time
-            rel_scores = rel_scores.detach().cpu().numpy()
+            out = model(**batch_data)  # (batch_size, num_docs) relevance scores in [0, 1], because not 'train'
+            query_time += time.perf_counter() - start_time
+            rel_scores = out['rel_scores'].detach().cpu().numpy()
+            if 'loss' in out:
+                total_loss += out['loss'].item()
             assert len(qids) == len(docids) == len(rel_scores)
 
             # Rank documents based on their scores
@@ -370,9 +402,10 @@ def evaluate(args, model, dataloader):
 
     if labels_exist:
         eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k)  # aggr. metrics for the entire dataset
+        eval_metrics['loss'] = total_loss / len(dataloader.dataset)  # average over samples
     else:
         eval_metrics = OrderedDict()
-    eval_metrics['batch_time'] = batch_time / len(dataloader)
+    eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
     ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
 
     return eval_metrics, ranked_df
@@ -494,7 +527,7 @@ def main():
     eval_mode = 'eval' if args.task == 'eval' else 'dev'  # 'eval' here is the name of the MSMARCO test set, 'dev' is the validation set
     logger.info("Preparing {} dataset ...".format(eval_mode))
     start_time = time.time()
-    eval_dataset = MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_dir, args.candidates_path,
+    eval_dataset = MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_dir, args.eval_candidates_path,
                                    qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                    max_query_length=args.max_query_length, num_candidates=None,
                                    limit_size=args.limit_size)
@@ -526,12 +559,12 @@ def main():
 
         model.eval()
         eval_start_time = time.time()
-        val_metrics, ranked_df = evaluate(args, model, eval_dataloader)
+        eval_metrics, ranked_df = evaluate(args, model, eval_dataloader)
         eval_runtime = time.time() - eval_start_time
         logger.info("Evaluation runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(eval_runtime)))
         print()
         print_str = 'Evaluation Summary: '
-        for k, v in val_metrics.items():
+        for k, v in eval_metrics.items():
             print_str += '{}: {:8f} | '.format(k, v)
         logger.info(print_str)
 
@@ -591,9 +624,9 @@ def get_query_encoder(args):
     """Initialize and return query encoder model object based on args"""
 
     if args.query_encoder_type == 'bert':
-        return BertModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config_from)
+        return BertModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
     elif args.query_encoder_type == 'roberta':
-        return RobertaModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config_from)
+        return RobertaModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
 
 
 def get_model(args):
@@ -602,10 +635,10 @@ def get_model(args):
     query_encoder = get_query_encoder(args)
 
     if args.model_type == 'mdstransformer':
-        return MDSTransformer(encoder_config=query_encoder,
+        return MDSTransformer(custom_encoder=query_encoder,
                               d_model=args.d_model,
                               num_heads=args.num_heads,
-                              num_decoder_layers=args.num_decoder_layers,
+                              num_decoder_layers=args.num_layers,
                               dim_feedforward=args.dim_feedforward,
                               dropout=args.dropout,
                               activation=args.activation)

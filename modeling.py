@@ -155,23 +155,25 @@ class MDSTransformer(nn.Module):
     Computes a relevance score for each (transformed) document representation and can be thus used for reranking.
 
     Args:
-        encoder_config: huggingface transformers configuration object for query encoder
-        ***Decoder:***
+        encoder_config: huggingface transformers configuration object for a Roberta query encoder.
+            Used instead of `custom_encoder`.
+        custom_encoder: custom encoder object initialized externally (default=None)
+            Used instead of `encoder_config`.
+        custom_decoder: custom decoder object initialized externally (default=None).
+            If not specified, then the following are used:
+
         d_model: the "decoder" representation (hidden) dimension. Is also the doc embedding dimension
-        num_heads: the number of heads in the multiheadattention models.
+        num_heads: the number of heads in the multiheadattention decoder layers.
         num_decoder_layers: the number of sub-decoder-layers in the decoder.
-        dim_feedforward: the dimension of the feedforward network model.
-        dropout: the dropout value.
-        activation: the activation function of encoder/decoder intermediate layer, "relu" or "gelu".
+        dim_feedforward: the dimension of the decoder feedforward network module.
+        dropout: the decoder dropout value.
+        activation: the activation function of the decoder intermediate layer, "relu" or "gelu".
         positional_encoding: if None, no positional encoding is used for the "decoder", and thus the output is permutation
             equivariant with respect to the document embedding sequence
-        **************
-        custom_encoder: custom encoder object initialized externally (default=None).
-        custom_decoder: custom decoder object initialized externally (default=None).
 
     Examples::
-        >>> model = MDSTransformer(enc_config, nhead=16, num_decoder_layers=4)
-        >>> model = MDSTransformer(custom_encoder=my_HF_encoder, nhead=16, num_decoder_layers=4)
+        >>> model = MDSTransformer(enc_config, num_heads=16, num_decoder_layers=4)
+        >>> model = MDSTransformer(custom_encoder=my_HF_encoder, num_heads=16, num_decoder_layers=4)
     """
 
     def __init__(self, encoder_config=None, d_model: int = 768, num_heads: int = 8,
@@ -184,7 +186,7 @@ class MDSTransformer(nn.Module):
         if custom_encoder is not None:
             self.encoder = custom_encoder
         else:
-            self.encoder = RobertaModel.__init__(self, encoder_config)
+            self.encoder = RobertaModel(encoder_config)
 
         if custom_decoder is not None:
             self.decoder = custom_decoder
@@ -219,7 +221,7 @@ class MDSTransformer(nn.Module):
 
     def forward(self, query_token_ids: Tensor, query_mask: Tensor = None, doc_emb: Tensor = None,
                 docinds: Tensor = None, local_emb_mat: Tensor = None, doc_padding_mask: Tensor = None,
-                doc_attention_mat_mask: Tensor = None, labels: Tensor = None) -> Tensor:
+                doc_attention_mat_mask: Tensor = None, labels: Tensor = None) -> Dict[str, Tensor]:
         r"""
         num_docs is the number of candidate docs per query and corresponds to the length of the padded "decoder" sequence
         :param  query_token_ids: (batch_size, max_query_len) tensor of padded sequence of token IDs fed to the encoder
@@ -238,11 +240,12 @@ class MDSTransformer(nn.Module):
                     This is for causality and is directly added on top of the attention matrix
         :param  labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices of the
                 relevant documents within its corresponding pool of candidates (docinds).
+                    Optional: If provided, the loss will be computed.
 
         :returns:
-            rel_scores: (batch_size, num_docs) relevance scores in [0, 1]
-            additionally, if `labels` is provided:
-            loss: scalar mean loss over entire batch
+            dict containing:
+                rel_scores: (batch_size, num_docs) relevance scores in [0, 1]
+                loss: scalar mean loss over entire batch (only if `labels` is provided!)
         """
 
         if 'doc_emb' is None:  # happens only in training, when additionally there is in-batch negative sampling
@@ -271,9 +274,9 @@ class MDSTransformer(nn.Module):
         rel_scores = self.score_docs(output_emb)  # (batch_size, num_docs) relevance scores in [0, 1]
 
         if labels is not None:
-            loss = self.loss_func(rel_scores, labels)  # scalar
-            return loss, rel_scores
-        return rel_scores
+            loss = self.loss_func(rel_scores, labels)  # scalar tensor
+            return {'loss': loss, 'rel_scores': rel_scores}
+        return {'rel_scores': rel_scores}
 
     def lookup_doc_emb(self, docinds, local_emb_mat):
         """
