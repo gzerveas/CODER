@@ -45,7 +45,7 @@ class CollectionDataset:
 class EmbeddedCollection:
     """Document / passage collection in the form of document embedding memmap"""
 
-    def __init__(self, embedding_memmap_dir, emb_dim=None, sorted_nat_ids=False):
+    def __init__(self, embedding_memmap_dir, emb_dim=None, sorted_nat_ids=False, load_to_memory=False):
         """
         :param embedding_memmap_dir: directory containing memmap file of precomputed document embeddings, and the
             corresponding passage/doc IDs in another memmpap file
@@ -53,6 +53,8 @@ class EmbeddedCollection:
             and in case this is not possible, the default value BERT_BASE_DIM will be used
         :param sorted_nat_ids: whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1, and
             doc embeddings are stored exactly in that order (is True for MSMARCO passage collection). A bit more efficient.
+        :param load_to_memory: If true, will load entire embedding array as np.array to memory, instead of memmap!
+            Needs > 16GB for MSMARCO (~50GB project total), but is faster.
         """
 
         if emb_dim is None:
@@ -75,11 +77,11 @@ class EmbeddedCollection:
 
         self.num_docs = len(pids)
         # shape is necessary input; this information is not stored and a 1D array is loaded by default
-        # TODO: remove!
-        self.embedding_vectors = np.array(np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
-                                           dtype='float32', shape=(self.num_docs, emb_dim)))
-        # self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
-        #                                    dtype='float32', shape=(self.num_docs, emb_dim))
+        self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
+                                           dtype='float32', shape=(self.num_docs, emb_dim))
+        if load_to_memory:
+            logger.warning("Loading all collection document embeddings to memory!")
+            self.embedding_vectors = np.array(self.embedding_vectors)
 
     def get_pid_to_ind_mapping(self, pids):
         """Returns function used to map a list of passage IDs to the corresponding integer indices of the embedding matrix"""
@@ -228,7 +230,7 @@ class MYMARCO_Dataset(Dataset):
     def __init__(self, mode,
                  embedding_memmap_dir, queries_tokenids_path, candidates_path, qrels_path=None,
                  tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
-                 limit_size=None, emb_collection=None):
+                 limit_size=None, emb_collection=None, load_collection_to_memory=False):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
@@ -245,14 +247,18 @@ class MYMARCO_Dataset(Dataset):
         :param candidate_sampling: method to use for sampling candidates. If None, the top `num_candidates` will be used
         :param limit_size: If set, limit dataset size to a smaller subset, e.g. for debugging. If in [0,1], it will
             be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
+        :param load_collection_to_memory: If true, will load entire embedding array as np.array to memory, instead of memmap!
+            Needs > 16GB for MSMARCO (~50GB project total), but is faster.
+        :param emb_collection: (optional) already initialized EmbeddedCollection object. Will be used instead of
+            reading matrix from `embedding_memmap_dir`
         """
-
         self.mode = mode  # "train", "dev", "eval"
         if emb_collection is not None:
             self.emb_collection = emb_collection
         else:
             logger.info("Opening collection document embeddings memmap in '{}' ...".format(embedding_memmap_dir))
-            self.emb_collection = EmbeddedCollection(embedding_memmap_dir, emb_dim=None, sorted_nat_ids=True)
+            self.emb_collection = EmbeddedCollection(embedding_memmap_dir, emb_dim=None, sorted_nat_ids=True,
+                                                     load_to_memory=load_collection_to_memory)
 
         if os.path.isdir(queries_tokenids_path):
             queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
@@ -331,9 +337,9 @@ class MYMARCO_Dataset(Dataset):
         else:
             rel_docs = None
 
-        tic = time.perf_counter()
-        doc_embeddings = torch.tensor(self.emb_collection[doc_ids])  # (num_doc_ids, emb_dim) slice of numpy.memmap embeddings
-        print("Time: {:.3g} s".format(time.perf_counter() - tic))
+        # tic = time.perf_counter()
+        doc_embeddings = torch.tensor(self.emb_collection[doc_ids])  # (num_doc_ids, emb_dim) tensor of doc. embeddings
+        # print("Time: {:.3g} s".format(time.perf_counter() - tic))
         return qid, query_token_ids, doc_ids, doc_embeddings, rel_docs
 
     def sample_candidates(self, candidates):
@@ -394,7 +400,6 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
             labels: (batch_size, max_docs_per_query) int tensor which for each query (row) contains the indices of the
                 relevant documents within its corresponding pool of candidates, `doc_ids`. Padded with -1.
     """
-    ipdb.set_trace()
     batch_size = len(batch_samples)
 
     qids, query_token_ids, doc_ids, doc_embeddings, rel_docs = zip(*batch_samples)

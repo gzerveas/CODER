@@ -145,7 +145,7 @@ class CrossAttentionScorer(nn.Module):
         :return: (batch_size, num_docs) relevance scores in [0, 1]
         """
 
-        return F.sigmoid(self.linear(output_emb))
+        return torch.sigmoid(self.linear(output_emb))
 
 
 class MDSTransformer(nn.Module):
@@ -203,6 +203,8 @@ class MDSTransformer(nn.Module):
             decoder_layer = nn.TransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
             decoder_norm = nn.LayerNorm(self.d_model)
             self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm)
+            # Without any init call, weight parameters are initialized as by default when creating torch layers (Kaiming uniform)
+            self.decoder.apply(lambda x: (torch.nn.init.xavier_uniform_ if hasattr(x, 'dim') else lambda y: y))
 
         if self.doc_emb_dim is None:
             self.doc_emb_dim = d_model
@@ -226,9 +228,6 @@ class MDSTransformer(nn.Module):
         self.score_docs = self.get_scoring_module(scoring_mode)
 
         self.loss_func = self.get_loss_func(loss_type)
-
-        # Without any init call, weight parameters are initialized as by default when creating torch layers (Kaiming uniform)
-        # self._reset_parameters()
 
     def get_scoring_module(self, scoring_mode):
 
@@ -272,7 +271,6 @@ class MDSTransformer(nn.Module):
                 rel_scores: (batch_size, num_docs) relevance scores in [0, 1]
                 loss: scalar mean loss over entire batch (only if `labels` is provided!)
         """
-        ipdb.set_trace()
         if doc_emb is None:  # happens only in training, when additionally there is in-batch negative sampling
             doc_emb = self.lookup_doc_emb(docinds, local_emb_mat)  # (batch_size, max_docs_per_query, doc_emb_dim)
         if self.doc_emb_dim != self.d_model:
@@ -301,7 +299,7 @@ class MDSTransformer(nn.Module):
         # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
         output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
 
-        rel_scores = self.score_docs(output_emb)  # (batch_size, num_docs) relevance scores in [0, 1]
+        rel_scores = self.score_docs(output_emb).squeeze()  # (batch_size, num_docs) relevance scores in [0, 1]
 
         if labels is not None:
             loss = self.loss_func(rel_scores, labels.long())  # loss is scalar tensor; labels are int16, expected int32

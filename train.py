@@ -100,10 +100,13 @@ def run_parse_args():
                              "If 0, only documents in `candidates_path` will be used as negatives.")
 
     ## System
-    parser.add_argument("--no_cuda", action='store_true')
+    parser.add_argument("--no_cuda", action='store_true', help="Use CPU only.")
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument("--data_num_workers", default=0, type=int)
+    parser.add_argument("--data_num_workers", default=0, type=int, help="Number of processes to load data. Default: main process only.")
     parser.add_argument("--num_keep", default=1, type=int, help="How many (latest) checkpoints to keep, besides the best.")
+    parser.add_argument("--load_collection_to_memory", action='store_true',
+                        help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
+                        "Needs > 16GB for MSMARCO (~50GB project total), but is faster.")
 
     ## Training process
     parser.add_argument("--per_gpu_eval_batch_size", default=32, type=int)
@@ -179,7 +182,9 @@ def train(args, model, val_dataloader, tokenizer=None):
     train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_dir, args.train_candidates_path,
                                     qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                     max_query_length=args.max_query_length, num_candidates=args.num_candidates,
-                                    limit_size=args.limit_size, emb_collection=val_dataloader.dataset.emb_collection)
+                                    limit_size=args.limit_size,
+                                    load_collection_to_memory=args.load_collection_to_memory,
+                                    emb_collection=val_dataloader.dataset.emb_collection)
     collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
@@ -222,7 +227,7 @@ def train(args, model, val_dataloader, tokenizer=None):
         model = torch.nn.DataParallel(model)
 
     # Train
-    logger.info("***** Start training *****")
+    logger.info("\n\n***** START TRAINING *****\n\n")
     logger.info("Num Epochs: %d", args.num_train_epochs)
     logger.info("Num examples: %d", len(train_dataset))
     logger.info("Batch size per GPU: %d", args.per_gpu_train_batch_size)
@@ -254,8 +259,8 @@ def train(args, model, val_dataloader, tokenizer=None):
 
             model_inp = {k: v.to(args.device) for k, v in model_inp.items()}
             start_time = time.perf_counter()
-            outputs = model(**model_inp)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+            output = model(**model_inp)  # model output is a dictionary
+            loss = output['loss']
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
@@ -283,7 +288,7 @@ def train(args, model, val_dataloader, tokenizer=None):
                 # evaluate at specified interval or if this is the last step
                 if (args.validation_steps and (global_step % args.validation_steps == 0)) or global_step == total_training_steps:
 
-                    logger.info("***** Running evaluation of step {} on dev set *****".format(global_step))
+                    logger.info("\n\n***** Running evaluation of step {} on dev set *****".format(global_step))
                     val_metrics, best_metrics, best_value = validate(args, model, val_dataloader, tb_writer,
                                                                      best_metrics, best_value, global_step)
                     metrics_names, metrics_values = zip(*val_metrics.items())
@@ -339,7 +344,7 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best
         best_metrics = val_metrics.copy()
 
         ranked_filepath = os.path.join(args.pred_dir, 'best.ranked.dev.tsv')
-        ranked_df.write_csv(ranked_filepath, header=False, sep='\t')
+        ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
 
         # Export metrics to a file accumulating best records from the current experiment
         rec_filepath = os.path.join(args.pred_dir, 'training_session_records.xls')
@@ -357,7 +362,8 @@ def evaluate(args, model, dataloader):
         eval_metrics: dict containing metrics (at least 1, batch processing time)
         rank_df: dataframe with indexed by qID (shared by multiple rows) and columns: PID, rank, score
     """
-    labels_exist = dataloader.qrels is not None
+    qrels = dataloader.dataset.qrels
+    labels_exist = qrels is not None
 
     # num_docs is the (potentially variable) number of candidates per query
     relevances = []  # (total_num_queries) list of (num_docs) lists with 1 at the indices corresponding to actually relevant passages
@@ -395,13 +401,17 @@ def evaluate(args, model, dataloader):
             df_chunks.extend(pd.DataFrame(data={"PID": ranksorted_docs[i],
                                                 "rank": list(range(len(docids[i]))),
                                                 "score": sorted_scores[i]},
-                                          index=qids[i]*len(docids[i])) for i in range(len(qids)))
+                                          index=[qids[i]]*len(docids[i])) for i in range(len(qids)))
             if labels_exist:
-                relevances.extend(get_relevances(dataloader.qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
-                num_relevant.extend(len(dataloader.qrels[qid]) for qid in qids)
+                relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
+                num_relevant.extend(len(qrels[qid]) for qid in qids)
 
     if labels_exist:
-        eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k)  # aggr. metrics for the entire dataset
+        try:
+            eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k)  # aggr. metrics for the entire dataset
+        except:
+            logger.error('Metrics calculation failed!')
+            eval_metrics = OrderedDict()
         eval_metrics['loss'] = total_loss / len(dataloader.dataset)  # average over samples
     else:
         eval_metrics = OrderedDict()
@@ -515,7 +525,7 @@ def main():
     eval_dataset = MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_dir, args.eval_candidates_path,
                                    qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                    max_query_length=args.max_query_length, num_candidates=None,
-                                   limit_size=args.limit_size)
+                                   limit_size=args.limit_size, load_collection_to_memory=args.load_collection_to_memory)
     collate_fn = eval_dataset.get_collate_func()
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
 
@@ -573,7 +583,7 @@ def main():
         logger.info(print_str)
 
         ranked_filepath = os.path.join(args.pred_dir, 'ranked.eval.tsv')
-        ranked_df.write_csv(ranked_filepath, header=False, sep='\t')
+        ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
 
 
 def setup(args):
