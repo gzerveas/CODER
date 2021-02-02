@@ -1,5 +1,5 @@
 import logging
-logging.basicConfig(format='%(asctime)s | %(name)s - %(levelname)s : %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
 logger.info("Loading packages ...")
 import os
@@ -136,13 +136,13 @@ def run_parse_args():
     parser.add_argument("--query_encoder_type", type=str, choices=['bert', 'roberta'], default='bert',
                         help="""Type of the model component used for encoding queries""")
     # The following refer to the transformer "decoder" (which processes an input sequence of document embeddings)
-    parser.add_argument('--d_model', type=int, default=64,
+    parser.add_argument('--d_model', type=int, default=None,
                         help='Internal dimension of transformer decoder embeddings')
-    parser.add_argument('--dim_feedforward', type=int, default=256,
+    parser.add_argument('--dim_feedforward', type=int, default=1024,
                         help='Dimension of dense feedforward part of transformer decoder layer')
     parser.add_argument('--num_heads', type=int, default=8,
                         help='Number of multi-headed attention heads for the transformer decoder')
-    parser.add_argument('--num_layers', type=int, default=3,
+    parser.add_argument('--num_layers', type=int, default=4,
                         help="Number of transformer decoder 'layers' (blocks)")
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout applied to most transformer decoder layers')
@@ -179,16 +179,16 @@ def train(args, model, val_dataloader, tokenizer=None):
     train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_dir, args.train_candidates_path,
                                     qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                     max_query_length=args.max_query_length, num_candidates=args.num_candidates,
-                                    limit_size=args.limit_size)
+                                    limit_size=args.limit_size, emb_collection=val_dataloader.dataset.emb_collection)
     collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg)
-    logger.info("Done in {:.3f} sec".format(time.time() - start_time))
+    logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
     # NOTE RepBERT: Must be sequential! Pos, Neg, Pos, Neg, ...
     # This is because a (query, pos. doc, neg. doc) triplet is split in 2 consecutive samples: (qID, posID) and (qID, negID)
     # If random sampling had been chosen, then these 2 samples would have ended up in different batches
     # train_sampler = SequentialSampler(train_dataset)
 
-    train_dataloader = DataLoader(train_dataset,
+    train_dataloader = DataLoader(train_dataset, shuffle=True,
                                   batch_size=train_batch_size, num_workers=args.data_num_workers,
                                   collate_fn=collate_fn)
 
@@ -223,13 +223,13 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # Train
     logger.info("***** Start training *****")
-    logger.info("  Num Epochs: %d", args.num_train_epochs)
-    logger.info("  Num examples: %d", len(train_dataset))
-    logger.info("  Batch size per GPU: %d", args.per_gpu_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation): %d",
+    logger.info("Num Epochs: %d", args.num_train_epochs)
+    logger.info("Num examples: %d", len(train_dataset))
+    logger.info("Batch size per GPU: %d", args.per_gpu_train_batch_size)
+    logger.info("Total train batch size (w. parallel, distributed & accumulation): %d",
                 train_batch_size * args.grad_accum_steps)
-    logger.info("  Gradient Accumulation steps: %d", args.grad_accum_steps)
-    logger.info("  Total optimization steps: %d", total_training_steps)
+    logger.info("Gradient Accumulation steps: %d", args.grad_accum_steps)
+    logger.info("Total optimization steps: %d", total_training_steps)
 
     global_step = start_step  # counts how many times the weights have been updated, i.e. num. batches // gradient acc. steps
     start_epoch = global_step // epoch_steps
@@ -501,7 +501,33 @@ def main():
     # Set seed
     utils.set_seed(args)
 
-    # Initialize model
+    # Get tokenizer
+    tokenizer = get_tokenizer(args)
+
+    # Load evaluation set and initialize evaluation dataloader
+    if args.task == 'train':
+        eval_mode = 'dev'  # 'eval' here is the name of the MSMARCO test set, 'dev' is the validation set
+    else:
+        eval_mode = args.task
+
+    logger.info("Preparing {} dataset ...".format(eval_mode))
+    start_time = time.time()
+    eval_dataset = MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_dir, args.eval_candidates_path,
+                                   qrels_path=args.msmarco_dir, tokenizer=tokenizer,
+                                   max_query_length=args.max_query_length, num_candidates=None,
+                                   limit_size=args.limit_size)
+    collate_fn = eval_dataset.get_collate_func()
+    logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
+
+    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+    # Note that DistributedSampler samples randomly
+    eval_dataloader = DataLoader(eval_dataset, batch_size=args.eval_batch_size, shuffle=False,
+                                 num_workers=args.data_num_workers, collate_fn=collate_fn)
+
+    logger.info("Number of {} samples: {}".format(eval_mode, len(eval_dataset)))
+    logger.info("Batch size: %d", args.eval_batch_size)
+
+    # Initialize model. This is done after loading the data, to know the doc. embeddings dimension
     logger.info("Initializing model ...")
     if args.model_type == 'repbert':
         # keep configuration setup like RepBERT (for backward compatibility).
@@ -512,35 +538,13 @@ def main():
         config = BertConfig.from_pretrained(args.load_model_path)
         model = RepBERT_Train.from_pretrained(args.load_model_path, config=config)
     else:  # new configuration setup for MultiDocumentScoringTransformer models
-        model = get_model(args)
-
-    # logger.info("Experiment configuration: %s", args)
+        model = get_model(args, eval_dataset.emb_collection.embedding_vectors.shape[1])
 
     logger.info("Model:\n{}".format(model))
     logger.info("Total number of parameters: {}".format(utils.count_parameters(model)))
     logger.info("Trainable parameters: {}".format(utils.count_parameters(model, trainable=True)))
 
-    # Get tokenizer
-    tokenizer = get_tokenizer(args)
 
-    # Load evaluation set and initialize evaluation dataloader
-    eval_mode = 'eval' if args.task == 'eval' else 'dev'  # 'eval' here is the name of the MSMARCO test set, 'dev' is the validation set
-    logger.info("Preparing {} dataset ...".format(eval_mode))
-    start_time = time.time()
-    eval_dataset = MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_dir, args.eval_candidates_path,
-                                   qrels_path=args.msmarco_dir, tokenizer=tokenizer,
-                                   max_query_length=args.max_query_length, num_candidates=None,
-                                   limit_size=args.limit_size)
-    collate_fn = eval_dataset.get_collate_func()
-    logger.info("Done in {:.3f} sec".format(time.time() - start_time))
-
-    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    eval_dataloader = DataLoader(eval_dataset, batch_size=args.eval_batch_size, shuffle=False,
-                                 num_workers=args.data_num_workers, collate_fn=collate_fn)
-
-    logger.info("  Number of {} samples: {}".format(eval_mode, len(eval_dataset)))
-    logger.info("  Batch size: %d", args.eval_batch_size)
 
     if args.task == "train":
         train(args, model, eval_dataloader, tokenizer)
@@ -629,19 +633,21 @@ def get_query_encoder(args):
         return RobertaModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
 
 
-def get_model(args):
+def get_model(args, doc_emb_dim=None):
     """Initialize and return end-to-end model object based on args"""
 
     query_encoder = get_query_encoder(args)
 
     if args.model_type == 'mdstransformer':
+
         return MDSTransformer(custom_encoder=query_encoder,
                               d_model=args.d_model,
                               num_heads=args.num_heads,
                               num_decoder_layers=args.num_layers,
                               dim_feedforward=args.dim_feedforward,
                               dropout=args.dropout,
-                              activation=args.activation)
+                              activation=args.activation,
+                              doc_emb_dim=doc_emb_dim)
     else:
         raise NotImplementedError('Unknown model type')
 

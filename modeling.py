@@ -1,8 +1,8 @@
-import math
+
 import logging
 from typing import Optional, Any, Dict
 
-import numpy as np
+import ipdb
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -178,9 +178,9 @@ class MDSTransformer(nn.Module):
 
     def __init__(self, encoder_config=None, d_model: int = 768, num_heads: int = 8,
                  num_decoder_layers: int = 6, dim_feedforward: int = 2048, dropout: float = 0.1,
-                 activation: str = "relu", positional_encoding=None,
+                 activation: str = "relu", positional_encoding=None, doc_emb_dim: int = None,
                  custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
-                 scoring_mode=None, loss_type=None) -> None:
+                 scoring_mode='cross_attention', loss_type='multilabelmargin') -> None:
         super(MDSTransformer, self).__init__()
 
         if custom_encoder is not None:
@@ -188,14 +188,27 @@ class MDSTransformer(nn.Module):
         else:
             self.encoder = RobertaModel(encoder_config)
 
+        self.doc_emb_dim = doc_emb_dim  # the expected document vector dimension. If None, it will be assumed to be d_model
+
         if custom_decoder is not None:
             self.decoder = custom_decoder
+            self.d_model = self.decoder.d_model
         else:
-            decoder_layer = nn.TransformerDecoderLayer(d_model, num_heads, dim_feedforward, dropout, activation)
-            decoder_norm = nn.LayerNorm(d_model)
+            if d_model is None:
+                self.d_model = doc_emb_dim
+                logger.warning("No `d_model` provided. Will use {} dim. for transformer model dimension, "
+                               "to match expected document dimension!".format(self.d_model))
+
+            assert self.d_model is not None, "One of `doc_emb_dim` or `d_model` should be not None!"
+            decoder_layer = nn.TransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
+            decoder_norm = nn.LayerNorm(self.d_model)
             self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm)
 
-        self.d_model = d_model
+        if self.doc_emb_dim is None:
+            self.doc_emb_dim = d_model
+            logger.warning("Using {} dim. for transformer model dimension; "
+                           "expecting same document embedding dimension!".format(self.d_model))
+
         self.num_heads = num_heads
 
         self.query_dim = self.encoder.config.hidden_size  # e.g. 768 for BERT-base
@@ -203,6 +216,12 @@ class MDSTransformer(nn.Module):
         # project query representation vectors to match dimensionality of doc embeddings (for cross-attention)
         if self.query_dim != self.d_model:
             self.project_query = nn.Linear(self.query_dim, self.d_model)
+
+        # project document representation vectors to match dimensionality of d_model
+        if self.doc_emb_dim != self.d_model:
+            self.project_documents = nn.Linear(self.doc_emb_dim, self.d_model)
+            logger.warning("Using {} dim. for transformer model dimension; will project document embeddings "
+                           "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
 
         self.score_docs = self.get_scoring_module(scoring_mode)
 
@@ -215,9 +234,15 @@ class MDSTransformer(nn.Module):
 
         if scoring_mode == 'cross_attention':
             return CrossAttentionScorer(self.d_model)
+        else:
+            raise NotImplementedError("Scoring mode '{}' not implemented!".format(scoring_mode))
 
     def get_loss_func(self, loss_type):
-        return nn.MultiLabelMarginLoss()
+
+        if loss_type == 'multilabelmargin':
+            return nn.MultiLabelMarginLoss()
+        else:
+            raise NotImplementedError("Loss type '{}' not implemented!".format(loss_type))
 
     def forward(self, query_token_ids: Tensor, query_mask: Tensor = None, doc_emb: Tensor = None,
                 docinds: Tensor = None, local_emb_mat: Tensor = None, doc_padding_mask: Tensor = None,
@@ -247,16 +272,21 @@ class MDSTransformer(nn.Module):
                 rel_scores: (batch_size, num_docs) relevance scores in [0, 1]
                 loss: scalar mean loss over entire batch (only if `labels` is provided!)
         """
-
-        if 'doc_emb' is None:  # happens only in training, when additionally there is in-batch negative sampling
+        ipdb.set_trace()
+        if doc_emb is None:  # happens only in training, when additionally there is in-batch negative sampling
             doc_emb = self.lookup_doc_emb(docinds, local_emb_mat)  # (batch_size, max_docs_per_query, doc_emb_dim)
+        if self.doc_emb_dim != self.d_model:
+            # project document representation vectors to match dimensionality of d_model
+            doc_emb = self.project_documents(doc_emb)
         # permute because pytorch convention for transformers is [seq_length, batch_size, feat_dim]
         doc_emb = doc_emb.permute(1, 0, 2)  # (max_docs_per_query, batch_size, doc_emb_dim) document embeddings
 
         if query_token_ids.size(0) != doc_emb.size(1):
             raise RuntimeError("the batch size for queries and documents must be equal")
 
-        enc_hidden_states = self.encoder(query_token_ids.to(torch.int64), attention_mask=query_mask)  # int64 required by torch nn.Embedding
+        # HF encoder output is a weird dictionary type
+        encoder_out = self.encoder(query_token_ids.to(torch.int64), attention_mask=query_mask)  # int64 required by torch nn.Embedding
+        enc_hidden_states = encoder_out['last_hidden_state']
         if self.query_dim != self.d_model:  # project query representation vectors to match dimensionality of doc embeddings
             enc_hidden_states = self.project_query(enc_hidden_states)
 
@@ -274,7 +304,7 @@ class MDSTransformer(nn.Module):
         rel_scores = self.score_docs(output_emb)  # (batch_size, num_docs) relevance scores in [0, 1]
 
         if labels is not None:
-            loss = self.loss_func(rel_scores, labels)  # scalar tensor
+            loss = self.loss_func(rel_scores, labels.long())  # loss is scalar tensor; labels are int16, expected int32
             return {'loss': loss, 'rel_scores': rel_scores}
         return {'rel_scores': rel_scores}
 

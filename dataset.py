@@ -5,6 +5,7 @@ from collections import defaultdict, OrderedDict
 from functools import partial
 from itertools import chain
 import time
+import ipdb
 
 import numpy as np
 from tqdm import tqdm
@@ -74,8 +75,11 @@ class EmbeddedCollection:
 
         self.num_docs = len(pids)
         # shape is necessary input; this information is not stored and a 1D array is loaded by default
-        self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
-                                           dtype='float32', shape=(self.num_docs, emb_dim))
+        # TODO: remove!
+        self.embedding_vectors = np.array(np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
+                                           dtype='float32', shape=(self.num_docs, emb_dim)))
+        # self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
+        #                                    dtype='float32', shape=(self.num_docs, emb_dim))
 
     def get_pid_to_ind_mapping(self, pids):
         """Returns function used to map a list of passage IDs to the corresponding integer indices of the embedding matrix"""
@@ -224,7 +228,7 @@ class MYMARCO_Dataset(Dataset):
     def __init__(self, mode,
                  embedding_memmap_dir, queries_tokenids_path, candidates_path, qrels_path=None,
                  tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
-                 limit_size=None):
+                 limit_size=None, emb_collection=None):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
@@ -244,8 +248,11 @@ class MYMARCO_Dataset(Dataset):
         """
 
         self.mode = mode  # "train", "dev", "eval"
-        logger.info("Opening collection document embeddings memmap in '{}' ...".format(embedding_memmap_dir))
-        self.emb_collection = EmbeddedCollection(embedding_memmap_dir, emb_dim=None, sorted_nat_ids=True)
+        if emb_collection is not None:
+            self.emb_collection = emb_collection
+        else:
+            logger.info("Opening collection document embeddings memmap in '{}' ...".format(embedding_memmap_dir))
+            self.emb_collection = EmbeddedCollection(embedding_memmap_dir, emb_dim=None, sorted_nat_ids=True)
 
         if os.path.isdir(queries_tokenids_path):
             queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
@@ -305,7 +312,7 @@ class MYMARCO_Dataset(Dataset):
             doc_embeddings: (len(doc_ids), emb_dim) slice of numpy.memmap embedding vectors corresponding to `doc_ids`
             rel_docs: set of ground truth relevant passage IDs corresponding to query ID; None if mode == 'eval'
         """
-
+        # ipdb.set_trace()
         qid = self.qids[ind]
         query_token_ids = self.queries[qid]
         query_token_ids = query_token_ids[:self.max_query_length]
@@ -324,7 +331,9 @@ class MYMARCO_Dataset(Dataset):
         else:
             rel_docs = None
 
-        doc_embeddings = self.emb_collection[doc_ids]  # (num_doc_ids, emb_dim) slice of numpy.memmap embeddings
+        tic = time.perf_counter()
+        doc_embeddings = torch.tensor(self.emb_collection[doc_ids])  # (num_doc_ids, emb_dim) slice of numpy.memmap embeddings
+        print("Time: {:.3g} s".format(time.perf_counter() - tic))
         return qid, query_token_ids, doc_ids, doc_embeddings, rel_docs
 
     def sample_candidates(self, candidates):
@@ -385,7 +394,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
             labels: (batch_size, max_docs_per_query) int tensor which for each query (row) contains the indices of the
                 relevant documents within its corresponding pool of candidates, `doc_ids`. Padded with -1.
     """
-
+    ipdb.set_trace()
     batch_size = len(batch_samples)
 
     qids, query_token_ids, doc_ids, doc_embeddings, rel_docs = zip(*batch_samples)
@@ -415,7 +424,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
             np.random.choice(list(unique_candidates - set(cands)), size=num_inbatch_neg, replace=False)))[:max_candidates]
                    for cands in doc_ids]
 
-        # local doc embedding matrix. It is only slightly smaller than `assembled_emb_mat`, because the chance of
+        # local doc embedding matrix. It is only slightly (if at all) smaller than `assembled_emb_mat`, because the chance of
         # duplicate docIDs in the original (unaugmented) `doc_ids` is very small #TODO: so its creation can be omitted
         local_emb_mat = torch.zeros(len(unique_candidates) + 1,  # we make 1 extra row at the end, for padding!
                                     doc_embeddings[0].shape[-1])  # (num_unique_docs, emb_dim)
