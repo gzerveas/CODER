@@ -86,6 +86,7 @@ def run_parse_args():
                         It is optional and used together with `query_encoder_type`.""")
 
     ## Dataset
+    parser.add_argument('--debug', action='store_true', help="Activate debug mode")
     parser.add_argument('--limit_size', type=float, default=None,
                         help="Limit  dataset to specified smaller random sample, e.g. for rapid debugging purposes. "
                              "If in [0,1], it will be interpreted as a proportion of the dataset, "
@@ -100,9 +101,11 @@ def run_parse_args():
                              "If 0, only documents in `candidates_path` will be used as negatives.")
 
     ## System
-    parser.add_argument("--no_cuda", action='store_true', help="Use CPU only.")
+    parser.add_argument('--n_gpu', type=int, default=-1,
+                        help="Number of GPUs. Default (-1): Use all available. 0: Use CPU only.")
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument("--data_num_workers", default=0, type=int, help="Number of processes to load data. Default: main process only.")
+    parser.add_argument("--data_num_workers", default=0, type=int,
+                        help="Number of processes feeding data to model. Default: main process only.")
     parser.add_argument("--num_keep", default=1, type=int, help="How many (latest) checkpoints to keep, besides the best.")
     parser.add_argument("--load_collection_to_memory", action='store_true',
                         help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
@@ -121,13 +124,13 @@ def run_parse_args():
     parser.add_argument("--logging_steps", type=int, default=100,
                         help="Log training information (tensorboard) every this many training steps; 0 for never")
 
-    parser.add_argument("--num_train_epochs", default=1, type=int)
+    parser.add_argument("--num_epochs", default=1, type=int)
     parser.add_argument('--optimizer', choices={"AdamW", "RAdam"}, default="AdamW", help="Optimizer")
-    parser.add_argument("--learning_rate", default=3e-6, type=float)
-    parser.add_argument("--weight_decay", default=0.01, type=float)
-    parser.add_argument("--warmup_steps", default=10000, type=int)
+    parser.add_argument("--learning_rate", default=1e-3, type=float)  # 3e-6
     parser.add_argument("--adam_epsilon", default=1e-8, type=float)
+    parser.add_argument("--warmup_steps", default=100, type=int)  # 10000
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
+    parser.add_argument("--weight_decay", default=0.01, type=float)
 
     ## Evaluation
     parser.add_argument("--metrics_k", type=int, default=10, help="Evaluate metrics considering top k candidates")
@@ -198,11 +201,11 @@ def train(args, model, val_dataloader, tokenizer=None):
                                   collate_fn=collate_fn)
 
     epoch_steps = (len(train_dataloader) // args.grad_accum_steps)  # num. actual steps (param. updates) per epoch
-    total_training_steps = epoch_steps * args.num_train_epochs
+    total_training_steps = epoch_steps * args.num_epochs
 
     start_step = 0  # which step training started from
 
-    # Prepare optimizer and schedule (linear warmup and decay)
+    # Prepare optimizer and schedule
     no_decay_str = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [param for name, param in model.named_parameters() if
@@ -221,6 +224,15 @@ def train(args, model, val_dataloader, tokenizer=None):
         model, start_step, optimizer, scheduler = utils.load_model(model, args.load_model_path, optimizer, scheduler,
                                                                    args.resume)
     model.to(args.device)
+    utils.move_to_device(optimizer, args.device)
+
+    global_step = start_step  # counts how many times the weights have been updated, i.e. num. batches // gradient acc. steps
+    start_epoch = global_step // epoch_steps
+    if start_step >= total_training_steps:
+        logger.error("The loaded model has been already trained for {} steps ({} epochs), "
+                     "while specified `num_epochs` is {} (total steps {})".format(start_epoch, start_step,
+                                                                                  args.num_epochs, total_training_steps))
+        sys.exit(1)
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
@@ -228,16 +240,13 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
-    logger.info("Num Epochs: %d", args.num_train_epochs)
+    logger.info("Num Epochs: %d", args.num_epochs)
     logger.info("Num examples: %d", len(train_dataset))
     logger.info("Batch size per GPU: %d", args.per_gpu_train_batch_size)
     logger.info("Total train batch size (w. parallel, distributed & accumulation): %d",
                 train_batch_size * args.grad_accum_steps)
     logger.info("Gradient Accumulation steps: %d", args.grad_accum_steps)
     logger.info("Total optimization steps: %d", total_training_steps)
-
-    global_step = start_step  # counts how many times the weights have been updated, i.e. num. batches // gradient acc. steps
-    start_epoch = global_step // epoch_steps
 
     best_value = 1e16 if args.key_metric in NEG_METRICS else -1e16  # initialize with +inf or -inf depending on key metric
     running_metrics = []  # (for validation) list of lists: for every evaluation, stores metrics like loss, MRR, MAP, ...
@@ -247,12 +256,12 @@ def train(args, model, val_dataloader, tokenizer=None):
     logging_loss = 0  # this is synchronized with `train_loss` every args.logging_steps
     model.zero_grad()
     model.train()
-    epoch_iterator = trange(start_epoch, int(args.num_train_epochs), desc="Epoch")
+    epoch_iterator = trange(start_epoch, int(args.num_epochs), desc="Epochs")
 
     batch_time = 0  # average time for the model to train (forward + backward pass) on a single batch of queries
     for epoch_idx in epoch_iterator:
         epoch_start_time = time.time()
-        batch_iterator = tqdm(train_dataloader, desc="Batch")
+        batch_iterator = tqdm(train_dataloader, desc="Batches")
         for step, (model_inp, _, _) in enumerate(batch_iterator):  # step can be a "sub-step", if grad. accum. > 1
             if args.resume and ((epoch_idx * epoch_steps) + step < args.grad_accum_steps * global_step):
                 continue  # this is done to continue dataloader from the correct step, when using args.resume
@@ -280,9 +289,14 @@ def train(args, model, val_dataloader, tokenizer=None):
 
                 # logging for training
                 if args.logging_steps and (global_step % args.logging_steps == 0):
-                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    tb_writer.add_scalar('lr', scheduler.get_last_lr()[0], global_step)  # [0] for first group
                     cur_loss = (train_loss - logging_loss) / args.logging_steps  # mean loss over last args.logging_steps (smoothened "current loss")
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
+                    logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
+                    logger.debug("Learning rate: {}".format(scheduler.get_last_lr()))
+                    logger.debug("Current memory usage: {} MB or {} MB".format(utils.get_current_memory_usage(),
+                                                                               utils.get_current_memory_usage2()))
+                    logger.debug("Max memory usage: {} MB".format(utils.get_max_memory_usage()))
                     logging_loss = train_loss
 
                 # evaluate at specified interval or if this is the last step
@@ -489,6 +503,8 @@ def evaluate_slow(args, model, dataloader, mode, prefix):
 
 def main():
     args = run_parse_args()
+    if args.debug:
+        logger.setLevel('DEBUG')
 
     # Setup experiment session, convert config dict to args object
     args = utils.dict2obj(setup(args))
@@ -500,13 +516,14 @@ def main():
     logger.info('Running:\n{}\n'.format(' '.join(sys.argv)))  # command used to run
 
     # Setup CUDA, GPU 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    args.n_gpu = torch.cuda.device_count()
-
-    args.device = device
+    args.device = torch.device("cuda" if torch.cuda.is_available() and (args.n_gpu != 0) else "cpu")
+    if args.n_gpu < 0:
+        args.n_gpu = torch.cuda.device_count()
+    elif args.device.type == 'cpu':
+        args.n_gpu = 0
 
     # Log current hardware setup
-    logger.info("Device: %s, n_gpu: %s", device, args.n_gpu)
+    logger.info("Device: %s, n_gpu: %s", args.device, args.n_gpu)
 
     # Set seed
     utils.set_seed(args)
@@ -550,7 +567,7 @@ def main():
     else:  # new configuration setup for MultiDocumentScoringTransformer models
         model = get_model(args, eval_dataset.emb_collection.embedding_vectors.shape[1])
 
-    logger.info("Model:\n{}".format(model))
+    logger.debug("Model:\n{}".format(model))
     logger.info("Total number of parameters: {}".format(utils.count_parameters(model)))
     logger.info("Trainable parameters: {}".format(utils.count_parameters(model, trainable=True)))
 

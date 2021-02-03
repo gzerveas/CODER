@@ -9,12 +9,14 @@ import builtins
 import ipdb
 from copy import deepcopy
 import traceback
+import resource
 
 import numpy as np
 import torch
 import xlrd
 import xlwt
 from xlutils.copy import copy
+import psutil
 
 import logging
 
@@ -115,13 +117,27 @@ def load_model(model, model_path, optimizer=None, scheduler=None, resume=False, 
             logger.info('Resumed optimizer with learning rate(s): {}'.format(lrs))
             if scheduler is not None:
                 scheduler.load_state_dict(checkpoint['scheduler'])
-                logger.info('Resumed scheduler with learning rate(s): {}'.format(scheduler.get_current_lr()))
+                logger.info('Resumed scheduler with learning rate(s): {}'.format(scheduler.get_last_lr()))
         except Exception:
             traceback.print_exc()
             logger.error("""When `resume==True`, make sure that an initialized optimizer (and optionally scheduler) 
             has been passed as an argument to `load_model`, and that the respective state(s) exist in the checkpoint.""")
 
     return model, global_step, optimizer, scheduler
+
+
+def move_to_device(obj, device):
+
+    state = obj.state if hasattr(obj, 'state') else obj
+
+    for param in state.values():
+        # Not sure there are any global tensors in the state dict
+        if isinstance(param, torch.Tensor):
+            param.data = param.data.to(device)
+            if param._grad is not None:
+                param._grad.data = param._grad.data.to(device)
+        elif isinstance(param, dict):
+            move_to_device(param, device)
 
 
 class Obj(object):
@@ -346,3 +362,21 @@ def recursively_hook(model, hook_fn):
                 recursively_hook(submodule, hook_fn)
         else:
             module.register_forward_hook(hook_fn)
+
+
+def get_current_memory_usage():
+    """RSS Memory usage in MB"""
+    with open('/proc/self/status') as f:
+        memusage = f.read().split('VmRSS:')[1].split('\n')[0][:-3]
+    return int(memusage.strip())/1024
+
+
+def get_current_memory_usage2():
+    """RSS Memory usage in MB"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info()[0] / (1024 ** 2)
+
+
+def get_max_memory_usage():
+    """max RSS Memory usage in MB"""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024

@@ -290,12 +290,12 @@ class MDSTransformer(nn.Module):
 
         # The nn.MultiHeadAttention expects ByteTensor or Boolean and uses the convention that non-0 is ignored
         # and 0 is used in attention, which is the opposite of HuggingFace.
-        memory_key_padding_mask = ~(query_mask.bool())
+        memory_key_padding_mask = ~query_mask
 
         # (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
         output_emb = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,
-                              tgt_key_padding_mask=doc_padding_mask,
-                              memory_key_padding_mask=memory_key_padding_mask)
+                                  tgt_key_padding_mask=~doc_padding_mask,  # again, MultiHeadAttention opposite of HF
+                                  memory_key_padding_mask=memory_key_padding_mask)
         # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
         output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
 
