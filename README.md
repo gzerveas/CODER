@@ -1,6 +1,21 @@
 # Multiple Document Scoring Transformer
 
-(Below apply to RepBert)
+Example commands:
+
+```bash
+python ~/Code/multidocscoring_transformer/train.py --help
+```
+will show and explain all options.
+
+```bash
+python ~/Code/multidocscoring_transformer/train.py --name DEBUG --task train  
+--output_dir ~/data/gzerveas/MultidocScoringTr/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding 
+--tokenized_dir ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO 
+--train_candidates_path ~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv 
+--eval_candidates_path ~/data/MS_MARCO/BM25_top1000.in_qrels.dev.tsv 
+--records_file ./MDST_records.xls --data_num_workers 0 --limit_size 256 --logging_steps 5 --num_candidates 30 --num_inbatch_neg 30 
+--load_collection_to_memory --debug
+```
 
 ## Data and Trained Models
 
@@ -47,7 +62,7 @@ To reduce duplication of effort in training and testing, we tokenize queries and
 
 ```bash
 python convert_text_to_tokenized.py --tokenize_queries --tokenize_collection
-python convert_collection_to_memmap.py
+python create_memmaps.py
 ```
 
 Please download the provided model `repbert.ckpt-350000.zip`, put it in `./data`, and unzip it. You should see two files in the directory `./data/ckpt-350000`, namely `pytorch_model.bin` and `config.json`.

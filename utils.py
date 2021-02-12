@@ -247,7 +247,7 @@ def register_record(filepath, timestamp, experiment_name, best_metrics, final_me
     if not os.path.exists(filepath):  # Create a records file for the first time
         logger.warning("Records file '{}' does not exist! Creating new file ...".format(filepath))
         directory = os.path.dirname(filepath)
-        if not os.path.exists(directory):
+        if len(directory) and not os.path.exists(directory):
             os.makedirs(directory)
         header = ["Timestamp", "Name", "Comment"] + ["Best " + m for m in metrics_names]
         if final_metrics is not None:
@@ -380,3 +380,18 @@ def get_current_memory_usage2():
 def get_max_memory_usage():
     """max RSS Memory usage in MB"""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+class Timer(object):
+
+    def __init__(self):
+        self.total_time = 0
+        self.count = 0
+
+    def update(self, measured_time):
+        self.total_time += measured_time
+        self.count += 1
+        return
+
+    def get_average(self):
+        return self.total_time / self.count

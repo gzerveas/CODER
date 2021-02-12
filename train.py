@@ -6,7 +6,6 @@ import os
 import sys
 import random
 import time
-
 import argparse
 import json
 import traceback
@@ -21,19 +20,22 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, SequentialSampler
 # from transformers.modeling_bert import BERT_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, get_linear_schedule_with_warmup
+from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, get_polynomial_decay_schedule_with_warmup
 
+# Package modules
 from modeling import RepBERT_Train, MDSTransformer
-from dataset import MSMARCODataset, MYMARCO_Dataset
+from dataset import MYMARCO_Dataset
 from optimizers import get_optimizer_class
 import utils
 import metrics
 
+from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
 
-
-NEG_METRICS = {}
-METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']
+NEG_METRICS = {}  # metrics which are better when smaller
+METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']  # metrics which are better when higher
 METRICS.extend(m + '@' for m in METRICS[:])
+
+val_times = utils.Timer()  # stores measured validation times
 
 
 def run_parse_args():
@@ -52,7 +54,8 @@ def run_parse_args():
                         help='If set, a timestamp and random suffix will not be appended to the output directory name')
     parser.add_argument("--task", choices=["train", "dev", "eval"], required=True)
     parser.add_argument('--resume', action='store_true',
-                        help='If set, will load `start_step` and state of optimizer, scheduler besides model weights.')
+                        help='Used together with `load_model`. '
+                             'If set, will load `start_step` and state of optimizer, scheduler besides model weights.')
 
     ## I/O
     parser.add_argument('--output_dir', type=str, default='./output',
@@ -86,9 +89,12 @@ def run_parse_args():
                         It is optional and used together with `query_encoder_type`.""")
 
     ## Dataset
-    parser.add_argument('--debug', action='store_true', help="Activate debug mode")
-    parser.add_argument('--limit_size', type=float, default=None,
-                        help="Limit  dataset to specified smaller random sample, e.g. for rapid debugging purposes. "
+    parser.add_argument('--train_limit_size', type=float, default=None,
+                        help="Limit  dataset to specified smaller random sample, e.g. for debugging purposes. "
+                             "If in [0,1], it will be interpreted as a proportion of the dataset, "
+                             "otherwise as an integer absolute number of samples")
+    parser.add_argument('--eval_limit_size', type=float, default=None,
+                        help="Limit  dataset to specified smaller random sample, e.g. for debugging purposes. "
                              "If in [0,1], it will be interpreted as a proportion of the dataset, "
                              "otherwise as an integer absolute number of samples")
     parser.add_argument("--max_query_length", type=int, default=32)
@@ -101,6 +107,7 @@ def run_parse_args():
                              "If 0, only documents in `candidates_path` will be used as negatives.")
 
     ## System
+    parser.add_argument('--debug', action='store_true', help="Activate debug mode")
     parser.add_argument('--n_gpu', type=int, default=-1,
                         help="Number of GPUs. Default (-1): Use all available. 0: Use CPU only.")
     parser.add_argument('--seed', type=int, default=42)
@@ -109,16 +116,16 @@ def run_parse_args():
     parser.add_argument("--num_keep", default=1, type=int, help="How many (latest) checkpoints to keep, besides the best.")
     parser.add_argument("--load_collection_to_memory", action='store_true',
                         help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
-                        "Needs > 16GB for MSMARCO (~50GB project total), but is faster.")
+                        "Needs ~26GB for MSMARCO (~50GB project total), but is faster.")
 
     ## Training process
     parser.add_argument("--per_gpu_eval_batch_size", default=32, type=int)
     parser.add_argument("--per_gpu_train_batch_size", default=32, type=int)
     parser.add_argument("--grad_accum_steps", type=int, default=1,
                         help="Gradient accumulation steps. The model parameters will be updated every this many batches")
-    parser.add_argument("--validation_steps", type=int, default=10000,
+    parser.add_argument("--validation_steps", type=int, default=5000,
                         help="Validate every this many training steps (i.e. param. updates); 0 for never.")
-    parser.add_argument("--save_steps", type=int, default=5000,
+    parser.add_argument("--save_steps", type=int, default=2500,
                         help="Save checkpoint every this many training steps (i.e. param. updates); "
                              "0 for no periodic saving (save only at the end)")
     parser.add_argument("--logging_steps", type=int, default=100,
@@ -126,11 +133,11 @@ def run_parse_args():
 
     parser.add_argument("--num_epochs", default=1, type=int)
     parser.add_argument('--optimizer', choices={"AdamW", "RAdam"}, default="AdamW", help="Optimizer")
-    parser.add_argument("--learning_rate", default=1e-3, type=float)  # 3e-6
-    parser.add_argument("--adam_epsilon", default=1e-8, type=float)
-    parser.add_argument("--warmup_steps", default=100, type=int)  # 10000
+    parser.add_argument("--learning_rate", default=1e-4, type=float)  # 3e-6
+    parser.add_argument("--adam_epsilon", default=1e-6, type=float)  # 1e-8
+    parser.add_argument("--warmup_steps", default=1000, type=int)  # 10000
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
-    parser.add_argument("--weight_decay", default=0.01, type=float)
+    parser.add_argument("--weight_decay", default=0.002, type=float)  # 0.01
 
     ## Evaluation
     parser.add_argument("--metrics_k", type=int, default=10, help="Evaluate metrics considering top k candidates")
@@ -185,7 +192,7 @@ def train(args, model, val_dataloader, tokenizer=None):
     train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_dir, args.train_candidates_path,
                                     qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                     max_query_length=args.max_query_length, num_candidates=args.num_candidates,
-                                    limit_size=args.limit_size,
+                                    limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
                                     emb_collection=val_dataloader.dataset.emb_collection)
     collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg)
@@ -216,8 +223,9 @@ def train(args, model, val_dataloader, tokenizer=None):
     ]
     optim_class = get_optimizer_class(args.optimizer)
     optimizer = optim_class(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
-                                                num_training_steps=total_training_steps)
+    scheduler = get_polynomial_decay_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
+                                                          num_training_steps=total_training_steps,
+                                                          lr_end=0.1*args.learning_rate, power=1.0)
 
     # Load model and possibly optimizer/scheduler state
     if args.load_model_path:
@@ -240,8 +248,9 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
-    logger.info("Num Epochs: %d", args.num_epochs)
-    logger.info("Num examples: %d", len(train_dataset))
+    logger.info("Number of epochs: %d", args.num_epochs)
+    logger.info("Number of training examples: %d", len(train_dataset))
+    logger.info("Number of validation examples: {}".format(len(val_dataloader.dataset)))
     logger.info("Batch size per GPU: %d", args.per_gpu_train_batch_size)
     logger.info("Total train batch size (w. parallel, distributed & accumulation): %d",
                 train_batch_size * args.grad_accum_steps)
@@ -258,7 +267,7 @@ def train(args, model, val_dataloader, tokenizer=None):
     model.train()
     epoch_iterator = trange(start_epoch, int(args.num_epochs), desc="Epochs")
 
-    batch_time = 0  # average time for the model to train (forward + backward pass) on a single batch of queries
+    batch_times = utils.Timer()  # average time for the model to train (forward + backward pass) on a single batch of queries
     for epoch_idx in epoch_iterator:
         epoch_start_time = time.time()
         batch_iterator = tqdm(train_dataloader, desc="Batches")
@@ -279,7 +288,7 @@ def train(args, model, val_dataloader, tokenizer=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             train_loss += loss.item()
 
-            batch_time += time.perf_counter() - start_time
+            batch_times.update(time.perf_counter() - start_time)
 
             if (step + 1) % args.grad_accum_steps == 0:
                 optimizer.step()
@@ -292,11 +301,20 @@ def train(args, model, val_dataloader, tokenizer=None):
                     tb_writer.add_scalar('lr', scheduler.get_last_lr()[0], global_step)  # [0] for first group
                     cur_loss = (train_loss - logging_loss) / args.logging_steps  # mean loss over last args.logging_steps (smoothened "current loss")
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
-                    logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
-                    logger.debug("Learning rate: {}".format(scheduler.get_last_lr()))
-                    logger.debug("Current memory usage: {} MB or {} MB".format(utils.get_current_memory_usage(),
-                                                                               utils.get_current_memory_usage2()))
-                    logger.debug("Max memory usage: {} MB".format(utils.get_max_memory_usage()))
+
+                    if args.debug:
+                        logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
+                        logger.debug("Learning rate: {}".format(scheduler.get_last_lr()))
+                        logger.debug("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
+                                                                                   np.round(utils.get_current_memory_usage2())))
+                        logger.debug("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
+                        logger.debug("Average lookup time: {} s".format(lookup_times.get_average()))
+                        logger.debug("Average retr. candidates time: {} s".format(retrieve_candidates_times.get_average()))
+                        logger.debug("Average prep. docids time: {} s".format(prep_docids_times.get_average()))
+                        logger.debug("Average sample fetching time: {} s".format(sample_fetching_times.get_average()))
+                        logger.debug("Average collation time: {} s".format(collation_times.get_average()))
+
                     logging_loss = train_loss
 
                 # evaluate at specified interval or if this is the last step
@@ -324,9 +342,18 @@ def train(args, model, val_dataloader, tokenizer=None):
     # Export record metrics to a file accumulating records from all experiments
     utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
                           best_metrics, val_metrics, comment=args.comment)
-    batch_time = batch_time / (epoch_idx * epoch_steps + step)
-    logger.info("Average time to train on 1 batch ({} samples): {:.3f} sec".format(train_batch_size, batch_time))
+
+    avg_batch_time = batch_times.total_time / (epoch_idx * epoch_steps + step)
+    logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec"
+                " ({}s per sample)".format(train_batch_size, avg_batch_time, {avg_batch_time/train_batch_size}))
+    logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec".format(train_batch_size, batch_times.get_average()))
     logger.info('Best {} was {}. Other metrics: {}'.format(args.key_metric, best_value, best_metrics))
+
+    logger.debug("Average lookup time: {} s".format(lookup_times.get_average()))
+    logger.debug("Average retr. candidates time: {} s".format(retrieve_candidates_times.get_average()))
+    logger.debug("Average prep. docids time: {} s".format(prep_docids_times.get_average()))
+    logger.debug("Average sample fetching time: {} s".format(sample_fetching_times.get_average()))
+    logger.debug("Average collation time: {} s".format(collation_times.get_average()))
 
     return
 
@@ -340,7 +367,16 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best
     eval_runtime = time.time() - eval_start_time
     model.train()
     logger.info("Validation runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(eval_runtime)))
-    print()
+
+    global val_times
+    val_times.update(eval_runtime)
+    avg_val_time = val_times.get_average()
+    avg_val_batch_time = avg_val_time / len(val_dataloader)
+    avg_val_sample_time = avg_val_time / len(val_dataloader.dataset)
+    logger.info("Avg val. time: {} hours, {} minutes, {} seconds".format(*utils.readable_time(avg_val_time)))
+    logger.info("Avg batch val. time: {} seconds".format(avg_val_batch_time))
+    logger.info("Avg sample val. time: {} seconds".format(avg_val_sample_time))
+
     print_str = 'Step {} Validation Summary: '.format(global_step)
     for k, v in val_metrics.items():
         tensorboard_writer.add_scalar('dev/{}'.format(k), v, global_step)
@@ -542,7 +578,8 @@ def main():
     eval_dataset = MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_dir, args.eval_candidates_path,
                                    qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                    max_query_length=args.max_query_length, num_candidates=None,
-                                   limit_size=args.limit_size, load_collection_to_memory=args.load_collection_to_memory)
+                                   limit_size=args.eval_limit_size,
+                                   load_collection_to_memory=args.load_collection_to_memory)
     collate_fn = eval_dataset.get_collate_func()
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
 
