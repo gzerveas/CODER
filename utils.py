@@ -88,8 +88,8 @@ def remove_oldest_checkpoint(dirpath, num_keep):
     suffices = map(lambda x: re.search(r"model_(\d*)\.", x), filelist)
     stepnums = sorted([int(matchobj.group(1)) for matchobj in suffices if matchobj])
 
-    if len(stepnums) >= num_keep:
-        os.remove("model_{}.cpt".format(stepnums[0]))
+    if len(stepnums) > num_keep:
+        os.remove(os.path.join(dirpath, "model_{}.pth".format(stepnums[0])))
 
     return
 

@@ -123,12 +123,12 @@ def run_parse_args():
     parser.add_argument("--per_gpu_train_batch_size", default=32, type=int)
     parser.add_argument("--grad_accum_steps", type=int, default=1,
                         help="Gradient accumulation steps. The model parameters will be updated every this many batches")
-    parser.add_argument("--validation_steps", type=int, default=5000,
+    parser.add_argument("--validation_steps", type=int, default=3000,
                         help="Validate every this many training steps (i.e. param. updates); 0 for never.")
-    parser.add_argument("--save_steps", type=int, default=2500,
+    parser.add_argument("--save_steps", type=int, default=2000,
                         help="Save checkpoint every this many training steps (i.e. param. updates); "
                              "0 for no periodic saving (save only at the end)")
-    parser.add_argument("--logging_steps", type=int, default=100,
+    parser.add_argument("--logging_steps", type=int, default=200,
                         help="Log training information (tensorboard) every this many training steps; 0 for never")
 
     parser.add_argument("--num_epochs", default=1, type=int)
@@ -136,6 +136,7 @@ def run_parse_args():
     parser.add_argument("--learning_rate", default=1e-4, type=float)  # 3e-6
     parser.add_argument("--adam_epsilon", default=1e-6, type=float)  # 1e-8
     parser.add_argument("--warmup_steps", default=1000, type=int)  # 10000
+    parser.add_argument("--final_lr_ratio", default=0.5, type=float)
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
     parser.add_argument("--weight_decay", default=0.002, type=float)  # 0.01
 
@@ -225,7 +226,7 @@ def train(args, model, val_dataloader, tokenizer=None):
     optimizer = optim_class(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = get_polynomial_decay_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
                                                           num_training_steps=total_training_steps,
-                                                          lr_end=0.1*args.learning_rate, power=1.0)
+                                                          lr_end=args.final_lr_ratio*args.learning_rate, power=1.0)
 
     # Load model and possibly optimizer/scheduler state
     if args.load_model_path:
@@ -309,11 +310,12 @@ def train(args, model, val_dataloader, tokenizer=None):
                                                                                    np.round(utils.get_current_memory_usage2())))
                         logger.debug("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
-                        logger.debug("Average lookup time: {} s".format(lookup_times.get_average()))
-                        logger.debug("Average retr. candidates time: {} s".format(retrieve_candidates_times.get_average()))
-                        logger.debug("Average prep. docids time: {} s".format(prep_docids_times.get_average()))
-                        logger.debug("Average sample fetching time: {} s".format(sample_fetching_times.get_average()))
-                        logger.debug("Average collation time: {} s".format(collation_times.get_average()))
+                        logger.debug("Average lookup time: {} s /samp".format(lookup_times.get_average()))
+                        logger.debug("Average retr. candidates time: {} s /samp".format(retrieve_candidates_times.get_average()))
+                        logger.debug("Average prep. docids time: {} s /samp".format(prep_docids_times.get_average()))
+                        logger.debug("Average sample fetching time: {} s /samp".format(sample_fetching_times.get_average()))
+                        logger.debug("Average collation time: {} s /batch".format(collation_times.get_average()))
+                        logger.debug("Average total batch processing time: {} s /batch".format(batch_times.get_average()))
 
                     logging_loss = train_loss
 
@@ -343,9 +345,9 @@ def train(args, model, val_dataloader, tokenizer=None):
     utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
                           best_metrics, val_metrics, comment=args.comment)
 
-    avg_batch_time = batch_times.total_time / (epoch_idx * epoch_steps + step)
+    avg_batch_time = batch_times.total_time / (epoch_idx * epoch_steps + step + 1)
     logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec"
-                " ({}s per sample)".format(train_batch_size, avg_batch_time, {avg_batch_time/train_batch_size}))
+                " ({:.6f}s per sample)".format(train_batch_size, avg_batch_time, avg_batch_time/train_batch_size))
     logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec".format(train_batch_size, batch_times.get_average()))
     logger.info('Best {} was {}. Other metrics: {}'.format(args.key_metric, best_value, best_metrics))
 
@@ -607,8 +609,6 @@ def main():
     logger.debug("Model:\n{}".format(model))
     logger.info("Total number of parameters: {}".format(utils.count_parameters(model)))
     logger.info("Trainable parameters: {}".format(utils.count_parameters(model, trainable=True)))
-
-
 
     if args.task == "train":
         train(args, model, eval_dataloader, tokenizer)
