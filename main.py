@@ -299,7 +299,8 @@ def train(args, model, val_dataloader, tokenizer=None):
 
                 # logging for training
                 if args.logging_steps and (global_step % args.logging_steps == 0):
-                    tb_writer.add_scalar('lr', scheduler.get_last_lr()[0], global_step)  # [0] for first group
+                    tb_writer.add_scalar('learn_rate_g0', scheduler.get_last_lr()[0], global_step)  # [0] for first group
+                    tb_writer.add_scalar('learn_rate_g1', scheduler.get_last_lr()[1], global_step)  # [1] for second group
                     cur_loss = (train_loss - logging_loss) / args.logging_steps  # mean loss over last args.logging_steps (smoothened "current loss")
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
 
@@ -613,13 +614,14 @@ def main():
     if args.task == "train":
         train(args, model, eval_dataloader, tokenizer)
     else:
-        # Just evaluate trained model on some dataset
+        # Just evaluate trained model on some dataset (needs ~27GB for MS MARCO dev set)
 
         # only composite (non-repbert) models need to be loaded; repbert is already loaded at this point
         if args.model_type != 'repbert':
             model, global_step, _, _ = utils.load_model(model, args.load_model_path)
         model.to(args.device)
         model_checkpoint_name = os.path.splitext(os.path.basename(args.load_model_path))[0]
+        logger.info("Will evaluate model on {} set".format(args.load_model_path, args.task))
 
         # multi-gpu eval
         if args.n_gpu > 1:
@@ -637,6 +639,7 @@ def main():
         logger.info(print_str)
 
         ranked_filepath = os.path.join(args.pred_dir, 'ranked.eval.tsv')
+        logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
         ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
 
 
