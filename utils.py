@@ -49,6 +49,8 @@ def eval_results(run_file_path,
 
 
 def set_seed(args):
+    """the seed state is shared across the entire program, regardless of module
+    (confirmed for Python random, but most likely true for the others too). Numpy is likely not thread safe."""
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -85,12 +87,11 @@ def remove_oldest_checkpoint(dirpath, num_keep):
     """Removes oldest checkpoint, if existing checkpoints in `dirpath` are more than `num_keep`"""
 
     filelist = os.listdir(dirpath)
-    suffices = map(lambda x: re.search(r"model_(\d*)\.", x), filelist)
+    suffices = map(lambda x: re.search(r"model_(\d+)\.", x), filelist)
     stepnums = sorted([int(matchobj.group(1)) for matchobj in suffices if matchobj])
 
     if len(stepnums) > num_keep:
         os.remove(os.path.join(dirpath, "model_{}.pth".format(stepnums[0])))
-
     return
 
 
@@ -138,6 +139,41 @@ def move_to_device(obj, device):
                 param._grad.data = param._grad.data.to(device)
         elif isinstance(param, dict):
             move_to_device(param, device)
+
+
+def write_list(filepath, alist):
+
+    with open(filepath, 'w') as f:
+        for item in alist:
+            f.write('{}\n'.format(item))
+
+
+# from: https://alexwlchan.net/2018/05/ascii-bar-charts/
+def ascii_bar_plot(labels, values, width=30):
+
+    increment = max(values) / width
+    longest_label_length = max(len(label) for label in labels)
+
+    for label, value in zip(labels, values):
+
+        # The ASCII block elements come in chunks of 8, so we work out how
+        # many fractions of 8 we need.
+        # https://en.wikipedia.org/wiki/Block_Elements
+        bar_chunks, remainder = divmod(int(value * 8 / increment), 8)
+
+        # First draw the full width chunks
+        bar = '█' * bar_chunks
+
+        # Then add the fractional part.  The Unicode code points for
+        # block elements are (8/8), (7/8), (6/8), ... , so we need to
+        # work backwards.
+        if remainder > 0:
+            bar += chr(ord('█') + (8 - remainder))
+
+        # If the bar is empty, add a left one-eighth block
+        bar = bar or '▏'
+
+        print(f'{label.rjust(longest_label_length)} ▏ {value:#4d} {bar}')
 
 
 class Obj(object):

@@ -20,18 +20,18 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, SequentialSampler
 # from transformers.modeling_bert import BERT_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, get_polynomial_decay_schedule_with_warmup
+from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, get_constant_schedule_with_warmup
 
 # Package modules
 from modeling import RepBERT_Train, MDSTransformer
-from dataset import MYMARCO_Dataset
-from optimizers import get_optimizer_class
+from dataset import MYMARCO_Dataset, MSMARCODataset
+from optimizers import get_optimizers, MultiOptimizer, MultiScheduler
 import utils
 import metrics
 
 from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
 
-NEG_METRICS = {}  # metrics which are better when smaller
+NEG_METRICS = {'loss'}  # metrics which are better when smaller
 METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']  # metrics which are better when higher
 METRICS.extend(m + '@' for m in METRICS[:])
 
@@ -69,8 +69,8 @@ def run_parse_args():
     parser.add_argument("--embedding_memmap_dir", type=str, default="repbert/representations/doc_embedding",
                         help="Directory containing (num_docs_in_collection, doc_emb_dim) memmap array of document "
                              "embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs")
-    parser.add_argument("--tokenized_dir", type=str, default="repbert/preprocessed",
-                        help="Contains pre-tokenized/numerized queries in JSON files")
+    parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",
+                        help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file.")
     parser.add_argument("--collection_memmap_dir", type=str, default="./data/collection_memmap", help="RepBERT only!")  # RepBERT only
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
     parser.add_argument('--load_model', dest='load_model_path', type=str, help='Path to pre-trained model.')
@@ -113,10 +113,15 @@ def run_parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument("--data_num_workers", default=0, type=int,
                         help="Number of processes feeding data to model. Default: main process only.")
-    parser.add_argument("--num_keep", default=1, type=int, help="How many (latest) checkpoints to keep, besides the best.")
+    parser.add_argument("--num_keep", default=1, type=int,
+                        help="How many (latest) checkpoints to keep, besides the best. "
+                             "The 'best' checkpoint takes ~500MB, each 'latest' checkpoint ~1.6GB.")
     parser.add_argument("--load_collection_to_memory", action='store_true',
                         help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
                         "Needs ~26GB for MSMARCO (~50GB project total), but is faster.")
+    parser.add_argument("--no_predictions", action='store_true',
+                        help="If true, will not write predictions (ranking of candidates in evaluation set) to disk. "
+                             "Used to save storage, e.g. when optimizing hyperparameters. (~300MB for 10k queries)")
 
     ## Training process
     parser.add_argument("--per_gpu_eval_batch_size", default=32, type=int)
@@ -133,10 +138,18 @@ def run_parse_args():
 
     parser.add_argument("--num_epochs", default=1, type=int)
     parser.add_argument('--optimizer', choices={"AdamW", "RAdam"}, default="AdamW", help="Optimizer")
-    parser.add_argument("--learning_rate", default=1e-4, type=float)  # 3e-6
     parser.add_argument("--adam_epsilon", default=1e-6, type=float)  # 1e-8
-    parser.add_argument("--warmup_steps", default=1000, type=int)  # 10000
-    parser.add_argument("--final_lr_ratio", default=0.5, type=float)
+    parser.add_argument("--learning_rate", default=1e-4, type=float)  # 3e-6
+    parser.add_argument("--encoder_learning_rate", default=None, type=float,
+                        help="Special learning rate for the query encoder. By default same as global learning rate.")
+    parser.add_argument("--warmup_steps", default=1000, type=int,
+                        help="For the first this many steps, the learning rate is linearly increased up to its maximum")  # 10000
+    parser.add_argument("--encoder_warmup_steps", default=None, type=int,
+                        help="Special for the query encoder. By default same as global warmup steps.")
+    parser.add_argument("--encoder_delay", default=0, type=int,
+                        help="At which step to start optimizing the encoder.")
+    parser.add_argument("--final_lr_ratio", default=0.99999, type=float,
+                        help="Proportion of the peak learning rate to retain at the end of training")
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
     parser.add_argument("--weight_decay", default=0.002, type=float)  # 0.01
 
@@ -161,11 +174,11 @@ def run_parse_args():
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout applied to most transformer decoder layers')
     parser.add_argument('--pos_encoding', choices={'fixed', 'learnable', 'none'}, default='none',
-                        help='What kind of positional encoding to use for the transformer decoder input sequence')
+                        help='What kind of positional encoding to use for the transformer decoder input sequence') # TODO: not implemented
     parser.add_argument('--activation', choices={'relu', 'gelu'}, default='gelu',
                         help='Activation to be used in transformer decoder')
     parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm'}, default='BatchNorm',
-                        help='Normalization layer to be used internally in the transformer decoder')
+                        help='Normalization layer to be used internally in the transformer decoder') # TODO: not implemented
 
     args = parser.parse_args()
 
@@ -177,20 +190,24 @@ def run_parse_args():
     if args.resume and (args.load_model_path is None):
         raise ValueError("You can only use option '--resume' when also specifying a model to load!")
 
+    if args.encoder_learning_rate is None:
+        args.encoder_learning_rate = args.learning_rate
+
+    if args.encoder_warmup_steps is None:
+        args.encoder_warmup_steps = args.encoder_warmup_steps
+
     return args
 
 
 def train(args, model, val_dataloader, tokenizer=None):
     """Prepare training dataset, train the model and handle results"""
 
-    utils.set_seed(args)  # for reproducibility
-
     tb_writer = SummaryWriter(args.tensorboard_dir)
 
     train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     logger.info("Preparing {} dataset ...".format('train'))
     start_time = time.time()
-    train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_dir, args.train_candidates_path,
+    train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_path, args.train_candidates_path,
                                     qrels_path=args.msmarco_dir, tokenizer=tokenizer,
                                     max_query_length=args.max_query_length, num_candidates=args.num_candidates,
                                     limit_size=args.train_limit_size,
@@ -198,6 +215,9 @@ def train(args, model, val_dataloader, tokenizer=None):
                                     emb_collection=val_dataloader.dataset.emb_collection)
     collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
+
+    utils.write_list(os.path.join(args.output_dir, "train_IDs.txt"), train_dataset.qids)
+    utils.write_list(os.path.join(args.output_dir, "val_IDs.txt"), val_dataloader.dataset.qids)
 
     # NOTE RepBERT: Must be sequential! Pos, Neg, Pos, Neg, ...
     # This is because a (query, pos. doc, neg. doc) triplet is split in 2 consecutive samples: (qID, posID) and (qID, negID)
@@ -214,19 +234,16 @@ def train(args, model, val_dataloader, tokenizer=None):
     start_step = 0  # which step training started from
 
     # Prepare optimizer and schedule
-    no_decay_str = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [param for name, param in model.named_parameters() if
-                    not any(pattern in name for pattern in no_decay_str)],
-         'weight_decay': args.weight_decay},
-        {'params': [param for name, param in model.named_parameters() if any(nd in name for nd in no_decay_str)],
-         'weight_decay': 0.0}
-    ]
-    optim_class = get_optimizer_class(args.optimizer)
-    optimizer = optim_class(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = get_polynomial_decay_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
-                                                          num_training_steps=total_training_steps,
-                                                          lr_end=args.final_lr_ratio*args.learning_rate, power=1.0)
+    encoder_optimizer, nonencoder_optimizer = get_optimizers(args, model)
+
+    encoder_scheduler = get_constant_schedule_with_warmup(encoder_optimizer, num_warmup_steps=args.encoder_warmup_steps)
+    nonencoder_scheduler = get_constant_schedule_with_warmup(nonencoder_optimizer, num_warmup_steps=args.warmup_steps)
+    # scheduler = get_polynomial_decay_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
+    #                                                       num_training_steps=total_training_steps,
+    #                                                       lr_end=args.final_lr_ratio*args.learning_rate, power=1.0)
+
+    optimizer = MultiOptimizer(nonencoder_optimizer, encoder_optimizer)
+    scheduler = MultiScheduler(nonencoder_scheduler, encoder_scheduler)
 
     # Load model and possibly optimizer/scheduler state
     if args.load_model_path:
@@ -234,6 +251,10 @@ def train(args, model, val_dataloader, tokenizer=None):
                                                                    args.resume)
     model.to(args.device)
     utils.move_to_device(optimizer, args.device)
+
+    if args.encoder_delay > start_step:  # TODO: ugly but there is no obvious elegant solution
+        optimizer.pop_optimizer()
+        scheduler.pop_scheduler()
 
     global_step = start_step  # counts how many times the weights have been updated, i.e. num. batches // gradient acc. steps
     start_epoch = global_step // epoch_steps
@@ -274,6 +295,7 @@ def train(args, model, val_dataloader, tokenizer=None):
         batch_iterator = tqdm(train_dataloader, desc="Batches")
         for step, (model_inp, _, _) in enumerate(batch_iterator):  # step can be a "sub-step", if grad. accum. > 1
             if args.resume and ((epoch_idx * epoch_steps) + step < args.grad_accum_steps * global_step):
+                # TODO: one can set a state train_dataloader.dataset.skip = True, which will cause the __getitem__ to immediately return None
                 continue  # this is done to continue dataloader from the correct step, when using args.resume
 
             model_inp = {k: v.to(args.device) for k, v in model_inp.items()}
@@ -297,16 +319,20 @@ def train(args, model, val_dataloader, tokenizer=None):
                 model.zero_grad()
                 global_step += 1
 
+                if global_step == args.encoder_delay:
+                    optimizer.add_optimizer(encoder_optimizer)
+                    scheduler.add_scheduler(encoder_scheduler)
+
                 # logging for training
                 if args.logging_steps and (global_step % args.logging_steps == 0):
-                    tb_writer.add_scalar('learn_rate_g0', scheduler.get_last_lr()[0], global_step)  # [0] for first group
-                    tb_writer.add_scalar('learn_rate_g1', scheduler.get_last_lr()[1], global_step)  # [1] for second group
+                    tb_writer.add_scalar('learn_rate1', scheduler.get_last_lr()[0][0], global_step)  # first brackets select scheduler, second the group
+                    tb_writer.add_scalar('learn_rate2', scheduler.get_last_lr()[1][0], global_step)
                     cur_loss = (train_loss - logging_loss) / args.logging_steps  # mean loss over last args.logging_steps (smoothened "current loss")
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
 
                     if args.debug:
                         logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
-                        logger.debug("Learning rate: {}".format(scheduler.get_last_lr()))
+                        logger.debug("Learning rate(s): {}".format(scheduler.get_last_lr()))
                         logger.debug("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
                                                                                    np.round(utils.get_current_memory_usage2())))
                         logger.debug("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
@@ -331,9 +357,10 @@ def train(args, model, val_dataloader, tokenizer=None):
 
                 if (args.save_steps and (global_step % args.save_steps == 0)) or global_step == total_training_steps:
                     # Save model checkpoint
-                    utils.remove_oldest_checkpoint(args.save_dir, args.num_keep)
                     utils.save_model(os.path.join(args.save_dir, 'model_{}.pth'.format(global_step)),
                                      global_step, model, optimizer, scheduler)
+                    utils.remove_oldest_checkpoint(args.save_dir, args.num_keep)
+
         epoch_runtime = time.time() - epoch_start_time
         logger.info("Epoch runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(epoch_runtime)))
 
@@ -358,7 +385,7 @@ def train(args, model, val_dataloader, tokenizer=None):
     logger.debug("Average sample fetching time: {} s".format(sample_fetching_times.get_average()))
     logger.debug("Average collation time: {} s".format(collation_times.get_average()))
 
-    return
+    return best_metrics
 
 
 def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best_value, global_step):
@@ -393,11 +420,13 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best
         condition = (val_metrics[args.key_metric] > best_value)
     if condition:
         best_value = val_metrics[args.key_metric]
+        # to save space: optimizer, scheduler not saved! Only latest checkpoints can be used for resuming training perfectly
         utils.save_model(os.path.join(args.save_dir, 'model_best.pth'), global_step, model)
         best_metrics = val_metrics.copy()
 
-        ranked_filepath = os.path.join(args.pred_dir, 'best.ranked.dev.tsv')
-        ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
+        if not args.no_predictions:
+            ranked_filepath = os.path.join(args.pred_dir, 'best.ranked.dev.tsv')
+            ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
 
         # Export metrics to a file accumulating best records from the current experiment
         rec_filepath = os.path.join(args.pred_dir, 'training_session_records.xls')
@@ -425,6 +454,8 @@ def evaluate(args, model, dataloader):
     query_time = 0  # average time for the model to score candidates for a single query
     total_loss = 0  # total loss over dataset
 
+    # rankfile = open(os.path.join(args.pred_dir, "debug_ranking.tsv"), 'w')  # TODO: REMOVE
+
     with torch.no_grad():
         for batch_data, qids, docids in tqdm(dataloader, desc="Evaluating"):
             batch_data = {k: v.to(args.device) for k, v in batch_data.items()}
@@ -439,7 +470,7 @@ def evaluate(args, model, dataloader):
             # Rank documents based on their scores
             num_docs_per_query = [len(cands) for cands in docids]
             num_lengths = set(num_docs_per_query)
-            no_padding = (len(num_lengths) == 1)  # all queries in this batch had the same number of candidates
+            no_padding = (len(num_lengths) == 1)  # whether all queries in this batch had the same number of candidates
 
             if no_padding:  # (only) 10% speedup compared to other case
                 sort_inds = np.fliplr(np.argsort(rel_scores, axis=1))  # (batch_size, num_docs) inds to sort rel_scores
@@ -452,9 +483,16 @@ def evaluate(args, model, dataloader):
 
             # extend by batch_size elements
             df_chunks.extend(pd.DataFrame(data={"PID": ranksorted_docs[i],
-                                                "rank": list(range(len(docids[i]))),
+                                                "rank": list(range(1, len(docids[i])+1)),
                                                 "score": sorted_scores[i]},
                                           index=[qids[i]]*len(docids[i])) for i in range(len(qids)))
+
+            # for qid, docid_list, score_list in zip(qids, ranksorted_docs, sorted_scores):  # TODO: REMOVE
+            #     rank = 1
+            #     for docid, score in zip(docid_list, score_list):
+            #         rankfile.write("{}\t{}\t{}\t{}\n".format(qid, docid, rank, score))
+            #         rank += 1
+
             if labels_exist:
                 relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
                 num_relevant.extend(len(qrels[qid]) for qid in qids)
@@ -470,6 +508,18 @@ def evaluate(args, model, dataloader):
         eval_metrics = OrderedDict()
     eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
     ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
+
+    if args.debug and labels_exist:
+        try:
+            rs = (np.nonzero(r)[0] for r in relevances)
+            ranks = [1 + int(r[0]) if r.size else 1e10 for r in rs]  # for each query, what was the rank of the rel. doc
+            freqs, bin_edges = np.histogram(ranks, bins=[1, 5, 10, 20, 30] + list(range(50, 1050, 50)))
+            bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i+1])
+                          for i in range(len(bin_edges)-1)] + ["[{}, inf)".format(bin_edges[-1])]
+            print('\nHistogram of ranks for the ground truth documents:\n')
+            utils.ascii_bar_plot(bin_labels, freqs, width=50)
+        except:
+            logger.error('Not possible!')
 
     return eval_metrics, ranked_df
 
@@ -512,7 +562,7 @@ def calculate_metrics(relevances, num_relevant, k):
 
 
 # Very inefficient. Used by RepBERT only.
-def evaluate_slow(args, model, dataloader, mode, prefix):
+def evaluate_slow(args, model, dataloader, mode, prefix='model'):
     """
     Writes scores to file while evaluating, then reads file, sorts results and writes another file with ranks, then runs
     MSMARCO evaluation Python script on this file (again reads many things) and uses regex to get MRR metric from output
@@ -527,7 +577,7 @@ def evaluate_slow(args, model, dataloader, mode, prefix):
                 batch = {k: v.to(args.device) for k, v in batch.items()}
                 outputs = model(**batch)  # Tuple(similarities, query_embeddings, doc_embeddings)
                 # outputs[0] is a (batch_size, batch_size) tensor of similarities between each query in the batch and each document in the batch
-                scores = torch.diagonal(outputs[0]).detach().cpu().numpy()
+                scores = torch.diagonal(outputs['rel_scores']).detach().cpu().numpy()  # outputs[0]
                 assert len(qids) == len(docids) == len(scores)
                 for qid, docid, score in zip(qids, docids, scores):
                     outputfile.write(f"{qid}\t{docid}\t{score}\n")
@@ -540,14 +590,12 @@ def evaluate_slow(args, model, dataloader, mode, prefix):
         return mrr
 
 
-def main():
-    args = run_parse_args()
+def main(config):
+
+    args = utils.dict2obj(config)  # Convert config dict to args object
+
     if args.debug:
         logger.setLevel('DEBUG')
-
-    # Setup experiment session, convert config dict to args object
-    args = utils.dict2obj(setup(args))
-
     # Add file logging besides stdout
     file_handler = logging.FileHandler(os.path.join(args.output_dir, 'output.log'))
     logger.addHandler(file_handler)
@@ -578,11 +626,7 @@ def main():
 
     logger.info("Preparing {} dataset ...".format(eval_mode))
     start_time = time.time()
-    eval_dataset = MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_dir, args.eval_candidates_path,
-                                   qrels_path=args.msmarco_dir, tokenizer=tokenizer,
-                                   max_query_length=args.max_query_length, num_candidates=None,
-                                   limit_size=args.eval_limit_size,
-                                   load_collection_to_memory=args.load_collection_to_memory)
+    eval_dataset = get_dataset(args, eval_mode, tokenizer)
     collate_fn = eval_dataset.get_collate_func()
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
 
@@ -602,8 +646,8 @@ def main():
         if args.load_model_path is None:
             args.load_model_path = "bert-base-uncased"
         # Works with either directory path containing HF config file, or JSON HF config file,  or pre-defined model string
-        config = BertConfig.from_pretrained(args.load_model_path)
-        model = RepBERT_Train.from_pretrained(args.load_model_path, config=config)
+        config_obj = BertConfig.from_pretrained(args.load_model_path)
+        model = RepBERT_Train.from_pretrained(args.load_model_path, config=config_obj)
     else:  # new configuration setup for MultiDocumentScoringTransformer models
         model = get_model(args, eval_dataset.emb_collection.embedding_vectors.shape[1])
 
@@ -620,8 +664,8 @@ def main():
         if args.model_type != 'repbert':
             model, global_step, _, _ = utils.load_model(model, args.load_model_path)
         model.to(args.device)
-        model_checkpoint_name = os.path.splitext(os.path.basename(args.load_model_path))[0]
-        logger.info("Will evaluate model on {} set".format(args.load_model_path, args.task))
+
+        logger.info("Will evaluate model on candidates in: {}".format(args.eval_candidates_path))
 
         # multi-gpu eval
         if args.n_gpu > 1:
@@ -638,7 +682,10 @@ def main():
             print_str += '{}: {:8f} | '.format(k, v)
         logger.info(print_str)
 
-        ranked_filepath = os.path.join(args.pred_dir, 'ranked.eval.tsv')
+        filename = 'reranked_' + os.path.basename(args.eval_candidates_path)
+        if not filename.endswith('.tsv'):
+            filename = filename[:filename.find('_memmap')] + '.tsv'  # it "eats" the last character if not '_memmap'
+        ranked_filepath = os.path.join(args.pred_dir, filename)
         logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
         ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
 
@@ -691,6 +738,20 @@ def setup(args):
     return config
 
 
+def get_dataset(args, eval_mode, tokenizer):
+    """Initialize and return dataset object based on args"""
+
+    if args.model_type == 'repbert':
+        return MSMARCODataset(eval_mode, args.msmarco_dir, args.collection_memmap_dir, args.tokenized_path,
+                              args.max_query_length, args.max_doc_length, limit_size=args.eval_limit_size)
+    else:
+        return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_path, args.eval_candidates_path,
+                               qrels_path=args.msmarco_dir, tokenizer=tokenizer,
+                               max_query_length=args.max_query_length, num_candidates=None,
+                               limit_size=args.eval_limit_size,
+                               load_collection_to_memory=args.load_collection_to_memory)
+
+
 def get_query_encoder(args):
     """Initialize and return query encoder model object based on args"""
 
@@ -734,7 +795,9 @@ def get_tokenizer(args):
 
 if __name__ == "__main__":
     total_start_time = time.time()
-    main()
+    args = run_parse_args()
+    config = setup(args)  # Setup experiment session
+    main(config)
     logger.info("All done!")
     total_runtime = time.time() - total_start_time
     logger.info("Total runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(total_runtime)))

@@ -252,30 +252,30 @@ def load_qrels(filepath):
 
 
 # Not used currently, CandidatesDataset is used instead
-def load_candidates(path_to_candidates):
-    """
-    Load candidate (retrieved) documents/passages from a file.
-    Assumes that retrieved documents per query are given in the order of rank (most relevant first) in the first 2
-    columns (ignores rest columns) as "qID1 \t pID1\n qID1 \t pID2\n ..."  but not necessarily contiguously (sorted by qID).
-    :param path_to_candidates: path to file of candidate (retrieved) documents/passages per query
-    :return:
-        qid_to_candidate_passages: dict: {int qID : list of retrieved int pIDs in order of relevance}
-    """
-
-    qid_to_candidate_passages = defaultdict(list)  # dict: {qID : list of retrieved pIDs in order of relevance}
-
-    with open(path_to_candidates, 'r') as f:
-        for line in f:
-            try:
-                fields = line.strip().split('\t')
-                qid = int(fields[0])
-                pid = int(fields[1])
-
-                qid_to_candidate_passages[qid].append(pid)
-            except Exception as x:
-                print(x)
-                logger.warning("Line \"{}\" is not in valid format and resulted in: {}".format(line, fields))
-    return qid_to_candidate_passages
+# def load_candidates(path_to_candidates):
+#     """
+#     Load candidate (retrieved) documents/passages from a file.
+#     Assumes that retrieved documents per query are given in the order of rank (most relevant first) in the first 2
+#     columns (ignores rest columns) as "qID1 \t pID1\n qID1 \t pID2\n ..."  but not necessarily contiguously (sorted by qID).
+#     :param path_to_candidates: path to file of candidate (retrieved) documents/passages per query
+#     :return:
+#         qid_to_candidate_passages: dict: {int qID : list of retrieved int pIDs in order of relevance}
+#     """
+#
+#     qid_to_candidate_passages = defaultdict(list)  # dict: {qID : list of retrieved pIDs in order of relevance}
+#
+#     with open(path_to_candidates, 'r') as f:
+#         for line in f:
+#             try:
+#                 fields = line.strip().split('\t')
+#                 qid = int(fields[0])
+#                 pid = int(fields[1])
+#
+#                 qid_to_candidate_passages[qid].append(pid)
+#             except Exception as x:
+#                 print(x)
+#                 logger.warning("Line \"{}\" is not in valid format and resulted in: {}".format(line, fields))
+#     return qid_to_candidate_passages
 
 
 # Not used because of REALLY SLOW access by pandas multi-row indexing when the number of queries is large
@@ -612,7 +612,11 @@ def assemble_3D_tensors(doc_ids, local_emb_mat, docID_to_localind):
 class MSMARCODataset(Dataset):
     def __init__(self, mode, msmarco_dir,
                  collection_memmap_dir, queries_tokenids_path,
-                 max_query_length=20, max_doc_length=256):
+                 max_query_length=20, max_doc_length=256, limit_size=None):
+        """
+        :param limit_size: If set, limit dataset size to a smaller subset, e.g. for debugging. If in [0,1], it will
+            be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
+        """
         self.collection = CollectionDataset(collection_memmap_dir)
         if os.path.isdir(queries_tokenids_path):
             queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
@@ -627,6 +631,49 @@ class MSMARCODataset(Dataset):
         self.sep_id = tokenizer.sep_token_id
         self.max_query_length = max_query_length
         self.max_doc_length = max_doc_length
+        self.limit_dataset_size(limit_size)
+
+    def limit_dataset_size(self, limit_size):
+        """Changes dataset to a smaller subset, e.g. for debugging"""
+        if limit_size is not None:
+            if limit_size > 1:
+                limit_size = int(limit_size)
+            else:  # interpret as proportion if in (0, 1]
+                limit_size = int(limit_size * len(self.qids))
+            if limit_size < len(self.qids):
+                self.qids = self.qids[:limit_size]
+                self.pids = self.pids[:limit_size]
+                self.labels = self.labels[:limit_size]
+                # self.candidates.lengths = self.candidates.lengths[:limit_size]
+                # self.candidates.get_qid_to_ind_mapping(self.qids)
+        return
+
+    def get_collate_function(self):
+        def collate_function(batch):
+            input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]
+            token_type_ids_lst = [[0] * len(x["query_input_ids"]) + [1] * len(x["doc_input_ids"]) for x in batch]
+            valid_mask_lst = [[1] * len(input_ids) for input_ids in input_ids_lst]
+            position_ids_lst = [list(range(len(x["query_input_ids"]))) +
+                                list(range(len(x["doc_input_ids"]))) for x in batch]
+
+            # The 2D tensors are padded NOT to a standard length (transformer seq. length), but to the max_len in the batch!
+            data = {
+                "input_ids": pack_tensor_2D(input_ids_lst, default=0, dtype=torch.int64),
+                # int64 is required by torch nn.Embedding :(
+                "token_type_ids": pack_tensor_2D(token_type_ids_lst, default=0, dtype=torch.int64),
+                "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
+                "position_ids": pack_tensor_2D(position_ids_lst, default=0, dtype=torch.int64),
+            }
+            qid_lst = [x['qid'] for x in
+                       batch]  # TODO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
+            docid_lst = [x['docid'] for x in batch]
+            if self.mode == "train":
+                # labels holds the in-batch indices of the relevant doc IDs for each query
+                labels = [[j for j in range(len(docid_lst)) if docid_lst[j] in x['rel_docs']] for x in batch]
+                data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int64, length=len(batch))
+            return data, qid_lst, docid_lst
+
+        return collate_function
 
     def __len__(self):
         return len(self.qids)
@@ -657,71 +704,3 @@ def pack_tensor_2D(lstlst, default, dtype, length=None):
     for i, l in enumerate(lstlst):
         tensor[i, :len(l)] = torch.tensor(l, dtype=dtype)  # casting to tensor required for assignment
     return tensor
-
-
-# only used by RepBERT
-def get_collate_function(mode):
-    def collate_function(batch):
-        input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]
-        token_type_ids_lst = [[0] * len(x["query_input_ids"]) + [1] * len(x["doc_input_ids"]) for x in batch]
-        valid_mask_lst = [[1] * len(input_ids) for input_ids in input_ids_lst]
-        position_ids_lst = [list(range(len(x["query_input_ids"]))) +
-                            list(range(len(x["doc_input_ids"]))) for x in batch]
-
-        # The 2D tensors are padded NOT to a standard length (transformer seq. length), but to the max_len in the batch!
-        data = {
-            "input_ids": pack_tensor_2D(input_ids_lst, default=0, dtype=torch.int64),  # int64 is required by torch nn.Embedding :(
-            "token_type_ids": pack_tensor_2D(token_type_ids_lst, default=0, dtype=torch.int64),
-            "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
-            "position_ids": pack_tensor_2D(position_ids_lst, default=0, dtype=torch.int64),
-        }
-        qid_lst = [x['qid'] for x in
-                   batch]  # TODO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
-        docid_lst = [x['docid'] for x in batch]
-        if mode == "train":
-            # labels holds the in-batch indices of the relevant doc IDs for each query
-            labels = [[j for j in range(len(docid_lst)) if docid_lst[j] in x['rel_docs']] for x in batch]
-            data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int64, length=len(batch))
-        return data, qid_lst, docid_lst
-
-    return collate_function
-
-
-def _test_dataset():
-    dataset = MSMARCODataset(mode="train")
-    for data in dataset:
-        tokens = dataset.tokenizer.convert_ids_to_tokens(data["query_input_ids"])
-        print(tokens)
-        tokens = dataset.tokenizer.convert_ids_to_tokens(data["doc_input_ids"])
-        print(tokens)
-        print(data['qid'], data['docid'], data['rel_docs'])
-        print()
-        k = input()
-        if k == "q":
-            break
-
-
-def _test_collate_func():
-    from torch.utils.data import DataLoader, SequentialSampler
-    eval_dataset = MSMARCODataset(mode="train")
-    train_sampler = SequentialSampler(eval_dataset)
-    collate_fn = get_collate_function(mode="train")
-    dataloader = DataLoader(eval_dataset, batch_size=26,
-                            num_workers=4, collate_fn=collate_fn, sampler=train_sampler)
-    tokenizer = eval_dataset.tokenizer
-    for batch, qidlst, pidlst in tqdm(dataloader):
-        pass
-        '''
-        print(batch['input_ids'])
-        print(batch['token_type_ids'])
-        print(batch['valid_mask'])
-        print(batch['position_ids'])
-        print(batch['labels'])
-        k = input()
-        if k == "q":
-            break
-        '''
-
-
-if __name__ == "__main__":
-    _test_collate_func()

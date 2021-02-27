@@ -1,7 +1,8 @@
 import os
 import json
 import argparse
-import numpy as np
+import glob
+import re
 from tqdm import tqdm
 from transformers import BertTokenizer, RobertaTokenizer
 
@@ -31,22 +32,28 @@ def tokenize_file(tokenizer, input_file, output_file):
     
 
 def tokenize_queries(args, tokenizer):
-    for mode in ["train", "dev", "eval", "eval.small"]:
-        output_path = f"{args.output_dir}/queries.{mode}.json"
-        tokenize_file(tokenizer, f"{args.msmarco_dir}/queries.{mode}.tsv", output_path)
 
+    if os.path.isdir(args.queries):
+        data_paths = glob.glob(os.path.join(args.queries, '*'))  # list of all paths
+        selected_paths = list(filter(lambda x: re.search(r"queries\..*\.tsv", x), data_paths))
+    else:
+        selected_paths = [args.queries]
 
-def tokenize_collection(args, tokenizer):
-    output_path = f"{args.output_dir}/collection.tokenize.json"
-    tokenize_file(tokenizer, f"{args.msmarco_dir}/collection.tsv", output_path)
+    for input_path in selected_paths:
+        output_path = os.path.join(args.output_dir, os.path.basename(input_path)[:-4] + '.json')
+        tokenize_file(tokenizer, input_path, output_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--msmarco_dir", type=str, default="./data/msmarco-passage")
-    parser.add_argument("--output_dir", type=str, default="./data/tokenized")
-    parser.add_argument("--tokenize_queries", action="store_true")
-    parser.add_argument("--tokenize_collection", action="store_true")
+    parser.add_argument("--output_dir", type=str, default="tokenized",
+                        help='Path of directory where to write tokenized collection and/or queries in JSON format.')
+    parser.add_argument("--queries", type=str, default=None,
+                        help="Path of text queries. If a directory, will tokenize all 'queries.*.tsv' found within, "
+                             "otherwise the specified file path. If flag is not used, no queries will be tokenized.")
+    parser.add_argument("--collection", type=str, default=None,
+                        help="Path of the text file containing the document collection. "
+                             "If flag is not used, no collection will be tokenized.")
     parser.add_argument("--tokenizer_type", type=str, choices=['bert', 'roberta'], default='bert',
                         help="""Type of tokenizer for the model component used for encoding queries (and passages)""")
     parser.add_argument("--tokenizer_from", type=str, default=None,
@@ -59,9 +66,9 @@ if __name__ == "__main__":
 
     tokenizer = get_tokenizer(args)
 
-    if args.tokenize_queries:
+    if args.queries is not None:
         tokenize_queries(args, tokenizer)  
-    if args.tokenize_collection:
-        tokenize_collection(args, tokenizer) 
+    if args.collection is not None:
+        tokenize_file(tokenizer, args.collection, os.path.join(args.output_dir, 'collection.tokenized.json'))
 
     tokenizer.save_pretrained(args.output_dir)

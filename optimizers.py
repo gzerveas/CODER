@@ -1,7 +1,12 @@
 import math
+import logging
+
 import torch
 from torch.optim.optimizer import Optimizer
 from transformers import AdamW
+
+logging.basicConfig(format='%(asctime)s | %(levelname)s : %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def get_optimizer_class(name):
@@ -12,6 +17,105 @@ def get_optimizer_class(name):
         return RAdam
     elif name == "AdamW":
         return AdamW
+
+
+def get_optimizers(args, model):
+
+    optim_class = get_optimizer_class(args.optimizer)
+
+    no_decay_str = ['bias', 'LayerNorm.weight']
+    encoder_no_decay_pgroup = []  # parameter group corresponding to encoder, contains biases and LayerNorm params
+    encoder_decay_pgroup = []  # parameter group corresponding to encoder. L2 regularization will be applied
+    nonencoder_no_decay_pgroup = []  # parameter group for non-encoder part, contains biases and LayerNorm params
+    nonencoder_decay_pgroup = []  # parameter group for non-encoder part. L2 regularization will be applied
+    for name, param in model.named_parameters():
+        if name in model.encoder._parameters.keys():
+            if any(st in name for st in no_decay_str):
+                encoder_no_decay_pgroup.append(param)
+            else:
+                encoder_decay_pgroup.append(param)
+        else:
+            if any(st in name for st in no_decay_str):
+                nonencoder_no_decay_pgroup.append(param)
+            else:
+                nonencoder_decay_pgroup.append(param)
+
+    encoder_optim_pgroups = [{'params': encoder_no_decay_pgroup, 'weight_decay': 0},
+                             {'params': encoder_decay_pgroup, 'weight_decay': args.weight_decay}]
+    # keyword arguments here will be the global defaults
+    encoder_optimizer = optim_class(encoder_optim_pgroups, lr=args.encoder_learning_rate, eps=args.adam_epsilon)
+
+    nonencoder_optim_pgroups = [{'params': nonencoder_no_decay_pgroup, 'weight_decay': 0},
+                                {'params': nonencoder_decay_pgroup, 'weight_decay': args.weight_decay}]
+    # keyword arguments here will be the global defaults
+    nonencoder_optimizer = optim_class(nonencoder_optim_pgroups, lr=args.learning_rate, eps=args.adam_epsilon)
+
+    return encoder_optimizer, nonencoder_optimizer
+
+
+class MultiOptimizer(object):
+    """Provides a single-Optimizer API for a collection of several optimizers.
+    Useful in case several schedules are used to control the learning rate of different portions of the model."""
+
+    def __init__(self, *optimizers):
+        """Ex: multoptim = MultiOptimizer(optim1, optim2)"""
+        self.optimizers = list(optimizers)
+
+    def zero_grad(self):
+        for op in self.optimizers:
+            op.zero_grad()
+
+    def step(self):
+        for op in self.optimizers:
+            op.step()
+
+    def state_dict(self):
+        return [op.state_dict() for op in self.optimizers]
+
+    def load_state_dict(self, state_dicts):
+        if len(state_dicts) > len(self.optimizers):
+            raise ValueError("Got {} state dictionaries for {} optimizers!".format(len(state_dicts), len(self.optimizers)))
+        elif len(state_dicts) < len(self.optimizers):
+            logger.warning("Got {} state dictionaries for {} optimizers! "
+                           "The state of some optimizers will remain as is.".format(len(state_dicts), len(self.optimizers)))
+        for i in range(len(state_dicts)):
+            self.optimizers[i].load_state_dict(state_dicts[i])
+
+    def add_optimizer(self, optimizer):
+        self.optimizers.append(optimizer)
+
+    def pop_optimizer(self):
+        self.optimizers.pop()
+
+
+class MultiScheduler(object):
+    """Provides a single-Scheduler API for a collection of several schedulers.
+    Useful in case several schedules are used to control the learning rate of different portions of the model."""
+
+    def __init__(self, *schedulers):
+        """Ex: multischeduler = MultiScheduler(sched1, sched2)"""
+        self.schedulers = list(schedulers)
+
+    def state_dict(self):
+        return [s.state_dict() for s in self.schedulers]
+
+    def load_state_dict(self, state_dicts):
+        if len(state_dicts) > len(self.schedulers):
+            raise ValueError("Got {} state dictionaries for {} schedulers!".format(len(state_dicts), len(self.schedulers)))
+        elif len(state_dicts) < len(self.schedulers):
+            logger.warning("Got {} state dictionaries for {} schedulers! "
+                           "The state of some schedulers will remain as is.".format(len(state_dicts), len(self.schedulers)))
+        for i in range(len(state_dicts)):
+            self.schedulers[i].load_state_dict(state_dicts[i])
+
+    def get_lr(self):
+        return [s.get_lr() for s in self.schedulers]
+
+    def add_scheduler(self, scheduler):
+        self.schedulers.append(scheduler)
+
+    def pop_scheduler(self):
+        self.schedulers.pop()
 
 
 # from https://github.com/LiyuanLucasLiu/RAdam/blob/master/radam/radam.py
