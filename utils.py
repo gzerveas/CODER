@@ -95,36 +95,41 @@ def remove_oldest_checkpoint(dirpath, num_keep):
     return
 
 
-def load_model(model, model_path, optimizer=None, scheduler=None, resume=False, change_output=False):
+def load_model(model, model_path, device='cpu', resume=False, change_output=False):
+    """
+    :param model: an initialized model object, already on its intended device
+    :param model_path: checkpoint file from which to load model
+    :param device: Where to initially load the tensors. The device of 'model' will determine the final destination,
+        but by explicitly setting this to the same device as where `model` resides, intermediate memory allocation may be avoided.
+    :param optimizer: initialized optimizer object. Returned "as is", unless `resume` is True, in which case the state is loaded
+    :param scheduler: initialized scheduler object. Returned "as is", unless `resume` is True, in which case the state is loaded
+    :param resume: if True, will additionally load global_step, optimizer and scheduler states
+    :param change_output: if True, the `output_layer` parameters will not be loaded onto the model (used for fine-tuning)
+    :return:
+    """
     global_step = 0
-    checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)  # Load all tensors onto the CPU
-    state_dict = deepcopy(checkpoint['state_dict'])
+    checkpoint = torch.load(model_path, map_location=device)
+    # checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)  # Load all tensors onto the CPU
     if change_output:  # this is used when fine-tuning
-        for key, val in checkpoint['state_dict'].items():
+        for key, val in list(checkpoint['state_dict'].items()):
             if key.startswith('output_layer'):
-                state_dict.pop(key)
-    model.load_state_dict(state_dict, strict=False)
+                checkpoint['state_dict'].pop(key)
+    model.load_state_dict(checkpoint['state_dict'], strict=False)
     logger.info('Loaded model from {}. Global step: {}'.format(model_path, checkpoint['global_step']))
 
-    # resume *training* from saved optimizer and scheduler 
-    if resume:
+    optimizer_state, scheduler_state = None, None
+    if resume:  # resume *training* from saved optimizer and scheduler
         try:
-            optimizer.load_state_dict(checkpoint['optimizer'])
             global_step = checkpoint['global_step']
-
-            lrs = []  # list of learning rates, one per parameter group
-            for param_group in optimizer.param_groups:
-                lrs.append(param_group['lr'])
-            logger.info('Resumed optimizer with learning rate(s): {}'.format(lrs))
-            if scheduler is not None:
-                scheduler.load_state_dict(checkpoint['scheduler'])
-                logger.info('Resumed scheduler with learning rate(s): {}'.format(scheduler.get_last_lr()))
-        except Exception:
+            optimizer_state = checkpoint['optimizer']
+            if 'scheduler' in checkpoint:
+                scheduler_state = checkpoint['scheduler']
+        except KeyError:
             traceback.print_exc()
-            logger.error("""When `resume==True`, make sure that an initialized optimizer (and optionally scheduler) 
-            has been passed as an argument to `load_model`, and that the respective state(s) exist in the checkpoint.""")
+            logger.error("When `resume==True`, make sure that the states of an optimizer (and optionally scheduler) "
+                         "exist in the checkpoint.")
 
-    return model, global_step, optimizer, scheduler
+    return model, global_step, optimizer_state, scheduler_state
 
 
 def move_to_device(obj, device):
@@ -133,7 +138,7 @@ def move_to_device(obj, device):
 
     for param in state.values():
         # Not sure there are any global tensors in the state dict
-        if isinstance(param, torch.Tensor):
+        if torch.is_tensor(param):
             param.data = param.data.to(device)
             if param._grad is not None:
                 param._grad.data = param._grad.data.to(device)

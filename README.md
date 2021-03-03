@@ -10,19 +10,19 @@ python ~/Code/multidocscoring_transformer/main.py --help
 ### Train (in debug mode)
 
 ```bash
-python ~/Code/multidocscoring_transformer/main.py --debug --name DEBUG --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_dir ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --train_limit_size 256 --logging_steps 2 --num_candidates 30 --num_inbatch_neg 30 --load_collection_to_memory
+python ~/Code/multidocscoring_transformer/main.py --debug --name DEBUG --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --train_limit_size 256 --logging_steps 2 --num_candidates 30 --num_inbatch_neg 30 --load_collection_to_memory
 ```
 
 ### Train
 
 ```bash
-python ~/Code/multidocscoring_transformer/main.py --name Informative_ParamValue3 --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_dir ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --num_candidates 30 --num_inbatch_neg 30 --load_collection_to_memory
+python ~/Code/multidocscoring_transformer/main.py --name Informative_ParamValue3 --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --num_candidates 30 --num_inbatch_neg 30 --load_collection_to_memory
 ```
 
 ### Evaluate
 
 ```bash
-python ~/Code/multidocscoring_transformer/main.py --name eval_Alpha0_100bm100rnd_lr1e-5w10000fr0.9  --no_timestamp --task dev --output_dir ~/data/gzerveas/MultidocScoringTr/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_dir ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file ~/data/gzerveas/MultidocScoringTr/MDST_records.xls --data_num_workers 0  --load_collection_to_memory --load_model ~/data/gzerveas/MultidocScoringTr/Experiments/Alpha0_100bm100rnd_lr1e-5w10000fr1_2021-02-14_21-10-45_wD9/checkpoints/model_best.pth
+python ~/Code/multidocscoring_transformer/main.py --name eval_Alpha0_100bm100rnd_lr1e-5w10000fr0.9  --no_timestamp --task dev --output_dir ~/data/gzerveas/MultidocScoringTr/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file ~/data/gzerveas/MultidocScoringTr/MDST_records.xls --data_num_workers 0  --load_collection_to_memory --load_model ~/data/gzerveas/MultidocScoringTr/Experiments/Alpha0_100bm100rnd_lr1e-5w10000fr1_2021-02-14_21-10-45_wD9/checkpoints/model_best.pth
 ```
 
 ## Data and Trained Models

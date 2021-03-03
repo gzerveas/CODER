@@ -50,7 +50,7 @@ def get_optimizers(args, model):
     # keyword arguments here will be the global defaults
     nonencoder_optimizer = optim_class(nonencoder_optim_pgroups, lr=args.learning_rate, eps=args.adam_epsilon)
 
-    return encoder_optimizer, nonencoder_optimizer
+    return nonencoder_optimizer, encoder_optimizer
 
 
 class MultiOptimizer(object):
@@ -96,6 +96,10 @@ class MultiScheduler(object):
         """Ex: multischeduler = MultiScheduler(sched1, sched2)"""
         self.schedulers = list(schedulers)
 
+    def step(self):
+        for s in self.schedulers:
+            s.step()
+
     def state_dict(self):
         return [s.state_dict() for s in self.schedulers]
 
@@ -108,8 +112,8 @@ class MultiScheduler(object):
         for i in range(len(state_dicts)):
             self.schedulers[i].load_state_dict(state_dicts[i])
 
-    def get_lr(self):
-        return [s.get_lr() for s in self.schedulers]
+    def get_last_lr(self):
+        return [s.get_last_lr() for s in self.schedulers]
 
     def add_scheduler(self, scheduler):
         self.schedulers.append(scheduler)

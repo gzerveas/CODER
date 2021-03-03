@@ -20,7 +20,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, SequentialSampler
 # from transformers.modeling_bert import BERT_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, get_constant_schedule_with_warmup
+from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, get_constant_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup
 
 # Package modules
 from modeling import RepBERT_Train, MDSTransformer
@@ -194,7 +194,7 @@ def run_parse_args():
         args.encoder_learning_rate = args.learning_rate
 
     if args.encoder_warmup_steps is None:
-        args.encoder_warmup_steps = args.encoder_warmup_steps
+        args.encoder_warmup_steps = args.warmup_steps
 
     return args
 
@@ -230,31 +230,43 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     epoch_steps = (len(train_dataloader) // args.grad_accum_steps)  # num. actual steps (param. updates) per epoch
     total_training_steps = epoch_steps * args.num_epochs
-
     start_step = 0  # which step training started from
 
-    # Prepare optimizer and schedule
-    encoder_optimizer, nonencoder_optimizer = get_optimizers(args, model)
-
-    encoder_scheduler = get_constant_schedule_with_warmup(encoder_optimizer, num_warmup_steps=args.encoder_warmup_steps)
-    nonencoder_scheduler = get_constant_schedule_with_warmup(nonencoder_optimizer, num_warmup_steps=args.warmup_steps)
-    # scheduler = get_polynomial_decay_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
-    #                                                       num_training_steps=total_training_steps,
-    #                                                       lr_end=args.final_lr_ratio*args.learning_rate, power=1.0)
-
-    optimizer = MultiOptimizer(nonencoder_optimizer, encoder_optimizer)
-    scheduler = MultiScheduler(nonencoder_scheduler, encoder_scheduler)
-
     # Load model and possibly optimizer/scheduler state
-    if args.load_model_path:
-        model, start_step, optimizer, scheduler = utils.load_model(model, args.load_model_path, optimizer, scheduler,
-                                                                   args.resume)
-    model.to(args.device)
-    utils.move_to_device(optimizer, args.device)
+    optim_state, sched_state = None, None
+    if args.load_model_path:  # model is already on its intended device, which we pass as an argument
+        model, start_step, optim_state, sched_state = utils.load_model(model, args.load_model_path, args.device, args.resume)
 
-    if args.encoder_delay > start_step:  # TODO: ugly but there is no obvious elegant solution
-        optimizer.pop_optimizer()
-        scheduler.pop_scheduler()
+    # Prepare optimizer and schedule
+    nonencoder_optimizer, encoder_optimizer = get_optimizers(args, model)
+    if optim_state is not None:
+        nonencoder_optimizer.load_state_dict(optim_state[0])
+        encoder_optimizer.load_state_dict(optim_state[1])
+        # load_state_dict for optimizers moves params to CPU (pytorch bug/quirk)
+        utils.move_to_device(nonencoder_optimizer, args.device)
+        utils.move_to_device(encoder_optimizer, args.device)
+        logger.info('Loaded optimizer(s) state')
+
+    nonencoder_scheduler = get_polynomial_decay_schedule_with_warmup(nonencoder_optimizer,
+                                                                     num_warmup_steps=args.warmup_steps,
+                                                                     num_training_steps=total_training_steps,
+                                                                     lr_end=args.final_lr_ratio * args.learning_rate,
+                                                                     power=1.0)
+    encoder_scheduler = get_polynomial_decay_schedule_with_warmup(encoder_optimizer,
+                                                                  num_warmup_steps=args.encoder_warmup_steps,
+                                                                  num_training_steps=total_training_steps,
+                                                                  lr_end=args.final_lr_ratio*args.encoder_learning_rate,
+                                                                  power=1.0)
+    if sched_state is not None:
+        nonencoder_scheduler.load_state_dict(sched_state[0])
+        encoder_scheduler.load_state_dict(sched_state[1])
+        logger.info('Loaded scheduler(s) state')
+
+    optimizer = MultiOptimizer(nonencoder_optimizer)
+    scheduler = MultiScheduler(nonencoder_scheduler)
+    if args.encoder_delay <= start_step:
+        optimizer.add_optimizer(encoder_optimizer)
+        scheduler.add_scheduler(encoder_scheduler)
 
     global_step = start_step  # counts how many times the weights have been updated, i.e. num. batches // gradient acc. steps
     start_epoch = global_step // epoch_steps
@@ -319,7 +331,7 @@ def train(args, model, val_dataloader, tokenizer=None):
                 model.zero_grad()
                 global_step += 1
 
-                if global_step == args.encoder_delay:
+                if global_step == args.encoder_delay:  # here global_step > start_step is guaranteed
                     optimizer.add_optimizer(encoder_optimizer)
                     scheduler.add_scheduler(encoder_scheduler)
 
@@ -655,6 +667,8 @@ def main(config):
     logger.info("Total number of parameters: {}".format(utils.count_parameters(model)))
     logger.info("Trainable parameters: {}".format(utils.count_parameters(model, trainable=True)))
 
+    model.to(args.device)
+
     if args.task == "train":
         train(args, model, eval_dataloader, tokenizer)
     else:
@@ -662,8 +676,7 @@ def main(config):
 
         # only composite (non-repbert) models need to be loaded; repbert is already loaded at this point
         if args.model_type != 'repbert':
-            model, global_step, _, _ = utils.load_model(model, args.load_model_path)
-        model.to(args.device)
+            model, global_step, _, _ = utils.load_model(model, args.load_model_path, device=args.device)
 
         logger.info("Will evaluate model on candidates in: {}".format(args.eval_candidates_path))
 
