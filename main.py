@@ -242,9 +242,9 @@ def train(args, model, val_dataloader, tokenizer=None):
     if optim_state is not None:
         nonencoder_optimizer.load_state_dict(optim_state[0])
         encoder_optimizer.load_state_dict(optim_state[1])
-        # load_state_dict for optimizers moves params to CPU (pytorch bug/quirk)
-        utils.move_to_device(nonencoder_optimizer, args.device)
-        utils.move_to_device(encoder_optimizer, args.device)
+        # TODO: Moving doesn't seem necessary
+        # utils.move_to_device(nonencoder_optimizer, args.device)
+        # utils.move_to_device(encoder_optimizer, args.device)
         logger.info('Loaded optimizer(s) state')
 
     nonencoder_scheduler = get_polynomial_decay_schedule_with_warmup(nonencoder_optimizer,
@@ -334,11 +334,13 @@ def train(args, model, val_dataloader, tokenizer=None):
                 if global_step == args.encoder_delay:  # here global_step > start_step is guaranteed
                     optimizer.add_optimizer(encoder_optimizer)
                     scheduler.add_scheduler(encoder_scheduler)
+                    logger.info('Added optimizer and scheduler for query encoder')
 
                 # logging for training
                 if args.logging_steps and (global_step % args.logging_steps == 0):
-                    tb_writer.add_scalar('learn_rate1', scheduler.get_last_lr()[0][0], global_step)  # first brackets select scheduler, second the group
-                    tb_writer.add_scalar('learn_rate2', scheduler.get_last_lr()[1][0], global_step)
+                    for s in range(len(scheduler.schedulers)):
+                        # first brackets select scheduler, second the group
+                        tb_writer.add_scalar('learn_rate{}'.format(s), scheduler.get_last_lr()[s][0], global_step)
                     cur_loss = (train_loss - logging_loss) / args.logging_steps  # mean loss over last args.logging_steps (smoothened "current loss")
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
 
@@ -396,6 +398,9 @@ def train(args, model, val_dataloader, tokenizer=None):
     logger.debug("Average prep. docids time: {} s".format(prep_docids_times.get_average()))
     logger.debug("Average sample fetching time: {} s".format(sample_fetching_times.get_average()))
     logger.debug("Average collation time: {} s".format(collation_times.get_average()))
+
+    logger.info("Current memory usage: {} MB".format(np.round(utils.get_current_memory_usage())))
+    logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
     return best_metrics
 
@@ -624,6 +629,20 @@ def main(config):
     # Log current hardware setup
     logger.info("Device: %s, n_gpu: %s", args.device, args.n_gpu)
 
+    # ##### TODO: HACK TO DEBUG hyperparam_optim
+    #
+    # def fitness_func(args):
+    #     fitness = - 1e-3*np.abs(args.warmup_steps - 5000) - 1e5*args.weight_decay + 1e-4*args.num_candidates*args.num_inbatch_neg \
+    #               - 2e-3*(args.num_candidates - 200)**2 + 1e-2*max(512, args.d_model) - (args.dim_feedforward - 1.5*args.d_model)**2
+    #     return fitness
+    #
+    # time.sleep(0.1)
+    # fitness = fitness_func(args)
+    # output = {'Recall': 2*fitness, 'MRR': fitness}
+    # logger.info("Done! fitness: {}".format(fitness))
+    # return output
+    # ##### TODO: HACK TO DEBUG hyperparam_optim
+
     # Set seed
     utils.set_seed(args)
 
@@ -670,7 +689,7 @@ def main(config):
     model.to(args.device)
 
     if args.task == "train":
-        train(args, model, eval_dataloader, tokenizer)
+        return train(args, model, eval_dataloader, tokenizer)
     else:
         # Just evaluate trained model on some dataset (needs ~27GB for MS MARCO dev set)
 
@@ -701,6 +720,8 @@ def main(config):
         ranked_filepath = os.path.join(args.pred_dir, filename)
         logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
         ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
+
+        return eval_metrics
 
 
 def setup(args):

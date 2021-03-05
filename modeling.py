@@ -198,6 +198,8 @@ class MDSTransformer(nn.Module):
                 self.d_model = doc_emb_dim
                 logger.warning("No `d_model` provided. Will use {} dim. for transformer model dimension, "
                                "to match expected document dimension!".format(self.d_model))
+            else:
+                self.d_model = d_model
 
             assert self.d_model is not None, "One of `doc_emb_dim` or `d_model` should be not None!"
             decoder_layer = nn.TransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
