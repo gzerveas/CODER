@@ -108,8 +108,8 @@ def run_parse_args():
 
     ## System
     parser.add_argument('--debug', action='store_true', help="Activate debug mode")
-    parser.add_argument('--n_gpu', type=int, default=-1,
-                        help="Number of GPUs. Default (-1): Use all available. 0: Use CPU only.")
+    parser.add_argument('--gpu-id', action='store', dest='cuda_device_ids', type=str, default="0",
+                        help="optional cuda device ids for single/multi gpu setting like '0' or '0,1,2,3' ", required=False)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument("--data_num_workers", default=0, type=int,
                         help="Number of processes feeding data to model. Default: main process only.")
@@ -620,12 +620,16 @@ def main(config):
     logger.info('Running:\n{}\n'.format(' '.join(sys.argv)))  # command used to run
 
     # Setup CUDA, GPU 
-    args.device = torch.device("cuda" if torch.cuda.is_available() and (args.n_gpu != 0) else "cpu")
-    if args.n_gpu < 0:
-        args.n_gpu = torch.cuda.device_count()
-    elif args.device.type == 'cpu':
-        args.n_gpu = 0
-
+    if torch.cuda.is_available():
+        args.cuda_device_ids_list = [int(x) for x in args.cuda_device_ids.split(',')]
+        args.n_gpu = len(args.cuda_device_ids_list)
+        if args.n_gpu > 1:
+            args.device = torch.device("cuda")
+        else:
+            args.device = torch.device("cuda:%d" % args.cuda_device_ids_list[0])
+    else:
+        args.device = torch.device("cpu")
+    
     # Log current hardware setup
     logger.info("Device: %s, n_gpu: %s", args.device, args.n_gpu)
 
