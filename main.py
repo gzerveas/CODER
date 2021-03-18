@@ -12,6 +12,7 @@ import traceback
 from datetime import datetime
 import string
 from collections import OrderedDict
+import ipdb
 
 import numpy as np
 import pandas as pd
@@ -179,6 +180,9 @@ def run_parse_args():
                         help='Activation to be used in transformer decoder')
     parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm'}, default='BatchNorm',
                         help='Normalization layer to be used internally in the transformer decoder') # TODO: not implemented
+    parser.add_argument('--scoring_mode', choices={'cross_attention', 'cross_attention_tanh'}, default='cross_attention',
+                        help='Scoring layer to map the final embeddings to scores') # TODO: not implemented
+
 
     args = parser.parse_args()
 
@@ -213,7 +217,7 @@ def train(args, model, val_dataloader, tokenizer=None):
                                     limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
                                     emb_collection=val_dataloader.dataset.emb_collection)
-    collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg)
+    collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg, n_gpu=args.n_gpu)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
     utils.write_list(os.path.join(args.output_dir, "train_IDs.txt"), train_dataset.qids)
@@ -278,7 +282,7 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model, device_ids=args.cuda_device_ids_list)
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
@@ -481,7 +485,7 @@ def evaluate(args, model, dataloader):
             query_time += time.perf_counter() - start_time
             rel_scores = out['rel_scores'].detach().cpu().numpy()
             if 'loss' in out:
-                total_loss += out['loss'].item()
+                total_loss += out['loss'].sum().item()
             assert len(qids) == len(docids) == len(rel_scores)
 
             # Rank documents based on their scores
@@ -662,7 +666,7 @@ def main(config):
     logger.info("Preparing {} dataset ...".format(eval_mode))
     start_time = time.time()
     eval_dataset = get_dataset(args, eval_mode, tokenizer)
-    collate_fn = eval_dataset.get_collate_func()
+    collate_fn = eval_dataset.get_collate_func(n_gpu=args.n_gpu)
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
@@ -705,7 +709,7 @@ def main(config):
 
         # multi-gpu eval
         if args.n_gpu > 1:
-            model = torch.nn.DataParallel(model)
+            model = torch.nn.DataParallel(model, device_ids=args.cuda_device_ids_list)
 
         model.eval()
         eval_start_time = time.time()
@@ -813,7 +817,8 @@ def get_model(args, doc_emb_dim=None):
                               dim_feedforward=args.dim_feedforward,
                               dropout=args.dropout,
                               activation=args.activation,
-                              doc_emb_dim=doc_emb_dim)
+                              doc_emb_dim=doc_emb_dim,
+                              scoring_mode=args.scoring_mode)
     else:
         raise NotImplementedError('Unknown model type')
 

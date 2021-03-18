@@ -125,6 +125,28 @@ class RepBERT(BertPreTrainedModel):
         return text_embeddings
 
 
+class CrossAttentionScorerTanh(nn.Module):
+    """
+    Exploits decoder cross-attention between encoded query states and documents.
+    The decoder creates its Queries from the layer below it, and takes the Keys and Values from the output of the encoder
+    TODO: What is the effect of LayerNormalization? Doesn't it flatten the scores distribution?
+    TODO: consider modifying the final cross-attention layer, to allow interactions between decoder's Values
+    """
+
+    def __init__(self, d_model):
+        super(CrossAttentionScorerTanh, self).__init__()
+
+        self.linear = nn.Linear(d_model, 1)
+
+    def forward(self, output_emb, query_emb=None):
+        """
+        :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
+        :param query_emb: not used
+        :return: (batch_size, num_docs) relevance scores in [0, 1]
+        """
+
+        return torch.tanh(self.linear(output_emb))
+    
 class CrossAttentionScorer(nn.Module):
     """
     Exploits decoder cross-attention between encoded query states and documents.
@@ -235,6 +257,8 @@ class MDSTransformer(nn.Module):
 
         if scoring_mode == 'cross_attention':
             return CrossAttentionScorer(self.d_model)
+        elif scoring_mode == 'cross_attention_tanh':
+            return CrossAttentionScorerTanh(self.d_model)
         else:
             raise NotImplementedError("Scoring mode '{}' not implemented!".format(scoring_mode))
 
@@ -275,12 +299,13 @@ class MDSTransformer(nn.Module):
         """
         if doc_emb is None:  # happens only in training, when additionally there is in-batch negative sampling
             doc_emb = self.lookup_doc_emb(docinds, local_emb_mat)  # (batch_size, max_docs_per_query, doc_emb_dim)
+            
         if self.doc_emb_dim != self.d_model:
             # project document representation vectors to match dimensionality of d_model
             doc_emb = self.project_documents(doc_emb)
         # permute because pytorch convention for transformers is [seq_length, batch_size, feat_dim]
         doc_emb = doc_emb.permute(1, 0, 2)  # (max_docs_per_query, batch_size, doc_emb_dim) document embeddings
-
+        
         if query_token_ids.size(0) != doc_emb.size(1):
             raise RuntimeError("the batch size for queries and documents must be equal")
 
@@ -289,7 +314,7 @@ class MDSTransformer(nn.Module):
         enc_hidden_states = encoder_out['last_hidden_state']
         if self.query_dim != self.d_model:  # project query representation vectors to match dimensionality of doc embeddings
             enc_hidden_states = self.project_query(enc_hidden_states)
-
+        
         # The nn.MultiHeadAttention expects ByteTensor or Boolean and uses the convention that non-0 is ignored
         # and 0 is used in attention, which is the opposite of HuggingFace.
         memory_key_padding_mask = ~query_mask
@@ -302,7 +327,7 @@ class MDSTransformer(nn.Module):
         output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
 
         rel_scores = self.score_docs(output_emb).squeeze()  # (batch_size, num_docs) relevance scores in [0, 1]
-
+        
         if labels is not None:
             loss = self.loss_func(rel_scores, labels.long())  # loss is scalar tensor; labels are int16, expected int32
             return {'loss': loss, 'rel_scores': rel_scores}
