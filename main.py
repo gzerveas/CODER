@@ -180,9 +180,10 @@ def run_parse_args():
                         help='Activation to be used in transformer decoder')
     parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm'}, default='BatchNorm',
                         help='Normalization layer to be used internally in the transformer decoder') # TODO: not implemented
-    parser.add_argument('--scoring_mode', choices={'cross_attention', 'cross_attention_tanh'}, default='cross_attention',
-                        help='Scoring layer to map the final embeddings to scores') # TODO: not implemented
-
+    parser.add_argument('--scoring_mode', choices={'cross_attention', 'cross_attention_tanh', 'cross_attention_softmax'},
+                        default='cross_attention', help='Scoring layer to map the final embeddings to scores')
+    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy'},
+                        default='multilabelmargin', help='Loss applied to final scores') 
 
     args = parser.parse_args()
 
@@ -818,7 +819,8 @@ def get_model(args, doc_emb_dim=None):
                               dropout=args.dropout,
                               activation=args.activation,
                               doc_emb_dim=doc_emb_dim,
-                              scoring_mode=args.scoring_mode)
+                              scoring_mode=args.scoring_mode,
+                              loss_type=args.loss_type)
     else:
         raise NotImplementedError('Unknown model type')
 

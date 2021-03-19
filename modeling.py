@@ -125,14 +125,25 @@ class RepBERT(BertPreTrainedModel):
         return text_embeddings
 
 
-class CrossAttentionScorerTanh(nn.Module):
-    """
-    Exploits decoder cross-attention between encoded query states and documents.
-    The decoder creates its Queries from the layer below it, and takes the Keys and Values from the output of the encoder
-    TODO: What is the effect of LayerNormalization? Doesn't it flatten the scores distribution?
-    TODO: consider modifying the final cross-attention layer, to allow interactions between decoder's Values
-    """
+class CrossAttentionScorerSoftmax(nn.Module):
+    
+    def __init__(self, d_model):
+        super(CrossAttentionScorerSoftmax, self).__init__()
 
+        self.linear = nn.Linear(d_model, 2)
+
+    def forward(self, output_emb, query_emb=None):
+        """
+        :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
+        :param query_emb: not used
+        :return: (batch_size, num_docs, 2) 0->relevance probability, 1->non-relevance probability
+        """
+
+        return torch.nn.LogSoftmax(dim=-1)(self.linear(output_emb))
+
+
+class CrossAttentionScorerTanh(nn.Module):
+    
     def __init__(self, d_model):
         super(CrossAttentionScorerTanh, self).__init__()
 
@@ -252,6 +263,9 @@ class MDSTransformer(nn.Module):
         self.score_docs = self.get_scoring_module(scoring_mode)
 
         self.loss_func = self.get_loss_func(loss_type)
+        
+        self.scoring_mode = scoring_mode
+        self.loss_type = loss_type
 
     def get_scoring_module(self, scoring_mode):
 
@@ -259,6 +273,8 @@ class MDSTransformer(nn.Module):
             return CrossAttentionScorer(self.d_model)
         elif scoring_mode == 'cross_attention_tanh':
             return CrossAttentionScorerTanh(self.d_model)
+        elif scoring_mode == 'cross_attention_softmax':
+            return CrossAttentionScorerSoftmax(self.d_model)
         else:
             raise NotImplementedError("Scoring mode '{}' not implemented!".format(scoring_mode))
 
@@ -266,6 +282,8 @@ class MDSTransformer(nn.Module):
 
         if loss_type == 'multilabelmargin':
             return nn.MultiLabelMarginLoss()
+        elif loss_type == 'crossentropy':
+            pass
         else:
             raise NotImplementedError("Loss type '{}' not implemented!".format(loss_type))
 
@@ -326,10 +344,23 @@ class MDSTransformer(nn.Module):
         # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
         output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
 
-        rel_scores = self.score_docs(output_emb).squeeze()  # (batch_size, num_docs) relevance scores in [0, 1]
+        predictions = self.score_docs(output_emb)
+        
+        if self.scoring_mode != 'cross_attention_softmax':
+            rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores in [0, 1]
+        else:
+            rel_scores = predictions[:,:,0]  # (batch_size, num_docs) relevance scores in [0, 1]
         
         if labels is not None:
-            loss = self.loss_func(rel_scores, labels.long())  # loss is scalar tensor; labels are int16, expected int32
+            if self.loss_type != 'crossentropy':
+                loss = self.loss_func(rel_scores, labels.long())  # loss is scalar tensor; labels are int16, expected int32
+            else:
+                scores_pos = predictions[:,:,0] * (labels > -1)
+                scores_neg = predictions[:,:,1] * (labels == -1)
+                scores_pos_mean = scores_pos.sum(dim=1) / (scores_pos!=0).sum(dim=1)
+                scores_neg_mean = scores_neg.sum(dim=1) / (scores_neg!=0).sum(dim=1)
+                loss = - torch.mean(scores_neg_mean + scores_pos_mean)
+                
             return {'loss': loss, 'rel_scores': rel_scores}
         return {'rel_scores': rel_scores}
 
