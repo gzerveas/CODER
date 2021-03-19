@@ -666,7 +666,7 @@ def main(config):
 
     logger.info("Preparing {} dataset ...".format(eval_mode))
     start_time = time.time()
-    eval_dataset = get_dataset(args, eval_mode, tokenizer)
+    eval_dataset = get_dataset(args, eval_mode, tokenizer) # CHANGED here from eval_mode
     collate_fn = eval_dataset.get_collate_func(n_gpu=args.n_gpu)
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
 
@@ -729,6 +729,8 @@ def main(config):
         ranked_filepath = os.path.join(args.pred_dir, filename)
         logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
         ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
+        
+        #ipdb.set_trace()
 
         return eval_metrics
 

@@ -414,7 +414,8 @@ class MYMARCO_Dataset(Dataset):
         retrieve_candidates_times.update(time.perf_counter() - tic)
         doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
-        if self.mode != "eval":
+        #if self.mode != "eval":
+        if self.mode == "train":
             tic = time.perf_counter()
             rel_docs = self.qrels[qid]
             # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
@@ -545,7 +546,8 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
-    if mode != "eval":
+    #if mode != "eval":
+    if mode == "train":
         # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
         # It is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
         # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
