@@ -154,11 +154,12 @@ def write_list(filepath, alist):
 
 
 # from: https://alexwlchan.net/2018/05/ascii-bar-charts/
-def ascii_bar_plot(labels, values, width=30):
+def ascii_bar_plot(labels, values, width=30, logger=None):
 
     increment = max(values) / width
     longest_label_length = max(len(label) for label in labels)
 
+    out_str = ''
     for label, value in zip(labels, values):
 
         # The ASCII block elements come in chunks of 8, so we work out how
@@ -178,7 +179,12 @@ def ascii_bar_plot(labels, values, width=30):
         # If the bar is empty, add a left one-eighth block
         bar = bar or '▏'
 
-        print(f'{label.rjust(longest_label_length)} ▏ {value:#4d} {bar}')
+        out_str += f'{label.rjust(longest_label_length)} ▏ {value:#4d} {bar}\n'
+
+    if logger is not None:
+        logger.info('\n' + out_str)
+    else:
+        print(out_str)
 
 
 class Obj(object):

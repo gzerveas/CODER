@@ -52,7 +52,7 @@ _(contains a bundle of related memmap arrays)_
 `repbert/preprocessed/doc_embedding/`
 
 ### Trained RepBERT model
-#### (checkpoint and configurration)
+#### (checkpoint and configuration)
 
 `repbert/ckpt-350000/`
 

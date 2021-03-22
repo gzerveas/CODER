@@ -52,7 +52,7 @@ def run_parse_args():
     parser.add_argument('--comment', type=str, default='', help='A comment/description of the experiment')
     parser.add_argument('--no_timestamp', action='store_true',
                         help='If set, a timestamp and random suffix will not be appended to the output directory name')
-    parser.add_argument("--task", choices=["train", "dev", "eval"], required=True)
+    parser.add_argument("--task", choices=["train", "dev", "eval"])
     parser.add_argument('--resume', action='store_true',
                         help='Used together with `load_model`. '
                              'If set, will load `start_step` and state of optimizer, scheduler besides model weights.')
@@ -181,6 +181,9 @@ def run_parse_args():
                         help='Normalization layer to be used internally in the transformer decoder') # TODO: not implemented
 
     args = parser.parse_args()
+
+    if args.task is None and args.config_filepath is None:
+        raise ValueError('Please specify task! (train, dev, eval)')
 
     # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
     components = args.key_metric.split('@')
@@ -526,15 +529,15 @@ def evaluate(args, model, dataloader):
     eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
     ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
 
-    if args.debug and labels_exist:
+    if labels_exist and (args.debug or args.task != 'train'):
         try:
             rs = (np.nonzero(r)[0] for r in relevances)
             ranks = [1 + int(r[0]) if r.size else 1e10 for r in rs]  # for each query, what was the rank of the rel. doc
             freqs, bin_edges = np.histogram(ranks, bins=[1, 5, 10, 20, 30] + list(range(50, 1050, 50)))
             bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i+1])
                           for i in range(len(bin_edges)-1)] + ["[{}, inf)".format(bin_edges[-1])]
-            print('\nHistogram of ranks for the ground truth documents:\n')
-            utils.ascii_bar_plot(bin_labels, freqs, width=50)
+            logger.info('\nHistogram of ranks for the ground truth documents:\n')
+            utils.ascii_bar_plot(bin_labels, freqs, width=50, logger=logger)
         except:
             logger.error('Not possible!')
 
@@ -720,6 +723,10 @@ def main(config):
         ranked_filepath = os.path.join(args.pred_dir, filename)
         logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
         ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
+
+        # Export record metrics to a file accumulating records from all experiments
+        utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
+                              eval_metrics, comment=args.comment)
 
         return eval_metrics
 
