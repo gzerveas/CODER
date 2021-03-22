@@ -414,7 +414,8 @@ class MYMARCO_Dataset(Dataset):
         retrieve_candidates_times.update(time.perf_counter() - tic)
         doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
-        if self.mode != "eval":
+        #if self.mode != "eval":
+        if self.mode == "train":
             tic = time.perf_counter()
             rel_docs = self.qrels[qid]
             # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
@@ -445,7 +446,7 @@ class MYMARCO_Dataset(Dataset):
         else:
             return candidates
 
-    def get_collate_func(self, num_inbatch_neg=0, max_candidates=MAX_DOCS):
+    def get_collate_func(self, num_inbatch_neg=0, max_candidates=MAX_DOCS, n_gpu=1):
         """
         :param num_inbatch_neg: number of negatives to randomly sample from other queries in the batch.
             Can only be > 0 if mode == 'train'
@@ -456,11 +457,11 @@ class MYMARCO_Dataset(Dataset):
         if self.mode != 'train':
             num_inbatch_neg = 0
         return partial(collate_function, mode=self.mode, pad_token_id=self.pad_id, num_inbatch_neg=num_inbatch_neg,
-                       max_candidates=max_candidates)
+                       max_candidates=max_candidates, n_gpu=n_gpu)
 
 
 # TODO: can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
-def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=MAX_DOCS):
+def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=MAX_DOCS, n_gpu=1):
     """
     :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, rel_docs)
     :param mode: 'train', 'dev', or 'eval'
@@ -530,7 +531,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
 
         data['docinds'], data['doc_padding_mask'] = prepare_docinds_and_mask(doc_ids, docID_to_localind,
                                                                              padding_idx=local_emb_mat.shape[0]-1)
-        data['local_emb_mat'] = local_emb_mat
+        data['local_emb_mat'] = local_emb_mat.repeat(n_gpu, 1) # repeats to be passes to the each split of multi-gpu
 
     max_docs_per_query = min(max_candidates, max(len(cands) for cands in doc_ids))  # length used for padding
 
@@ -545,14 +546,15 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
-    if mode != "eval":
+    #if mode != "eval":
+    if mode == "train":
         # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
         # It is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
         # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
         # that 1 or more positives (rel. docs) will be at the beginning of the list (and only there)
         labels = [list(range(len(rd))) for rd in rel_docs]
         # must be padded with -1 to have same dimensions as the transformer decoder output: (batch_size, max_docs_per_query)
-        data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)
+        data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int32, length=max_docs_per_query)
 
     global collation_times
     collation_times.update(time.perf_counter() - start_collation_time)
@@ -573,11 +575,11 @@ def prepare_docinds_and_mask(doc_ids, docID_to_localind, padding_idx, length=Non
     """
     batch_size = len(doc_ids)
     length = length if length is not None else max(len(docids) for docids in doc_ids)
-    docinds = torch.full((batch_size, length), padding_idx, dtype=torch.int16)  # int16 because they are local
+    docinds = torch.full((batch_size, length), padding_idx, dtype=torch.int32)  
     docinds_mask = torch.zeros_like(docinds, dtype=torch.bool)
     for i, docids in enumerate(doc_ids):
         local_docinds = [docID_to_localind[docid] for docid in docids]
-        docinds[i, :len(docids)] = torch.tensor(local_docinds, dtype=torch.int16)  # casting to tensor required for assignment
+        docinds[i, :len(docids)] = torch.tensor(local_docinds, dtype=torch.int32)  # casting to tensor required for assignment
         docinds_mask[i, :len(docids)] = True
     return docinds, docinds_mask
 
@@ -648,7 +650,7 @@ class MSMARCODataset(Dataset):
                 # self.candidates.get_qid_to_ind_mapping(self.qids)
         return
 
-    def get_collate_function(self):
+    def get_collate_function(self, n_gpu=1): # TODO n_gpu is not well-handled in the function
         def collate_function(batch):
             input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]
             token_type_ids_lst = [[0] * len(x["query_input_ids"]) + [1] * len(x["doc_input_ids"]) for x in batch]

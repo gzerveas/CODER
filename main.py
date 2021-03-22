@@ -12,6 +12,7 @@ import traceback
 from datetime import datetime
 import string
 from collections import OrderedDict
+import ipdb
 
 import numpy as np
 import pandas as pd
@@ -108,8 +109,8 @@ def run_parse_args():
 
     ## System
     parser.add_argument('--debug', action='store_true', help="Activate debug mode")
-    parser.add_argument('--n_gpu', type=int, default=-1,
-                        help="Number of GPUs. Default (-1): Use all available. 0: Use CPU only.")
+    parser.add_argument('--gpu-id', action='store', dest='cuda_device_ids', type=str, default="0",
+                        help="optional cuda device ids for single/multi gpu setting like '0' or '0,1,2,3' ", required=False)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument("--data_num_workers", default=0, type=int,
                         help="Number of processes feeding data to model. Default: main process only.")
@@ -179,6 +180,10 @@ def run_parse_args():
                         help='Activation to be used in transformer decoder')
     parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm'}, default='BatchNorm',
                         help='Normalization layer to be used internally in the transformer decoder') # TODO: not implemented
+    parser.add_argument('--scoring_mode', choices={'cross_attention', 'cross_attention_tanh', 'cross_attention_softmax'},
+                        default='cross_attention', help='Scoring layer to map the final embeddings to scores')
+    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy'},
+                        default='multilabelmargin', help='Loss applied to final scores') 
 
     args = parser.parse_args()
 
@@ -216,7 +221,7 @@ def train(args, model, val_dataloader, tokenizer=None):
                                     limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
                                     emb_collection=val_dataloader.dataset.emb_collection)
-    collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg)
+    collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg, n_gpu=args.n_gpu)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
     utils.write_list(os.path.join(args.output_dir, "train_IDs.txt"), train_dataset.qids)
@@ -281,7 +286,7 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model, device_ids=args.cuda_device_ids_list)
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
@@ -484,7 +489,7 @@ def evaluate(args, model, dataloader):
             query_time += time.perf_counter() - start_time
             rel_scores = out['rel_scores'].detach().cpu().numpy()
             if 'loss' in out:
-                total_loss += out['loss'].item()
+                total_loss += out['loss'].sum().item()
             assert len(qids) == len(docids) == len(rel_scores)
 
             # Rank documents based on their scores
@@ -623,12 +628,16 @@ def main(config):
     logger.info('Running:\n{}\n'.format(' '.join(sys.argv)))  # command used to run
 
     # Setup CUDA, GPU 
-    args.device = torch.device("cuda" if torch.cuda.is_available() and (args.n_gpu != 0) else "cpu")
-    if args.n_gpu < 0:
-        args.n_gpu = torch.cuda.device_count()
-    elif args.device.type == 'cpu':
-        args.n_gpu = 0
-
+    if torch.cuda.is_available():
+        args.cuda_device_ids_list = [int(x) for x in args.cuda_device_ids.split(',')]
+        args.n_gpu = len(args.cuda_device_ids_list)
+        if args.n_gpu > 1:
+            args.device = torch.device("cuda")
+        else:
+            args.device = torch.device("cuda:%d" % args.cuda_device_ids_list[0])
+    else:
+        args.device = torch.device("cpu")
+    
     # Log current hardware setup
     logger.info("Device: %s, n_gpu: %s", args.device, args.n_gpu)
 
@@ -660,8 +669,8 @@ def main(config):
 
     logger.info("Preparing {} dataset ...".format(eval_mode))
     start_time = time.time()
-    eval_dataset = get_dataset(args, eval_mode, tokenizer)
-    collate_fn = eval_dataset.get_collate_func()
+    eval_dataset = get_dataset(args, eval_mode, tokenizer) # CHANGED here from eval_mode
+    collate_fn = eval_dataset.get_collate_func(n_gpu=args.n_gpu)
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
@@ -704,7 +713,7 @@ def main(config):
 
         # multi-gpu eval
         if args.n_gpu > 1:
-            model = torch.nn.DataParallel(model)
+            model = torch.nn.DataParallel(model, device_ids=args.cuda_device_ids_list)
 
         model.eval()
         eval_start_time = time.time()
@@ -723,6 +732,8 @@ def main(config):
         ranked_filepath = os.path.join(args.pred_dir, filename)
         logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
         ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
+        
+        #ipdb.set_trace()
 
         # Export record metrics to a file accumulating records from all experiments
         utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
@@ -816,7 +827,9 @@ def get_model(args, doc_emb_dim=None):
                               dim_feedforward=args.dim_feedforward,
                               dropout=args.dropout,
                               activation=args.activation,
-                              doc_emb_dim=doc_emb_dim)
+                              doc_emb_dim=doc_emb_dim,
+                              scoring_mode=args.scoring_mode,
+                              loss_type=args.loss_type)
     else:
         raise NotImplementedError('Unknown model type')
 
