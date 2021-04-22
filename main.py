@@ -109,13 +109,13 @@ def run_parse_args():
 
     ## System
     parser.add_argument('--debug', action='store_true', help="Activate debug mode")
-    parser.add_argument('--gpu-id', action='store', dest='cuda_device_ids', type=str, default="0",
-                        help="optional cuda device ids for single/multi gpu setting like '0' or '0,1,2,3' ", required=False)
+    parser.add_argument('--gpu_id', action='store', dest='cuda_ids', type=str, default="0",
+                        help="Optional cuda device ids for single/multi gpu setting, like '0' or '0,1,2,3' ", required=False)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument("--data_num_workers", default=0, type=int,
                         help="Number of processes feeding data to model. Default: main process only.")
     parser.add_argument("--num_keep", default=1, type=int,
-                        help="How many (latest) checkpoints to keep, besides the best. "
+                        help="How many (latest) checkpoints to keep, besides the best. Can be 0 or more"
                              "The 'best' checkpoint takes ~500MB, each 'latest' checkpoint ~1.6GB.")
     parser.add_argument("--load_collection_to_memory", action='store_true',
                         help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
@@ -180,10 +180,13 @@ def run_parse_args():
                         help='Activation to be used in transformer decoder')
     parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm'}, default='BatchNorm',
                         help='Normalization layer to be used internally in the transformer decoder') # TODO: not implemented
-    parser.add_argument('--scoring_mode', choices={'cross_attention', 'cross_attention_tanh', 'cross_attention_softmax'},
-                        default='cross_attention', help='Scoring layer to map the final embeddings to scores')
-    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy'},
-                        default='multilabelmargin', help='Loss applied to final scores') 
+    parser.add_argument('--scoring_mode',
+                        choices={'raw', 'sigmoid', 'tanh', 'softmax',
+                                 'cross_attention', 'cross_attention_sigmoid', 'cross_attention_tanh', 'cross_attention_softmax',
+                                 'dot_product'},
+                        default='raw', help='Scoring function to map the final embeddings to scores')
+    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy'}, default='multilabelmargin',
+                        help='Loss applied to document scores')
 
     args = parser.parse_args()
 
@@ -203,6 +206,12 @@ def run_parse_args():
 
     if args.encoder_warmup_steps is None:
         args.encoder_warmup_steps = args.warmup_steps
+
+    if args.scoring_mode.endswith('softmax') ^ (args.loss_type == 'crossentropy'):
+        raise Exception('Cross-entropy loss should be used iff softmax is used for scoring')
+
+    args.cuda_ids = [int(x) for x in args.cuda_ids.split(',')]
+    args.n_gpu = len(args.cuda_ids)
 
     return args
 
@@ -286,7 +295,7 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model, device_ids=args.cuda_device_ids_list)
+        model = torch.nn.DataParallel(model, device_ids=args.cuda_ids)
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
@@ -485,9 +494,9 @@ def evaluate(args, model, dataloader):
         for batch_data, qids, docids in tqdm(dataloader, desc="Evaluating"):
             batch_data = {k: v.to(args.device) for k, v in batch_data.items()}
             start_time = time.perf_counter()
-            out = model(**batch_data)  # (batch_size, num_docs) relevance scores in [0, 1], because not 'train'
+            out = model(**batch_data)
             query_time += time.perf_counter() - start_time
-            rel_scores = out['rel_scores'].detach().cpu().numpy()
+            rel_scores = out['rel_scores'].detach().cpu().numpy()  # (batch_size, num_docs) relevance scores in [0, 1]
             if 'loss' in out:
                 total_loss += out['loss'].sum().item()
             assert len(qids) == len(docids) == len(rel_scores)
@@ -498,10 +507,18 @@ def evaluate(args, model, dataloader):
             no_padding = (len(num_lengths) == 1)  # whether all queries in this batch had the same number of candidates
 
             if no_padding:  # (only) 10% speedup compared to other case
-                sort_inds = np.fliplr(np.argsort(rel_scores, axis=1))  # (batch_size, num_docs) inds to sort rel_scores
+                docids_array = np.array(docids, dtype=np.int32)  # (batch_size, num_docs) array of docIDs per query
+                # First shuffle along doc dimension, because relevant document(s) are placed at the beginning and would benefit
+                # in case of score ties! (can happen e.g. with saturating score functions)
+                inds = np.random.permutation(rel_scores.shape[1])
+                np.take(rel_scores, inds, axis=1, out=rel_scores)
+                np.take(docids_array, inds, axis=1, out=docids_array)
+
+                # Sort by descending relevance
+                inds = np.fliplr(np.argsort(rel_scores, axis=1))  # (batch_size, num_docs) inds to sort rel_scores
                 # (batch_size, num_docs) docIDs per query, in order of descending relevance score
-                ranksorted_docs = np.take_along_axis(np.array(docids, dtype=np.int32), sort_inds, axis=1)
-                sorted_scores = np.take_along_axis(rel_scores, sort_inds, axis=1)
+                ranksorted_docs = np.take_along_axis(docids_array, inds, axis=1)
+                sorted_scores = np.take_along_axis(rel_scores, inds, axis=1)
             else:
                 # (batch_size) iterables of docIDs and scores per query, in order of descending relevance score
                 ranksorted_docs, sorted_scores = zip(*(map(rank_docs, docids, rel_scores)))
@@ -549,13 +566,19 @@ def evaluate(args, model, dataloader):
     return eval_metrics, ranked_df
 
 
-def rank_docs(docids, scores):
+def rank_docs(docids, scores, shuffle=True):
     """Given a list of document IDs and a (potentially longer due to padding) 1D array of their scores, sort both scores
     and coresponding document IDs in the order of descending scores."""
     actual_scores = scores[:len(docids)]
-    sort_inds = np.flip(np.argsort(actual_scores))
-    actual_scores = actual_scores[sort_inds]
-    docids = [docids[i] for i in sort_inds]
+
+    if shuffle:  # used to remove any possible bias in documents order
+        inds = np.random.permutation(len(docids))
+        actual_scores = actual_scores[inds]
+        docids = [docids[i] for i in inds]
+
+    inds = np.flip(np.argsort(actual_scores))
+    actual_scores = actual_scores[inds]
+    docids = [docids[i] for i in inds]
     return docids, actual_scores
 
 
@@ -629,12 +652,10 @@ def main(config):
 
     # Setup CUDA, GPU 
     if torch.cuda.is_available():
-        args.cuda_device_ids_list = [int(x) for x in args.cuda_device_ids.split(',')]
-        args.n_gpu = len(args.cuda_device_ids_list)
         if args.n_gpu > 1:
             args.device = torch.device("cuda")
         else:
-            args.device = torch.device("cuda:%d" % args.cuda_device_ids_list[0])
+            args.device = torch.device("cuda:%d" % args.cuda_ids[0])
     else:
         args.device = torch.device("cpu")
     
@@ -713,7 +734,7 @@ def main(config):
 
         # multi-gpu eval
         if args.n_gpu > 1:
-            model = torch.nn.DataParallel(model, device_ids=args.cuda_device_ids_list)
+            model = torch.nn.DataParallel(model, device_ids=args.cuda_ids)
 
         model.eval()
         eval_start_time = time.time()
@@ -732,8 +753,6 @@ def main(config):
         ranked_filepath = os.path.join(args.pred_dir, filename)
         logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
         ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
-        
-        #ipdb.set_trace()
 
         # Export record metrics to a file accumulating records from all experiments
         utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
@@ -750,16 +769,7 @@ def setup(args):
         config: configuration dictionary
     """
 
-    config = args.__dict__  # configuration dictionary
-
-    if args.config_filepath is not None:
-        logger.info("Reading configuration ...")
-        try:  # dictionary containing the entire configuration settings in a hierarchical fashion
-            config.update(utils.load_config(args.config_filepath))
-        except:
-            logger.critical("Failed to load configuration file. Check JSON syntax and verify that files exist")
-            traceback.print_exc()
-            sys.exit(1)
+    config = utils.load_config(args)  # configuration dictionary
 
     # Create output directory
     initial_timestamp = datetime.now()

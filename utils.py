@@ -197,14 +197,25 @@ def dict2obj(d):
     return json.loads(json.dumps(d), object_hook=Obj)
 
 
-def load_config(config_filepath):
+def load_config(args):
     """
-    Using a json file with the master configuration (config file for each part of the pipeline),
-    return a dictionary containing the entire configuration settings in a hierarchical fashion.
+    Returns a dictionary with the full experiment configuration settings.
+    If a json file is specified with `--config`, its contents will overwrite the defaults or other arguments as
+    extracted by argparse.
     """
 
-    with open(config_filepath) as cnfg:
-        config = json.load(cnfg)
+    config = args.__dict__  # configuration dictionary
+
+    if args.config_filepath is not None:
+        logger.info("Reading configuration ...")
+        try:  # dictionary containing the entire configuration settings in a hierarchical fashion
+            with open(args.config_filepath) as cnfg:
+                json_config = json.load(cnfg)
+            config.update(json_config)
+        except:
+            logger.critical("Failed to load configuration file. Check JSON syntax and verify that files exist")
+            traceback.print_exc()
+            sys.exit(1)
 
     return config
 

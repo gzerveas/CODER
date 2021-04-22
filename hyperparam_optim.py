@@ -4,6 +4,7 @@ import optuna
 from optuna.samplers import TPESampler
 
 from main import main, run_parse_args, setup, NEG_METRICS, METRICS
+import utils
 
 # Metric for hyperparam optimization.
 # Can be different from "key_metric" of main, which determines the set of "best_values" and saved checkpoints
@@ -14,7 +15,12 @@ def objective(trial):
     random.seed()  # re-randomize seed (it's fixed inside `main`), because it's needed for dir name suffix
     args = run_parse_args()  # `argsparse` object
 
+    config = utils.load_config(args)  # config dictionary, which potentially comes from a JSON file
+    args = utils.dict2obj(config)  # convert back to args object
+    args.config_filepath = None  # the contents of a JSON file (if specified) have been loaded already, so prevent the `main.setup` from overwriting the Optuna overrides
+
     # Optuna overrides
+    args.scoring_mode = trial.suggest_categorical('scoring_mode', ['raw', 'cross_attention', 'dot_product', 'cross_attention_gelu'])
     args.optimizer = trial.suggest_categorical('optimizer', ['AdamW', 'RAdam'])
     args.weight_decay = trial.suggest_loguniform('weight_decay', 1e-6, 5e-2)
     args.num_candidates = trial.suggest_int('num_candidates', 10, 400)
@@ -46,11 +52,10 @@ def objective(trial):
     return best_values[OPTIM_METRIC]
 
 
-
 if __name__ == '__main__':
 
     storage = 'sqlite:////gpfs/data/ceickhof/dcohen_share/mdst_optuna.db'
-    study_name = 'mdst_study_1'  # This name is shared across jobs
+    study_name = 'mdst_study_transp_Qenc_repbert'  # This name is shared across jobs
     n_trials = 10
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())
     direction = 'minimize' if OPTIM_METRIC in NEG_METRICS else 'maximize'

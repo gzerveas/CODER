@@ -57,7 +57,7 @@ class RepBERT_Train(BertPreTrainedModel):
         :param token_type_ids:
         :param valid_mask: (batch_size, batch_seq_length)
         :param position_ids:
-        :param labels: (batch_size, batch_size) padded (with -1) tensor of relevant doc in-batch (local) indices
+        :param labels: (batch_size, batch_size) padded (with -1) tensor of the position of relevant docs within in-batch (local) indices
         :return: Tuple[(  loss,
                         (batch_size, batch_size) tensor of similarities between each query in the batch and
                             each document in the batch
@@ -88,10 +88,10 @@ class RepBERT_Train(BertPreTrainedModel):
 
 
 def _average_sequence_embeddings(sequence_output, valid_mask):
-    flags = valid_mask==1  # (valid_mask == 1) seems superfluous, but is prob. there to convert to bool
+    flags = valid_mask.bool()  # (valid_mask == 1) seems superfluous, but is prob. there to convert to bool
     lengths = torch.sum(flags, dim=-1)
     lengths = torch.clamp(lengths, 1, None)
-    sequence_embeddings = torch.sum(sequence_output * flags[:,:,None], dim=1)
+    sequence_embeddings = torch.sum(sequence_output * flags[:, :, None], dim=1)
     sequence_embeddings = sequence_embeddings/lengths[:, None]
     return sequence_embeddings
 
@@ -125,60 +125,168 @@ class RepBERT(BertPreTrainedModel):
         return text_embeddings
 
 
-class CrossAttentionScorerSoftmax(nn.Module):
-    
-    def __init__(self, d_model):
-        super(CrossAttentionScorerSoftmax, self).__init__()
+# class CrossAttentionScorerLogSoftmax(nn.Module):
+#
+#     def __init__(self, d_model):
+#         super(CrossAttentionScorerLogSoftmax, self).__init__()
+#
+#         self.linear = nn.Linear(d_model, 2)
+#
+#     def forward(self, output_emb, query_emb=None):
+#         """
+#         :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
+#         :param query_emb: not used
+#         :return: (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
+#         """
+#
+#         return torch.nn.LogSoftmax(dim=-1)(self.linear(output_emb))
+#
+#
+# class CrossAttentionScorerTanh(nn.Module):
+#
+#     def __init__(self, d_model):
+#         super(CrossAttentionScorerTanh, self).__init__()
+#
+#         self.linear = nn.Linear(d_model, 1)
+#
+#     def forward(self, output_emb, query_emb=None):
+#         """
+#         :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
+#         :param query_emb: not used
+#         :return: (batch_size, num_docs) relevance scores in [-1, 1]
+#         """
+#
+#         return torch.tanh(self.linear(output_emb))
 
-        self.linear = nn.Linear(d_model, 2)
 
-    def forward(self, output_emb, query_emb=None):
-        """
-        :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
-        :param query_emb: not used
-        :return: (batch_size, num_docs, 2) 0->relevance probability, 1->non-relevance probability
-        """
-
-        return torch.nn.LogSoftmax(dim=-1)(self.linear(output_emb))
-
-
-class CrossAttentionScorerTanh(nn.Module):
-    
-    def __init__(self, d_model):
-        super(CrossAttentionScorerTanh, self).__init__()
-
-        self.linear = nn.Linear(d_model, 1)
-
-    def forward(self, output_emb, query_emb=None):
-        """
-        :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
-        :param query_emb: not used
-        :return: (batch_size, num_docs) relevance scores in [0, 1]
-        """
-
-        return torch.tanh(self.linear(output_emb))
-    
-class CrossAttentionScorer(nn.Module):
+class Scorer(nn.Module):
     """
-    Exploits decoder cross-attention between encoded query states and documents.
-    The decoder creates its Queries from the layer below it, and takes the Keys and Values from the output of the encoder
+    Directly scores final document representations in the "decoder".
+    Exploits cross-attention between encoded query states and documents in the preceding decoder layer.
+    The decoder creates its Queries from the layer below it, and takes the Keys and Values from the output of the encoder.
     TODO: What is the effect of LayerNormalization? Doesn't it flatten the scores distribution?
-    TODO: consider modifying the final cross-attention layer, to allow interactions between decoder's Values
     """
 
-    def __init__(self, d_model):
-        super(CrossAttentionScorer, self).__init__()
+    def __init__(self, d_model, scoring_mode=None):
+        super(Scorer, self).__init__()
+        self.build_score_function(d_model, scoring_mode)
 
-        self.linear = nn.Linear(d_model, 1)
+    def build_score_function(self, d_model, scoring_mode):
 
-    def forward(self, output_emb, query_emb=None):
+        if scoring_mode.endswith('sigmoid'):
+            self.linear = nn.Linear(d_model, 1)
+            self.score_func = torch.sigmoid
+        elif scoring_mode.endswith('tanh'):
+            self.linear = nn.Linear(d_model, 1)
+            self.score_func = torch.tanh
+        elif scoring_mode.endswith('softmax'):
+            self.linear = nn.Linear(d_model, 2)
+            self.score_func = torch.nn.LogSoftmax(dim=-1)
+        else:
+            self.linear = nn.Linear(d_model, 1)
+            self.score_func = torch.nn.Identity()
+
+    def forward(self, output_emb, *args, **kwargs):
         """
-        :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
-        :param query_emb: not used
-        :return: (batch_size, num_docs) relevance scores in [0, 1]
+        :param output_emb: (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
+        :return: case `scoring_mode`:
+            None: (batch_size, num_docs) relevance scores, floats of arbitrary range
+            'sigmoid': (batch_size, num_docs) relevance scores in [0, 1]
+            'tanh': (batch_size, num_docs) relevance scores in [-1, 1]
+            'softmax': (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
         """
+        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
+        return self.score_func(self.linear(output_emb))
 
-        return torch.sigmoid(self.linear(output_emb))
+
+class CrossAttentionScorer(Scorer):
+    """
+    Applies multi-headed attention between query term embeddings and final document representations in the "decoder".
+    Final document representations are used as Queries, (query) encoder representations are used as Keys and Values.
+    TODO: Experiment with the reverse? doc_emb as K, V, query_emb as Q
+    """
+
+    def __init__(self, d_model, scoring_mode=None):
+        super(CrossAttentionScorer, self).__init__(d_model, scoring_mode)
+
+        self.multihead_attn = torch.nn.MultiheadAttention(d_model, num_heads=8)
+        self.activation_func = torch.nn.GELU()
+
+    def forward(self, output_emb, query_emb, query_mask):
+        """
+        :param output_emb: output_emb: (num_docs, batch_size, d_model) transformed sequence of document embeddings
+        :param query_emb: (query_length, batch_size, d_model) final query term embeddings
+        :param query_mask: (batch_size, query_length) attention mask bool tensor for query tokens; 0 use, 1 ignore
+        :return: case `scoring_mode`:
+            None or 'cross_attention': (batch_size, num_docs) relevance scores, floats of arbitrary range
+            'sigmoid': (batch_size, num_docs) relevance scores in [0, 1]
+            'tanh': (batch_size, num_docs) relevance scores in [-1, 1]
+            'softmax': (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
+        """
+        output_emb = self.activation_func(output_emb)  # TODO: test
+        query_emb = self.activation_func(query_emb)  # TODO: test
+        out = self.multihead_attn(output_emb, query_emb, query_emb, key_padding_mask=query_mask, need_weights=False)[0]
+        out = out.permute(1, 0, 2)  # (batch_size, num_docs, d_model)
+        return self.score_func(self.linear(out))
+
+
+class DotProductScorer(nn.Module):
+    """
+    Computes scores as a dot product between the aggregate (e.g. mean) query representation and each final document
+    embedding.
+    """
+    def __init__(self):
+        super(DotProductScorer, self).__init__()
+
+        # self.activation_func = torch.nn.GELU()
+
+    def forward(self, output_emb, query_emb, query_mask):
+        """
+        :param output_emb: output_emb: (num_docs, batch_size, d_model) transformed sequence of document embeddings
+        :param query_emb: (query_length, batch_size, d_model) final query term embeddings
+        :param query_mask: (batch_size, query_length) attention mask bool tensor for query tokens; 0 use, 1 ignore
+        :return: scores: (batch_size, num_docs) inner product between aggregate query embedding and each document embedding
+        """
+        # output_emb = self.activation_func(output_emb)  # TODO: test
+        # query_emb = self.activation_func(query_emb)  # TODO: test
+        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, d_model)
+        query_emb = query_emb.permute(1, 0, 2)  # (batch_size, query_len, d_model)
+        avg_query_emb = _average_sequence_embeddings(query_emb, ~query_mask)
+
+        prod = torch.matmul(output_emb, avg_query_emb[:, :, None]).squeeze()  # (batch_size, num_docs) scores
+
+        return prod
+
+
+class RelevanceCrossEntropyLoss(nn.Module):
+    """
+    Special cross-entropy loss
+    """
+    def __init__(self):
+        super(RelevanceCrossEntropyLoss, self).__init__()
+
+    def forward(self, predictions, labels):
+        """
+        :param predictions: (batch_size, num_docs, 2) relevance class log-probabilities for each candidate document and query.
+            Dimension [:, :, 0] corresponds to the log-prob. for the "relevant" class and [:, :, 1] to the "non-relevant" class.
+        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+                indicating non-relevance.
+        :return: loss: scalar tensor. Mean loss per document
+        """
+        # WARNING: works only because relevant documents are always prepended at the beginning, and thus labels are e.g. [0, 1, 2, -1, ..., -1]
+
+        # For the entire batch, calculate one loss component from positive documents and one from negatives, normalizing by their numbers.
+        # Here, queries with more positive (and negative) documents contribute more to the loss calculation than queries
+        # with a smaller number.
+        is_relevant = (labels > -1)
+        total_relevant = is_relevant.sum()  # total number of relevant documents in the batch
+        loss_pos = torch.sum(predictions[:, :, 0] * is_relevant) / total_relevant  # scalar. loss per document, for positive documents
+        loss_neg = torch.sum(predictions[:, :, 1] * ~is_relevant) / (labels.shape[0]*labels.shape[1] - total_relevant)  # scalar. loss per document, for negative documents
+        loss = - (loss_pos + loss_neg)
+
+        return loss
 
 
 class MDSTransformer(nn.Module):
@@ -269,21 +377,19 @@ class MDSTransformer(nn.Module):
 
     def get_scoring_module(self, scoring_mode):
 
-        if scoring_mode == 'cross_attention':
-            return CrossAttentionScorer(self.d_model)
-        elif scoring_mode == 'cross_attention_tanh':
-            return CrossAttentionScorerTanh(self.d_model)
-        elif scoring_mode == 'cross_attention_softmax':
-            return CrossAttentionScorerSoftmax(self.d_model)
+        if scoring_mode.startswith('cross_attention'):
+            return CrossAttentionScorer(self.d_model, scoring_mode)
+        elif scoring_mode.startswith('dot_product'):
+            return DotProductScorer()
         else:
-            raise NotImplementedError("Scoring mode '{}' not implemented!".format(scoring_mode))
+            return Scorer(self.d_model, scoring_mode)
 
     def get_loss_func(self, loss_type):
 
         if loss_type == 'multilabelmargin':
             return nn.MultiLabelMarginLoss()
         elif loss_type == 'crossentropy':
-            pass
+            return RelevanceCrossEntropyLoss()
         else:
             raise NotImplementedError("Loss type '{}' not implemented!".format(loss_type))
 
@@ -323,16 +429,18 @@ class MDSTransformer(nn.Module):
             doc_emb = self.project_documents(doc_emb)
         # permute because pytorch convention for transformers is [seq_length, batch_size, feat_dim]
         doc_emb = doc_emb.permute(1, 0, 2)  # (max_docs_per_query, batch_size, doc_emb_dim) document embeddings
-        
+
         if query_token_ids.size(0) != doc_emb.size(1):
             raise RuntimeError("the batch size for queries and documents must be equal")
 
         # HF encoder output is a weird dictionary type
         encoder_out = self.encoder(query_token_ids.to(torch.int64), attention_mask=query_mask)  # int64 required by torch nn.Embedding
-        enc_hidden_states = encoder_out['last_hidden_state']
+        enc_hidden_states = encoder_out['last_hidden_state']  # (batch_size, max_query_len, query_dim)
         if self.query_dim != self.d_model:  # project query representation vectors to match dimensionality of doc embeddings
-            enc_hidden_states = self.project_query(enc_hidden_states)
-        
+            enc_hidden_states = self.project_query(enc_hidden_states)  # (batch_size, max_query_len, d_model)
+        # permute because pytorch convention for transformers is [seq_length, batch_size, feat_dim]
+        enc_hidden_states = enc_hidden_states.permute(1, 0, 2)  # (max_query_len, batch_size, d_model)
+
         # The nn.MultiHeadAttention expects ByteTensor or Boolean and uses the convention that non-0 is ignored
         # and 0 is used in attention, which is the opposite of HuggingFace.
         memory_key_padding_mask = ~query_mask
@@ -342,25 +450,19 @@ class MDSTransformer(nn.Module):
                                   tgt_key_padding_mask=~doc_padding_mask,  # again, MultiHeadAttention opposite of HF
                                   memory_key_padding_mask=memory_key_padding_mask)
         # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
-        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
 
-        predictions = self.score_docs(output_emb)
+        predictions = self.score_docs(output_emb, enc_hidden_states, memory_key_padding_mask)  # relevance scores. dimensions vary depending on scoring_mode
         
-        if self.scoring_mode != 'cross_attention_softmax':
-            rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores in [0, 1]
+        if self.scoring_mode.endswith('softmax'):
+            rel_scores = torch.exp(predictions[:, :, 0])  # (batch_size, num_docs) relevance scores
         else:
-            rel_scores = predictions[:,:,0]  # (batch_size, num_docs) relevance scores in [0, 1]
+            rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores
         
         if labels is not None:
             if self.loss_type != 'crossentropy':
-                loss = self.loss_func(rel_scores, labels.long())  # loss is scalar tensor; labels are int16, expected int32
+                loss = self.loss_func(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
             else:
-                scores_pos = predictions[:,:,0] * (labels > -1)
-                scores_neg = predictions[:,:,1] * (labels == -1)
-                scores_pos_mean = scores_pos.sum(dim=1) / (scores_pos!=0).sum(dim=1)
-                scores_neg_mean = scores_neg.sum(dim=1) / (scores_neg!=0).sum(dim=1)
-                loss = - torch.mean(scores_neg_mean + scores_pos_mean)
-                
+                loss = self.loss_func(predictions, labels)  # loss is scalar tensor
             return {'loss': loss, 'rel_scores': rel_scores}
         return {'rel_scores': rel_scores}
 

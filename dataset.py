@@ -414,8 +414,7 @@ class MYMARCO_Dataset(Dataset):
         retrieve_candidates_times.update(time.perf_counter() - tic)
         doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
-        #if self.mode != "eval":
-        if self.mode == "train":
+        if self.mode != "eval":
             tic = time.perf_counter()
             rel_docs = self.qrels[qid]
             # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
@@ -531,7 +530,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
 
         data['docinds'], data['doc_padding_mask'] = prepare_docinds_and_mask(doc_ids, docID_to_localind,
                                                                              padding_idx=local_emb_mat.shape[0]-1)
-        data['local_emb_mat'] = local_emb_mat.repeat(n_gpu, 1) # repeats to be passes to the each split of multi-gpu
+        data['local_emb_mat'] = local_emb_mat.repeat(n_gpu, 1)  # replicas passed to each split of multi-gpu
 
     max_docs_per_query = min(max_candidates, max(len(cands) for cands in doc_ids))  # length used for padding
 
@@ -546,15 +545,14 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
-    #if mode != "eval":
-    if mode == "train":
+    if mode != "eval":
         # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
         # It is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
         # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
         # that 1 or more positives (rel. docs) will be at the beginning of the list (and only there)
         labels = [list(range(len(rd))) for rd in rel_docs]
         # must be padded with -1 to have same dimensions as the transformer decoder output: (batch_size, max_docs_per_query)
-        data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int32, length=max_docs_per_query)
+        data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)  # no more than a couple of rel. documents per query exist, so even int8 could be used
 
     global collation_times
     collation_times.update(time.perf_counter() - start_collation_time)
@@ -575,7 +573,7 @@ def prepare_docinds_and_mask(doc_ids, docID_to_localind, padding_idx, length=Non
     """
     batch_size = len(doc_ids)
     length = length if length is not None else max(len(docids) for docids in doc_ids)
-    docinds = torch.full((batch_size, length), padding_idx, dtype=torch.int32)  
+    docinds = torch.full((batch_size, length), padding_idx, dtype=torch.int32)  # although docinds are local indices, int32 is used because the number of documents in the batch can grow large: cand_per_query*batch_size
     docinds_mask = torch.zeros_like(docinds, dtype=torch.bool)
     for i, docids in enumerate(doc_ids):
         local_docinds = [docID_to_localind[docid] for docid in docids]
@@ -610,7 +608,7 @@ def assemble_3D_tensors(doc_ids, local_emb_mat, docID_to_localind):
     return doc_emb_tensor, doc_emb_mask
 
 
-# only used by RepBERT
+# TODO: only used by RepBERT! (consider removing)
 class MSMARCODataset(Dataset):
     def __init__(self, mode, msmarco_dir,
                  collection_memmap_dir, queries_tokenids_path,
@@ -650,7 +648,7 @@ class MSMARCODataset(Dataset):
                 # self.candidates.get_qid_to_ind_mapping(self.qids)
         return
 
-    def get_collate_function(self, n_gpu=1): # TODO n_gpu is not well-handled in the function
+    def get_collate_function(self, n_gpu=1):  # TODO n_gpu is not handled in the function
         def collate_function(batch):
             input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]
             token_type_ids_lst = [[0] * len(x["query_input_ids"]) + [1] * len(x["doc_input_ids"]) for x in batch]
