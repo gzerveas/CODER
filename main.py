@@ -73,8 +73,8 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # Prepare optimizer and schedule
     nonencoder_optimizer, encoder_optimizer = get_optimizers(args, model)
-    print("args.learning_rate: ", args.learning_rate)
-    print('nonencoder_optimizer.defaults["lr"]: ', nonencoder_optimizer.defaults["lr"])
+    logger.debug("args.learning_rate: ", args.learning_rate)
+    logger.debug('nonencoder_optimizer.defaults["lr"]: ', nonencoder_optimizer.defaults["lr"])
     optimizer = MultiOptimizer(nonencoder_optimizer)
     if args.encoder_delay <= start_step:
         optimizer.add_optimizer(encoder_optimizer)
@@ -84,11 +84,11 @@ def train(args, model, val_dataloader, tokenizer=None):
         # utils.move_to_device(nonencoder_optimizer, args.device)
         # utils.move_to_device(encoder_optimizer, args.device)
         logger.info('Loaded optimizer(s) state')
-        print('optimizer.defaults["lr"]: ', optimizer.optimizers[0].defaults["lr"])
+        logger.debug('optimizer.defaults["lr"]: ', optimizer.optimizers[0].defaults["lr"])
 
     schedulers = get_schedulers(args, total_training_steps, nonencoder_optimizer, encoder_optimizer)
 
-    print("schedulers['nonencoder_scheduler'].get_last_lr(): ", schedulers['nonencoder_scheduler'].get_last_lr())
+    logger.debug("schedulers['nonencoder_scheduler'].get_last_lr(): ", schedulers['nonencoder_scheduler'].get_last_lr())
     scheduler = MultiScheduler(schedulers['nonencoder_scheduler'])
     if args.reduce_on_plateau:
         ROP_scheduler = MultiScheduler(schedulers['ROP_nonencoder_scheduler'])
@@ -100,7 +100,7 @@ def train(args, model, val_dataloader, tokenizer=None):
         scheduler.load_state_dict(sched_state)
         logger.info('Loaded scheduler(s) state')
     scheduler.step()  # this is done to correctly initialize learning rate (otherwise optimizer.defaults["lr"] is the first value when using get_constant_schedule_with_warmup)
-    print("schedulers['nonencoder_scheduler'].get_last_lr(): ", scheduler.schedulers[0].get_last_lr())
+    logger.debug("schedulers['nonencoder_scheduler'].get_last_lr(): ", scheduler.schedulers[0].get_last_lr())
 
     global_step = start_step  # counts how many times the weights have been updated, i.e. num. batches // gradient acc. steps
     start_epoch = global_step // epoch_steps

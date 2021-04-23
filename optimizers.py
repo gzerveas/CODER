@@ -60,20 +60,19 @@ def get_schedulers(args, total_training_steps, nonencoder_optimizer, encoder_opt
 
     if args.reduce_on_plateau is not None:
         mode = 'min' if args.reduce_on_plateau in NEG_METRICS else 'max'
-        print('mode: ', mode)
         patience = round(args.ROP_patience / args.validation_steps)  # patience in number of evaluations
         ROP_nonencoder_scheduler = ReduceLROnPlateau(nonencoder_optimizer, mode=mode, factor=args.ROP_factor,
                                                      patience=patience,
                                                      verbose=True,
-                                                     threshold_mode='abs',
-                                                     threshold=500, # 0.002
-                                                     min_lr=0) #args.final_lr_ratio*args.learning_rate)
+                                                     threshold_mode='rel',
+                                                     threshold=0.002,
+                                                     min_lr=args.final_lr_ratio*args.learning_rate)
         ROP_encoder_scheduler = ReduceLROnPlateau(encoder_optimizer, mode=mode, factor=args.ROP_factor,
                                                   patience=patience,
                                                   verbose=True,
-                                                  threshold_mode='abs',
-                                                  threshold=500,  # 0.002
-                                                  min_lr=0) #args.final_lr_ratio*args.encoder_learning_rate)
+                                                  threshold_mode='rel',
+                                                  threshold=0.002,
+                                                  min_lr=args.final_lr_ratio*args.encoder_learning_rate)
 
         nonencoder_scheduler = get_constant_schedule_with_warmup(nonencoder_optimizer, num_warmup_steps=args.warmup_steps)
         encoder_scheduler = get_constant_schedule_with_warmup(encoder_optimizer, num_warmup_steps=args.encoder_warmup_steps)

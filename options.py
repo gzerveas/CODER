@@ -96,7 +96,7 @@ def run_parse_args():
     parser.add_argument("--per_gpu_train_batch_size", default=32, type=int)
     parser.add_argument("--grad_accum_steps", type=int, default=1,
                         help="Gradient accumulation steps. The model parameters will be updated every this many batches")
-    parser.add_argument("--validation_steps", type=int, default=3000,
+    parser.add_argument("--validation_steps", type=int, default=2000,
                         help="Validate every this many training steps (i.e. param. updates); 0 for never.")
     parser.add_argument("--save_steps", type=int, default=2000,
                         help="Save checkpoint every this many training steps (i.e. param. updates); "
@@ -123,7 +123,7 @@ def run_parse_args():
                         help="If a metric is specified with this option, then this metric will be monitored, and in "
                              "case of no improvement within `ROP_patience` steps, the learning rate will be reduced by"
                              "`ROP_factor`.")
-    parser.add_argument("--ROP_patience", default=12000, type=int,
+    parser.add_argument("--ROP_patience", default=10000, type=int,
                         help="Number of steps after which the learning rate will be reduced in case of no performance"
                              " improvement. Must be higher than `validation_steps` (usually, multiple).")
     parser.add_argument("--ROP_factor", default=0.5, type=float,
