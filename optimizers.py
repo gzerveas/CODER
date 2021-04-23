@@ -3,7 +3,10 @@ import logging
 
 import torch
 from torch.optim.optimizer import Optimizer
-from transformers import AdamW
+from torch.optim.lr_scheduler import MultiplicativeLR, ReduceLROnPlateau
+from transformers import AdamW, get_polynomial_decay_schedule_with_warmup
+
+from options import NEG_METRICS
 
 logging.basicConfig(format='%(asctime)s | %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,6 +56,45 @@ def get_optimizers(args, model):
     return nonencoder_optimizer, encoder_optimizer
 
 
+def get_schedulers(args, total_training_steps, nonencoder_optimizer, encoder_optimizer):
+
+    if args.reduce_on_plateau is not None:
+        mode = 'min' if args.reduce_on_plateau in NEG_METRICS else 'max'
+        print('mode: ', mode)
+        patience = round(args.ROP_patience / args.validation_steps)  # patience in number of evaluations
+        ROP_nonencoder_scheduler = ReduceLROnPlateau(nonencoder_optimizer, mode=mode, factor=args.ROP_factor,
+                                                     patience=patience,
+                                                     verbose=True,
+                                                     threshold_mode='abs',
+                                                     threshold=500, # 0.002
+                                                     min_lr=0) #args.final_lr_ratio*args.learning_rate)
+        ROP_encoder_scheduler = ReduceLROnPlateau(encoder_optimizer, mode=mode, factor=args.ROP_factor,
+                                                  patience=patience,
+                                                  verbose=True,
+                                                  threshold_mode='abs',
+                                                  threshold=500,  # 0.002
+                                                  min_lr=0) #args.final_lr_ratio*args.encoder_learning_rate)
+
+        nonencoder_scheduler = get_constant_schedule_with_warmup(nonencoder_optimizer, num_warmup_steps=args.warmup_steps)
+        encoder_scheduler = get_constant_schedule_with_warmup(encoder_optimizer, num_warmup_steps=args.encoder_warmup_steps)
+
+        return {'nonencoder_scheduler': nonencoder_scheduler, 'encoder_scheduler': encoder_scheduler,
+                'ROP_nonencoder_scheduler': ROP_nonencoder_scheduler, 'ROP_encoder_scheduler': ROP_encoder_scheduler}
+
+    nonencoder_scheduler = get_polynomial_decay_schedule_with_warmup(nonencoder_optimizer,
+                                                                     num_warmup_steps=args.warmup_steps,
+                                                                     num_training_steps=total_training_steps,
+                                                                     lr_end=args.final_lr_ratio * args.learning_rate,
+                                                                     power=1.0)
+    encoder_scheduler = get_polynomial_decay_schedule_with_warmup(encoder_optimizer,
+                                                                  num_warmup_steps=args.encoder_warmup_steps,
+                                                                  num_training_steps=total_training_steps,
+                                                                  lr_end=args.final_lr_ratio*args.encoder_learning_rate,
+                                                                  power=1.0)
+
+    return {'nonencoder_scheduler': nonencoder_scheduler, 'encoder_scheduler': encoder_scheduler}
+
+
 class MultiOptimizer(object):
     """Provides a single-Optimizer API for a collection of several optimizers.
     Useful in case several schedules are used to control the learning rate of different portions of the model."""
@@ -73,12 +115,15 @@ class MultiOptimizer(object):
         return [op.state_dict() for op in self.optimizers]
 
     def load_state_dict(self, state_dicts):
+        num_states = len(self.optimizers)
         if len(state_dicts) > len(self.optimizers):
-            raise ValueError("Got {} state dictionaries for {} optimizers!".format(len(state_dicts), len(self.optimizers)))
+            logger.warning("Got {} state dictionaries for {} optimizers! "
+                           "Will only use the first {} state dictionaries.".format(len(state_dicts), len(self.optimizers), len(self.optimizers)))
         elif len(state_dicts) < len(self.optimizers):
             logger.warning("Got {} state dictionaries for {} optimizers! "
                            "The state of some optimizers will remain as is.".format(len(state_dicts), len(self.optimizers)))
-        for i in range(len(state_dicts)):
+            num_states = len(state_dicts)
+        for i in range(num_states):
             self.optimizers[i].load_state_dict(state_dicts[i])
 
     def add_optimizer(self, optimizer):
@@ -96,20 +141,23 @@ class MultiScheduler(object):
         """Ex: multischeduler = MultiScheduler(sched1, sched2)"""
         self.schedulers = list(schedulers)
 
-    def step(self):
+    def step(self, *args):
         for s in self.schedulers:
-            s.step()
+            s.step(*args)
 
     def state_dict(self):
         return [s.state_dict() for s in self.schedulers]
 
     def load_state_dict(self, state_dicts):
+        num_states = len(self.schedulers)
         if len(state_dicts) > len(self.schedulers):
-            raise ValueError("Got {} state dictionaries for {} schedulers!".format(len(state_dicts), len(self.schedulers)))
+            logger.warning("Got {} state dictionaries for {} schedulers! "
+                           "Will only use the first {} state dictionaries.".format(len(state_dicts), len(self.schedulers), len(self.schedulers)))
         elif len(state_dicts) < len(self.schedulers):
             logger.warning("Got {} state dictionaries for {} schedulers! "
                            "The state of some schedulers will remain as is.".format(len(state_dicts), len(self.schedulers)))
-        for i in range(len(state_dicts)):
+            num_states = len(state_dicts)
+        for i in range(num_states):
             self.schedulers[i].load_state_dict(state_dicts[i])
 
     def get_last_lr(self):
@@ -120,6 +168,37 @@ class MultiScheduler(object):
 
     def pop_scheduler(self):
         self.schedulers.pop()
+
+
+def get_constant_schedule_with_warmup(optimizer, num_warmup_steps: int, last_epoch: int = -1):
+    """
+    Create a schedule with a constant learning rate preceded by a warmup period, during which the learning rate
+    increases linearly between 0 and the initial lr set in the optimizer.
+    The returned scheduler can be combined with other schedulers, such as ReduceOnPlateau.
+
+    Args:
+        optimizer (:class:`~torch.optim.Optimizer`):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (:obj:`int`):
+            The number of steps for the warmup phase.
+        last_epoch (:obj:`int`, `optional`, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        :obj:`torch.optim.lr_scheduler.MultiplicativeLR` with the appropriate schedule.
+    """
+
+    def lr_lambda(current_step: int):
+        lr_init = 1/(num_warmup_steps - 1)
+        if current_step == 1:
+            return lr_init
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(current_step - 1)
+        return 1.0
+
+    scheduler = MultiplicativeLR(optimizer, lr_lambda, last_epoch=last_epoch)
+
+    return scheduler
 
 
 # from https://github.com/LiyuanLucasLiu/RAdam/blob/master/radam/radam.py

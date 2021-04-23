@@ -101,11 +101,13 @@ def load_model(model, model_path, device='cpu', resume=False, change_output=Fals
     :param model_path: checkpoint file from which to load model
     :param device: Where to initially load the tensors. The device of 'model' will determine the final destination,
         but by explicitly setting this to the same device as where `model` resides, intermediate memory allocation may be avoided.
-    :param optimizer: initialized optimizer object. Returned "as is", unless `resume` is True, in which case the state is loaded
-    :param scheduler: initialized scheduler object. Returned "as is", unless `resume` is True, in which case the state is loaded
     :param resume: if True, will additionally load global_step, optimizer and scheduler states
     :param change_output: if True, the `output_layer` parameters will not be loaded onto the model (used for fine-tuning)
-    :return:
+
+    :return: model: the model object, with weights loaded from a checkpoint
+    :return: global_step: 0, unless `resume` is True, in which case the step number is loaded from a checkpoint
+    :return: optimizer_state: None, unless `resume` is True, in which case a single state dict or a list of state dicts are loaded
+    :return: scheduler_state: None, unless `resume` is True, in which case a single state dict or a list of state docts are loaded
     """
     global_step = 0
     checkpoint = torch.load(model_path, map_location=device)

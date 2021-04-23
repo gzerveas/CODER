@@ -3,7 +3,8 @@ import random
 import optuna
 from optuna.samplers import TPESampler
 
-from main import main, run_parse_args, setup, NEG_METRICS, METRICS
+from options import *
+from main import main, setup
 import utils
 
 # Metric for hyperparam optimization.
