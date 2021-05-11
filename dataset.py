@@ -414,17 +414,19 @@ class MYMARCO_Dataset(Dataset):
         retrieve_candidates_times.update(time.perf_counter() - tic)
         doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
-        if self.mode != "eval":
+        if self.mode == "eval":
+            rel_docs = None
+        else:
             tic = time.perf_counter()
             rel_docs = self.qrels[qid]
-            # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
-            # while ensuring that they are only included once
-            num_candidates = len(doc_ids)
-            new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:num_candidates]
-            doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
+            if self.mode == "train":
+                # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
+                # while ensuring that they are only included once
+                num_candidates = len(doc_ids)
+                new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:num_candidates]
+                doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
             prep_docids_times.update(time.perf_counter() - tic)
-        else:
-            rel_docs = None
+
 
         tic = time.perf_counter()
         doc_embeddings = torch.tensor(self.emb_collection[doc_ids])  # (num_doc_ids, emb_dim) tensor of doc. embeddings

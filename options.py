@@ -126,9 +126,17 @@ def run_parse_args():
     parser.add_argument("--ROP_patience", default=10000, type=int,
                         help="Number of steps after which the learning rate will be reduced in case of no performance"
                              " improvement. Must be higher than `validation_steps` (usually, multiple).")
+    parser.add_argument("--ROP_cooldown", default=10000, type=int,
+                        help="Number of steps after each learning rate reduction, during which the ROP mechanism is "
+                             "inactive.")
     parser.add_argument("--ROP_factor", default=0.5, type=float,
                         help="Multiplicative factor used to reduce learning rate in case of no performance"
                              " improvement.")
+    parser.add_argument("--ROP_threshold", default=1e-4, type=float,
+                        help="Unsigned threshold used to decide whether metric has improved improvement.")
+    parser.add_argument("--ROP_thr_mode", default='rel', choices=['rel', 'abs'],
+                        help="Type of threshold used to decide whether metric has improved improvement: "
+                             "relative ('rel') or absolute ('abs') improvement.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
     parser.add_argument("--weight_decay", default=0.002, type=float)  # 0.01
 

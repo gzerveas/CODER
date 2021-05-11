@@ -411,7 +411,8 @@ class MDSTransformer(nn.Module):
         :param  doc_padding_mask: (batch_size, num_docs) boolean/ByteTensor mask with 0 at positions of missing input
                     documents (decoder sequence length is less than the max. doc. pool size in the batch)
         :param  doc_attention_mat_mask: (num_docs, num_docs) float additive mask for the decoder sequence (optional).
-                    This is for causality and is directly added on top of the attention matrix
+                    This is for causality, and if FloatTensor, can be directly added on top of the attention matrix.
+                    If BoolTensor, positions with ``True`` are ignored, while ``False`` values will be considered.
         :param  labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices of the
                 relevant documents within its corresponding pool of candidates (docinds).
                     Optional: If provided, the loss will be computed.
@@ -445,6 +446,9 @@ class MDSTransformer(nn.Module):
         # and 0 is used in attention, which is the opposite of HuggingFace.
         memory_key_padding_mask = ~query_mask
 
+        SELFATTENTION_OFF = False  # TODO: for ablation study
+        if SELFATTENTION_OFF:
+            doc_attention_mat_mask = ~torch.eye(doc_emb.shape[0], dtype=bool)  # (max_docs_per_query, max_docs_per_query)
         # (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
         output_emb = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,
                                   tgt_key_padding_mask=~doc_padding_mask,  # again, MultiHeadAttention opposite of HF

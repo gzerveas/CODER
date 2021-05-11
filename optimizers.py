@@ -63,15 +63,17 @@ def get_schedulers(args, total_training_steps, nonencoder_optimizer, encoder_opt
         patience = round(args.ROP_patience / args.validation_steps)  # patience in number of evaluations
         ROP_nonencoder_scheduler = ReduceLROnPlateau(nonencoder_optimizer, mode=mode, factor=args.ROP_factor,
                                                      patience=patience,
+                                                     cooldown=args.ROP_cooldown,
                                                      verbose=True,
-                                                     threshold_mode='rel',
-                                                     threshold=0.002,
+                                                     threshold_mode=args.ROP_thr_mode,
+                                                     threshold=args.ROP_threshold,
                                                      min_lr=args.final_lr_ratio*args.learning_rate)
         ROP_encoder_scheduler = ReduceLROnPlateau(encoder_optimizer, mode=mode, factor=args.ROP_factor,
                                                   patience=patience,
+                                                  cooldown=args.ROP_cooldown,
                                                   verbose=True,
-                                                  threshold_mode='rel',
-                                                  threshold=0.002,
+                                                  threshold_mode=args.ROP_thr_mode,
+                                                  threshold=args.ROP_threshold,
                                                   min_lr=args.final_lr_ratio*args.encoder_learning_rate)
 
         nonencoder_scheduler = get_constant_schedule_with_warmup(nonencoder_optimizer, num_warmup_steps=args.warmup_steps)

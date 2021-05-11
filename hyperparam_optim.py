@@ -20,18 +20,25 @@ def objective(trial):
     args = utils.dict2obj(config)  # convert back to args object
     args.config_filepath = None  # the contents of a JSON file (if specified) have been loaded already, so prevent the `main.setup` from overwriting the Optuna overrides
 
+    # args.gpu_id = '0,1'
+    # args.per_gpu_train_batch_size = 16
+    # args.per_gpu_eval_batch_size = 16
+    # args.reduce_on_plateau = 'loss'
+
     # Optuna overrides
-    args.scoring_mode = trial.suggest_categorical('scoring_mode', ['raw', 'cross_attention', 'dot_product', 'cross_attention_gelu'])
+    args.scoring_mode = trial.suggest_categorical('scoring_mode', ['cross_attention',  'cross_attention_gelu'])#, 'dot_product', 'raw'])
     args.optimizer = trial.suggest_categorical('optimizer', ['AdamW', 'RAdam'])
     args.weight_decay = trial.suggest_loguniform('weight_decay', 1e-6, 5e-2)
-    args.num_candidates = trial.suggest_int('num_candidates', 10, 400)
-    args.num_inbatch_neg = trial.suggest_int('num_inbatch_neg', 10, 400)
+    args.num_candidates = 300
+    args.num_inbatch_neg = 300
+    # args.num_candidates = trial.suggest_int('num_candidates', 10, 400)
+    # args.num_inbatch_neg = trial.suggest_int('num_inbatch_neg', 10, 400)
     args.learning_rate = trial.suggest_loguniform('learning_rate', 1e-6, 1e-4)
     args.encoder_delay = int(trial.suggest_discrete_uniform('encoder_delay', 0, 20000, 5000))
     args.encoder_learning_rate = trial.suggest_uniform('encoder_learning_rate', 0.1*args.learning_rate, 2*args.learning_rate) #trial.suggest_loguniform('encoder_learning_rate', 1e-6, 1e-4)
     args.warmup_steps = int(trial.suggest_discrete_uniform('warmup_steps', 1000, 20000, 1000))
     args.encoder_warmup_steps = int(trial.suggest_discrete_uniform('encoder_warmup_steps', 5000, 20000, 1000))
-    args.final_lr_ratio = trial.suggest_uniform('final_lr_ratio', 0.9999, 0.9999)
+    args.final_lr_ratio = trial.suggest_uniform('final_lr_ratio', 0.01, 0.1)
     args.adam_epsilon = trial.suggest_loguniform('adam_epsilon', 1e-8, 2e-6)
 
     args.num_layers = trial.suggest_int('num_layers', 1, 6)
@@ -56,7 +63,7 @@ def objective(trial):
 if __name__ == '__main__':
 
     storage = 'sqlite:////gpfs/data/ceickhof/dcohen_share/mdst_optuna.db'
-    study_name = 'mdst_study_transp_Qenc_repbert'  # This name is shared across jobs
+    study_name = 'mdst_study_all_new'  # This name is shared across jobs
     n_trials = 10
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())
     direction = 'minimize' if OPTIM_METRIC in NEG_METRICS else 'maximize'
