@@ -45,7 +45,8 @@ def tokenize_queries(args, tokenizer):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Converts documents in a collection and/or text queries into "
+                                                 "JSON files containing sequences of token IDs")
     parser.add_argument("--output_dir", type=str, default="tokenized",
                         help='Path of directory where to write tokenized collection and/or queries in JSON format.')
     parser.add_argument("--queries", type=str, default=None,

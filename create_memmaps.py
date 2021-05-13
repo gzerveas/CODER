@@ -170,7 +170,8 @@ def create_candidates_memmap(candidates_filepath, memmap_dir, max_docs, num_qids
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Creates binary memmap files out of a tokenized/numerized document collection"
+                                                 "JSON file and/or a candidate (retrieved) documents text file.")
     parser.add_argument("--tokenized_collection", type=str, default=None,
                         help="JSON file containing {docID : list of document token IDs} pairs, "
                              "produced by convert_text_to_tokenized.py")

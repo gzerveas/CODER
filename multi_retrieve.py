@@ -27,6 +27,7 @@ def raise_immediately(func):
 @raise_immediately
 def writer(args, finish_queue_lst):
     _, query_id_memmap = get_embed_memmap(args.query_embedding_dir, args.embedding_dim)
+    print("Writing retrieved documents in {} ...".format(args.output_path))
     with open(args.output_path, 'w') as outFile:
         for qid in query_id_memmap:
             score_docid_lst = []
@@ -46,10 +47,12 @@ def allrank(gpu_queue, doc_begin_index, doc_end_index, finish_queue):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     assert torch.cuda.device_count() == 1
 
+    print("Loading query embeddings memmap ...")
     query_embedding_memmap, query_id_memmap = get_embed_memmap(
         args.query_embedding_dir, args.embedding_dim)
     qid2pos = {identity:i for i, identity in enumerate(query_id_memmap)}
 
+    print("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(
         args.doc_embedding_dir, args.embedding_dim)
     assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))
@@ -60,7 +63,7 @@ def allrank(gpu_queue, doc_begin_index, doc_end_index, finish_queue):
     doc_embeddings = torch.from_numpy(doc_embeddings).to(device)
     results_dict = {qid:PriorityQueue(maxsize=args.hit) for qid in query_id_memmap}
 
-    for qid in tqdm(query_id_memmap, desc=f"{gpuid}"):
+    for qid in tqdm(query_id_memmap, desc=f"Retrieving on GPU {gpuid}"):
         query_embedding = query_embedding_memmap[qid2pos[qid]]
         query_embedding = torch.from_numpy(query_embedding)
         query_embedding = query_embedding.to(device)
