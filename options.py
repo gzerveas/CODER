@@ -1,4 +1,7 @@
 import argparse
+import logging
+logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
+logger = logging.getLogger()
 
 NEG_METRICS = ['loss']  # metrics which are better when smaller
 POS_METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']  # metrics which are better when higher
@@ -20,7 +23,11 @@ def run_parse_args():
     parser.add_argument('--comment', type=str, default='', help='A comment/description of the experiment')
     parser.add_argument('--no_timestamp', action='store_true',
                         help='If set, a timestamp and random suffix will not be appended to the output directory name')
-    parser.add_argument("--task", choices=["train", "dev", "eval"])
+    parser.add_argument("--task", choices=["train", "dev", "eval"], default=None,
+                        help="'train' is used to train the model (and validate on a validation set specified by `eval_candidates_path`). "
+                             "'dev' is used for evaluation when labels are available: this allows to calculate metrics, "
+                             "plot histograms, inject ground truth relevant document in set of candidates to be reranked. "
+                             "'eval' mode is used for evaluation ONLY if no labels are available.")
     parser.add_argument('--resume', action='store_true',
                         help='Used together with `load_model`. '
                              'If set, will load `start_step` and state of optimizer, scheduler besides model weights.')
@@ -28,8 +35,10 @@ def run_parse_args():
     ## I/O
     parser.add_argument('--output_dir', type=str, default='./output',
                         help='Root output directory. Must exist. Time-stamped directories will be created inside.')
-    parser.add_argument("--msmarco_dir", type=str, default="~/data/MS_MARCO",
-                        help="Directory where qrels, queries files can be found")
+    # parser.add_argument("--msmarco_dir", type=str, default="~/data/MS_MARCO",  # TODO: remove
+    #                     help="OBSOLETE! Here only for compatibility. Directory where qrels, queries files can be found")
+    parser.add_argument("--qrels_path", type=str,
+                        help="Path of the text file or directory with the ground truth relevance labels, qrels")
     parser.add_argument("--train_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv",
                         help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini")
     parser.add_argument("--eval_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.dev.tsv",
@@ -37,7 +46,7 @@ def run_parse_args():
     parser.add_argument("--embedding_memmap_dir", type=str, default="repbert/representations/doc_embedding",
                         help="Directory containing (num_docs_in_collection, doc_emb_dim) memmap array of document "
                              "embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs")
-    parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",
+    parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",  # TODO: rename "queries_path"
                         help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file.")
     parser.add_argument("--collection_memmap_dir", type=str, default="./data/collection_memmap", help="RepBERT only!")  # RepBERT only
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
@@ -75,7 +84,7 @@ def run_parse_args():
                              "If 0, only documents in `candidates_path` will be used as negatives.")
 
     ## System
-    parser.add_argument('--debug', action='store_true', help="Activate debug mode")
+    parser.add_argument('--debug', action='store_true', help="Activate debug mode (displays more information)")
     parser.add_argument('--gpu_id', action='store', dest='cuda_ids', type=str, default="0",
                         help="Optional cuda device ids for single/multi gpu setting, like '0' or '0,1,2,3' ", required=False)
     parser.add_argument('--seed', type=int, default=42)
@@ -143,6 +152,9 @@ def run_parse_args():
     ## Evaluation
     parser.add_argument("--metrics_k", type=int, default=10, help="Evaluate metrics considering top k candidates")
     parser.add_argument('--key_metric', choices=METRICS, default='MRR', help='Metric used for defining best epoch')
+    parser.add_argument("--inject_ground_truth", action='store_true',
+                        help="If true, the ground truth document(s) will always be present in the set of documents"
+                             "to be reranked for evaluation (during validation or in 'dev' mode).")
 
     ## Model
     parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer'], default='mdstransformer',
@@ -164,20 +176,49 @@ def run_parse_args():
                         help='What kind of positional encoding to use for the transformer decoder input sequence') # TODO: not implemented
     parser.add_argument('--activation', choices={'relu', 'gelu'}, default='gelu',
                         help='Activation to be used in transformer decoder')
-    parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm'}, default='BatchNorm',
-                        help='Normalization layer to be used internally in the transformer decoder') # TODO: not implemented
+    parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm', 'None'}, default='BatchNorm',
+                        help='Normalization layer to be used internally in the transformer decoder')
     parser.add_argument('--scoring_mode',
                         choices={'raw', 'sigmoid', 'tanh', 'softmax',
                                  'cross_attention', 'cross_attention_sigmoid', 'cross_attention_tanh', 'cross_attention_softmax',
-                                 'dot_product'},
+                                 'dot_product', 'dot_product_gelu', 'dot_product_softmax',
+                                 'cosine', 'cosine_gelu', 'cosine_softmax'},
                         default='raw', help='Scoring function to map the final embeddings to scores')
-    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy'}, default='multilabelmargin',
+    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'multitier'}, default='multilabelmargin',
                         help='Loss applied to document scores')
+    parser.add_argument('--num_tiers', type=int, default=4,
+                        help="Number of relevance tiers for `loss_type` 'multitier'")
+    parser.add_argument('--tier_size', type=int, default=50,
+                        help="Number of candidates within each tier of relevance for `loss_type` 'multitier'")
+    parser.add_argument('--diff_function', choices={'exp', 'maxmargin'}, default='maxmargin',
+                        help="Function to be applied to score differences between documents belonging to different tiers, "
+                             "when `loss_type` is 'multitier'.")
+    parser.add_argument('--gt_function', choices={'multilabelmargin', 'same', None}, default=None,
+                        help="Special loss function to be applied for calculating the extra contribution of the ground truth"
+                             "relevant documents, when `loss_type` is 'multitier'. If None, no special treatment will "
+                             "be given to ground truth relevant documents in the loss calculation, besides including them "
+                             "in the top tier.")
+    parser.add_argument('--gt_factor', type=float, default=2.0,
+                        help="Scaling factor of ground truth component for `loss_type` 'multitier'")
+    parser.add_argument('--selfatten_mode', type=int, default=0, choices=[0, 1, 2, 3],
+                        help="Self-attention (SA) mode for contextualizing documents. Choices: "
+                             "0: regular SA "
+                             "1: turn off SA by using diagonal SA matrix (no interactions between documents) "
+                             "2: linear layer + non-linearity instead of SA "
+                             "3: SA layer has simply been removed")
+    parser.add_argument('--no_dec_crossatten', action='store_true',
+                        help="If used, the transformer decoder will not have cross-attention over the sequence of "
+                             "query term embeddings in the output of the query encoder")
+    parser.add_argument('--no_decoder', action='store_true',
+                        help="If used, no transformer decoder will be used to transform document embeddings")
 
     args = parser.parse_args()
 
-    if args.task is None and args.config_filepath is None:
+    if (args.task is None) and (args.config_filepath is None):
         raise ValueError('Please specify task! (train, dev, eval)')
+
+    # if (args.task != 'eval') and (args.qrels_path is None):
+    #     logger.warning("Will use `args.msmarco_dir` to find qrels in args.msmarco_dir/qrels.{}.tsv !".format(args.task))
 
     # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
     components = args.key_metric.split('@')

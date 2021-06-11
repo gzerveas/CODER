@@ -1,8 +1,7 @@
-
+import math
 import logging
 from typing import Optional, Any, Dict
 
-import ipdb
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -125,42 +124,10 @@ class RepBERT(BertPreTrainedModel):
         return text_embeddings
 
 
-# class CrossAttentionScorerLogSoftmax(nn.Module):
-#
-#     def __init__(self, d_model):
-#         super(CrossAttentionScorerLogSoftmax, self).__init__()
-#
-#         self.linear = nn.Linear(d_model, 2)
-#
-#     def forward(self, output_emb, query_emb=None):
-#         """
-#         :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
-#         :param query_emb: not used
-#         :return: (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
-#         """
-#
-#         return torch.nn.LogSoftmax(dim=-1)(self.linear(output_emb))
-#
-#
-# class CrossAttentionScorerTanh(nn.Module):
-#
-#     def __init__(self, d_model):
-#         super(CrossAttentionScorerTanh, self).__init__()
-#
-#         self.linear = nn.Linear(d_model, 1)
-#
-#     def forward(self, output_emb, query_emb=None):
-#         """
-#         :param output_emb: (batch_size, num_docs, doc_emb_size) transformed sequence of document embeddings
-#         :param query_emb: not used
-#         :return: (batch_size, num_docs) relevance scores in [-1, 1]
-#         """
-#
-#         return torch.tanh(self.linear(output_emb))
-
-
 class Scorer(nn.Module):
     """
+    When used as a base class, it creates the functions used to compute the query-document relevance scores.
+    When used as a stand-alone class:
     Directly scores final document representations in the "decoder".
     Exploits cross-attention between encoded query states and documents in the preceding decoder layer.
     The decoder creates its Queries from the layer below it, and takes the Keys and Values from the output of the encoder.
@@ -172,6 +139,11 @@ class Scorer(nn.Module):
         self.build_score_function(d_model, scoring_mode)
 
     def build_score_function(self, d_model, scoring_mode):
+        """
+        :param d_model: the dimension of the vectors (typically, embeddings of size d_model, but not in case of "dot_product" scoring)
+            before the scoring function
+        :param scoring_mode: string specifying how to score documents
+        """
 
         if scoring_mode.endswith('sigmoid'):
             self.linear = nn.Linear(d_model, 1)
@@ -184,6 +156,12 @@ class Scorer(nn.Module):
             self.score_func = torch.nn.LogSoftmax(dim=-1)
         else:
             self.linear = nn.Linear(d_model, 1)
+
+            # self.linear.weight.requires_grad = False
+            # self.linear.weight.data.fill_(1.00)
+            # self.linear.bias.requires_grad = False
+            # self.linear.bias.data.fill_(0.00)
+
             self.score_func = torch.nn.Identity()
 
     def forward(self, output_emb, *args, **kwargs):
@@ -230,15 +208,26 @@ class CrossAttentionScorer(Scorer):
         return self.score_func(self.linear(out))
 
 
-class DotProductScorer(nn.Module):
+class DotProductScorer(Scorer):
     """
     Computes scores as a dot product between the aggregate (e.g. mean) query representation and each final document
     embedding.
     """
-    def __init__(self):
-        super(DotProductScorer, self).__init__()
+    def __init__(self, scoring_mode='', pre_activation=None, normalize=False):
+        """
+        :param scoring_mode: string, same as the option used to initialize `MDSTransformer`. At this point, the string
+            must start with "doc_product" or "cosine", but the suffix can specify a (non)linear transformation to be used on scores
+        :param pre_activation: activation function to use on representations BEFORE computing the inner product
+        :param normalize: if True, will divide product by vector norms, i.e. will compute the cosine similarity
+        """
+        super(DotProductScorer, self).__init__(d_model=1, scoring_mode=scoring_mode)
 
-        # self.activation_func = torch.nn.GELU()
+        if pre_activation is not None:
+            self.pre_activation_func = torch.nn.GELU()
+        else:
+            self.pre_activation_func = None
+
+        self.normalize = normalize
 
     def forward(self, output_emb, query_emb, query_mask):
         """
@@ -246,16 +235,24 @@ class DotProductScorer(nn.Module):
         :param query_emb: (query_length, batch_size, d_model) final query term embeddings
         :param query_mask: (batch_size, query_length) attention mask bool tensor for query tokens; 0 use, 1 ignore
         :return: scores: (batch_size, num_docs) inner product between aggregate query embedding and each document embedding
+            if 'dot_product_softmax': (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
         """
-        # output_emb = self.activation_func(output_emb)  # TODO: test
-        # query_emb = self.activation_func(query_emb)  # TODO: test
+        if self.pre_activation_func is not None:
+            output_emb = self.pre_activation_func(output_emb)  # TODO: test
+            query_emb = self.pre_activation_func(query_emb)  # TODO: test
+
         output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, d_model)
         query_emb = query_emb.permute(1, 0, 2)  # (batch_size, query_len, d_model)
-        avg_query_emb = _average_sequence_embeddings(query_emb, ~query_mask)
+        avg_query_emb = _average_sequence_embeddings(query_emb, ~query_mask)  # (batch_size, d_model)
 
-        prod = torch.matmul(output_emb, avg_query_emb[:, :, None]).squeeze()  # (batch_size, num_docs) scores
+        if self.normalize:
+            scores = F.cosine_similarity(output_emb, avg_query_emb[:, None, :], dim=2, eps=1e-6)
+        else:
+            # scores = torch.matmul(output_emb, avg_query_emb[:, :, None])  # (batch_size, num_docs, 1) when using self.score_func for re-scaling
+            # scores = self.score_func(self.linear(scores))
+            scores = torch.matmul(output_emb, avg_query_emb[:, :, None]).squeeze()  # to disable scaling
 
-        return prod
+        return scores
 
 
 class RelevanceCrossEntropyLoss(nn.Module):
@@ -289,6 +286,345 @@ class RelevanceCrossEntropyLoss(nn.Module):
         return loss
 
 
+class MultiTierLoss(nn.Module):
+    """
+    Multiple tiers of relevance for negative documents.
+    """
+
+    def __init__(self, num_tiers=3, tier_size=50, diff_function='maxmargin', gt_function=None, gt_factor=2, reduction='mean'):
+        """
+        :param num_tiers: total number of tiers (ground truth documents are not considered a separate tier)
+        :param tier_size: number of documents in each tier
+        :param diff_function: function to be applied to score differences between documents belonging to different tiers
+        :param gt_function: special loss function to be applied for calculating the extra contribution of the ground truth
+                            relevant documents. If None, no special treatment will be given to ground truth relevant
+                            documents in the loss calculation, besides including them in the top tier
+        :param gt_factor: scaling factor of special ground truth component
+        :param reduction: if 'none', a loss for each batch item (query) will be computed, otherwise the 'mean' or 'sum'
+                        over queries in the batch
+        """
+        super(MultiTierLoss, self).__init__()
+
+        self.num_tiers = num_tiers
+        self.tier_size = tier_size
+
+        if diff_function == 'exp':
+            self.diff_function = lambda x: torch.exp(-x)
+        elif diff_function == 'maxmargin':
+            self.diff_function = lambda x: torch.nn.functional.relu(1 - x)  # max(0, 1-x)
+        else:
+            raise NotImplementedError("Difference function '{}' not implemented")
+
+        if gt_function == 'same':  # will use the same function as `diff_function`
+            self.gt_function = self.compute_gt_diffs
+        elif gt_function == 'multilabelmargin':  # this is equivalent to 'same' with `diff_function`=='maxmargin', but much faster (avoids Python loop over batch_size)
+            self.gt_function = nn.MultiLabelMarginLoss(reduction='none')
+        else:  # if None, no special treatment for ground truth relevant documents
+            self.gt_function = gt_function
+        self.gt_factor = gt_factor
+
+        self.reduction = reduction
+
+    # def compute_diffs_slow(self, scores, inds1, inds2):
+    #     """
+    #     complexity of O(inds1), but calculates the loss contributions for num_queries*inds1*inds2 elements
+    #     :param scores: (batch_size, num_docs) relevance scores for each candidate document and query
+    #     :param inds1: (num_tier1docs,) indices (locations) of documents within first tier. Same across batch (i.e. for all queries)! Can be a list or range.
+    #     :param inds2: (num_tier2docs,) indices (locations) of documents within second tier. Same across batch (i.e. for all queries)! Can be a list or range.
+    #     :return query_losses: (batch_size,) loss for each query corresponding
+    #         to the score differences between documents with inds1 and documents with inds2
+    #     """
+
+    #     query_losses = torch.zeros(scores.shape[0], dtype=torch.float32, device=scores.device)
+    #     for i in inds1:
+    #         query_losses += torch.sum(self.diff_function(scores[:, i].unsqueeze(dim=-1) - scores[:, inds2]), dim=1)
+    #     return query_losses / (len(inds1) + len(inds2))  # normalize by the number of terms
+
+    def compute_diffs(self, scores, inds1, inds2):
+        """
+        :param scores: (batch_size, num_docs) relevance scores for each candidate document and query
+        :param inds1: (num_tier1docs,) indices (locations) of documents within first tier. Same across batch (i.e. for all queries)! Can be a list or range.
+        :param inds2: (num_tier2docs,) indices (locations) of documents within second tier. Same across batch (i.e. for all queries)! Can be a list or range.
+        :return query_losses: (batch_size,) loss for each query corresponding
+            to the score differences between documents with inds1 and documents with inds2
+        """
+
+        query_losses = torch.sum(
+            self.diff_function(scores[:, inds1].unsqueeze(dim=2) - scores[:, inds2].unsqueeze(dim=1)), dim=(1, 2)) / (
+                                   len(inds1) + len(inds2))
+
+        return query_losses
+
+    def compute_gt_diffs(self, scores, labels):
+        """
+        loop O(batch_size)
+        Use `labels` to determine indices of ground truth and negative documents, and use them
+        to call `compute_diffs`.
+        # TODO: relies on the easy-to-lift assumption that all g.t. are at the beginning
+
+        :param scores: (batch_size, num_docs) relevance scores for each candidate document and query.
+        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+                indicating non-relevance.
+        :return query_losses: (batch_size,) loss for each query
+        """
+        num_relevant = (labels > -1).sum(dim=1)  # (batch_size,)
+
+        # equivalent to:
+        # torch.tensor([self.compute_diffs(scores[i, :].unsqueeze(0), range(num_relevant[i]), range(num_relevant[i], scores.shape[1])) for i in range(scores.shape[0])], device=scores.device)
+        # loop O(batch_size)
+        query_losses = torch.tensor([torch.sum(self.diff_function(
+            scores[i, range(num_relevant[i])].unsqueeze(dim=-1) - scores[i, range(num_relevant[i], scores.shape[1])]))
+                                     for i in range(scores.shape[0])]).to(device=scores.device)
+
+        return query_losses / scores.shape[1]
+
+    def forward(self, scores, labels):
+        """
+        :param scores: (batch_size, num_docs) relevance scores for each candidate document and query.
+        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+                indicating non-relevance.
+        :return: loss: (batch_size,) tensor of aggregate loss per document for each query if reduction=='none',
+                        otherwise scalar tensor of aggregate loss per query and document
+        """
+
+        # is_relevant = (labels > -1)
+        # num_relevant = is_relevant.sum(dim=1)  # total number of relevant documents in the batch
+        # num_negatives = scores.shape[1] - num_relevant
+        num_negatives = scores.shape[1]  # this is approximately correct; we hereby include the g.t. relevant in tier 1
+        mids_distance = math.ceil((num_negatives - 2 * self.tier_size) / (self.num_tiers - 1))
+        start_inds = [0] + [int(self.tier_size / 2) + i * mids_distance for i in range(self.num_tiers - 2)] + [
+            scores.shape[1] - self.tier_size]
+
+        # Treating as "positives" the documents within each tier, the loss compares
+        # their scores to the scores of documents in all lower tiers (and the ones in-between lower tiers)
+        # complexity O(num_tiers)
+        loss = torch.zeros(scores.shape[0], dtype=torch.float32,
+                           device=scores.device)  # (batch_size,) loss for each query
+        for t in range(self.num_tiers - 1):
+            # variant to compare with immediately lower tier: inds2 = range(start_inds[t+1], start_inds[t+1] + self.tier_size)
+            loss += self.compute_diffs(scores, range(start_inds[t], start_inds[t] + self.tier_size),
+                                       range(start_inds[t + 1], scores.shape[1]))
+
+        if self.gt_function is not None:
+            # in this case a special loss component will be computed from ground truth relevant documents versus
+            # all other candidates using the provided function, added with a scaling factor of `self.gt_factor`
+            gt_loss = self.gt_function(scores, labels)
+            loss = loss + self.gt_factor * gt_loss
+
+        if self.reduction == 'mean':
+            loss = torch.mean(loss)
+        elif self.reduction == 'sum':
+            loss = torch.sum(loss)
+
+        return loss
+
+
+def get_loss_module(args):
+
+    if args.loss_type == 'multilabelmargin':
+        return nn.MultiLabelMarginLoss()
+    elif args.loss_type == 'crossentropy':
+        return RelevanceCrossEntropyLoss()
+    elif args.loss_type == 'multitier':
+        return MultiTierLoss(num_tiers=args.num_tiers, tier_size=args.tier_size, diff_function=args.diff_function,
+                             gt_function=args.gt_function,
+                             gt_factor=args.gt_factor)
+    else:
+        raise NotImplementedError("Loss type '{}' not implemented!".format(args.loss_type))
+
+
+class NoCrossTransformerDecoderLayer(nn.TransformerDecoderLayer):
+    r"""NoCrossTransformerDecoderLayer is a modified nn.TransformerDecoderLayer, without a cross-attention layer
+    attending over the sequence of encoder embeddings.
+
+    Args:
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        activation: the activation function of intermediate layer, relu or gelu (default=relu).
+"""
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", normalization="LayerNorm"):
+        super(nn.TransformerDecoderLayer, self).__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.normalization = normalization
+        if normalization == "LayerNorm":
+            self.norm1 = nn.LayerNorm(d_model)
+            self.norm3 = nn.LayerNorm(d_model)
+        elif normalization == "BatchNorm":
+            self.norm1 = nn.BatchNorm1d(d_model, eps=1e-5)
+            self.norm3 = nn.BatchNorm1d(d_model, eps=1e-5)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+
+    def __setstate__(self, state):
+        if 'activation' not in state:
+            state['activation'] = F.relu
+        super(NoCrossTransformerDecoderLayer, self).__setstate__(state)
+
+    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Optional[Tensor] = None, memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None, memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        r"""Pass the inputs (and mask) through the decoder layer.
+
+        Args:
+            tgt: the sequence to the decoder layer (required).
+            memory: the sequence from the last layer of the encoder (required).
+            tgt_mask: the mask for the tgt sequence (optional).
+            memory_mask: the mask for the memory sequence (optional).
+            tgt_key_padding_mask: the mask for the tgt keys per batch (optional).
+            memory_key_padding_mask: the mask for the memory keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        tgt2 = self.self_attn(tgt, tgt, tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        if self.normalization != 'None':
+            tgt = self.norm1(tgt)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        if self.normalization != 'None':
+            tgt = self.norm3(tgt)
+        return tgt
+
+
+class LinearTransformerDecoderLayer(nn.TransformerDecoderLayer):
+    r"""LinearTransformerDecoderLayer is a modified nn.TransformerDecoderLayer, with the self-attention layer replaced
+    by a dense layer, followed by a non-linearity.
+
+    Args:
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        activation: the activation function of intermediate layer, relu or gelu (default=relu).
+"""
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu"):
+        super(nn.TransformerDecoderLayer, self).__init__()
+
+        self.linear_attn_substitute = nn.Linear(d_model, d_model)
+        self.act1 = nn.ReLU()
+
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def __setstate__(self, state):
+        if 'activation' not in state:
+            state['activation'] = F.relu
+        super(LinearTransformerDecoderLayer, self).__setstate__(state)
+
+    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Optional[Tensor] = None, memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None, memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        r"""Pass the inputs (and mask) through the decoder layer.
+
+        Args:
+            tgt: the sequence to the decoder layer (required).
+            memory: the sequence from the last layer of the encoder (required).
+            tgt_mask: the mask for the tgt sequence (optional).
+            memory_mask: the mask for the memory sequence (optional).
+            tgt_key_padding_mask: the mask for the tgt keys per batch (optional).
+            memory_key_padding_mask: the mask for the memory keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        tgt2 = self.act1(self.linear_attn_substitute(tgt))
+        tgt = self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+
+class ReducedTransformerDecoderLayer(nn.TransformerDecoderLayer):
+    r"""ReducedTransformerDecoderLayer is a modified nn.TransformerDecoderLayer, with no self-attention layer.
+
+    Args:
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        activation: the activation function of intermediate layer, relu or gelu (default=relu).
+"""
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu"):
+        super(nn.TransformerDecoderLayer, self).__init__()
+
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def __setstate__(self, state):
+        if 'activation' not in state:
+            state['activation'] = F.relu
+        super(ReducedTransformerDecoderLayer, self).__setstate__(state)
+
+    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Optional[Tensor] = None, memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None, memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        r"""Pass the inputs (and mask) through the decoder layer.
+
+        Args:
+            tgt: the sequence to the decoder layer (required).
+            memory: the sequence from the last layer of the encoder (required).
+            tgt_mask: the mask for the tgt sequence (optional).
+            memory_mask: the mask for the memory sequence (optional).
+            tgt_key_padding_mask: the mask for the tgt keys per batch (optional).
+            memory_key_padding_mask: the mask for the memory keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+
+        tgt = self.norm1(tgt)
+        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+
 class MDSTransformer(nn.Module):
     r"""Multiple Document Scoring Transformer. By default, consists of a Roberta query enconder (Huggingface implementation),
     and a "decoder" using self-attention over a sequence (set) of document representations and cross-attention over
@@ -319,9 +655,10 @@ class MDSTransformer(nn.Module):
 
     def __init__(self, encoder_config=None, d_model: int = 768, num_heads: int = 8,
                  num_decoder_layers: int = 6, dim_feedforward: int = 2048, dropout: float = 0.1,
-                 activation: str = "relu", positional_encoding=None, doc_emb_dim: int = None,
-                 custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
-                 scoring_mode='cross_attention', loss_type='multilabelmargin') -> None:
+                 activation: str = "relu", normalization: str = "LayerNorm", positional_encoding=None,
+                 doc_emb_dim: int = None, custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
+                 scoring_mode='cross_attention', loss_module=None, selfatten_mode=0, no_decoder=False,
+                 no_dec_crossatten=False) -> None:
         super(MDSTransformer, self).__init__()
 
         if custom_encoder is not None:
@@ -343,11 +680,23 @@ class MDSTransformer(nn.Module):
                 self.d_model = d_model
 
             assert self.d_model is not None, "One of `doc_emb_dim` or `d_model` should be not None!"
-            decoder_layer = nn.TransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
-            decoder_norm = nn.LayerNorm(self.d_model)
-            self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm)
-            # Without any init call, weight parameters are initialized as by default when creating torch layers (Kaiming uniform)
-            self.decoder.apply(lambda x: (torch.nn.init.xavier_uniform_ if hasattr(x, 'dim') else lambda y: y))
+
+            self.no_decoder = no_decoder
+            if not no_decoder:
+                self.selfatten_mode = selfatten_mode  # TODO: for ablation study
+                self.no_dec_crossatten = no_dec_crossatten
+                if selfatten_mode == 2:  # transformer decoder block with the self-attention layer replaced by linear layer + non-linearity
+                    decoder_layer = LinearTransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
+                elif selfatten_mode == 3:  # transformer decoder block with the self-attention layer simply removed
+                    decoder_layer = ReducedTransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
+                elif no_dec_crossatten:
+                    decoder_layer = NoCrossTransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation, normalization)
+                else:  # usual transformer decoder block
+                    decoder_layer = nn.TransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
+                decoder_norm = nn.LayerNorm(self.d_model)
+                self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm)
+                # Without any init call, weight parameters are initialized as by default when creating torch layers (Kaiming uniform)
+                self.decoder.apply(lambda x: (torch.nn.init.xavier_uniform_ if hasattr(x, 'dim') else lambda y: y))
 
         if self.doc_emb_dim is None:
             self.doc_emb_dim = d_model
@@ -358,7 +707,7 @@ class MDSTransformer(nn.Module):
 
         self.query_dim = self.encoder.config.hidden_size  # e.g. 768 for BERT-base
 
-        # project query representation vectors to match dimensionality of doc embeddings (for cross-attention)
+        # project query representation vectors to match dimensionality of doc embeddings (for cross-attention and/or scoring)
         if self.query_dim != self.d_model:
             self.project_query = nn.Linear(self.query_dim, self.d_model)
 
@@ -368,30 +717,29 @@ class MDSTransformer(nn.Module):
             logger.warning("Using {} dim. for transformer model dimension; will project document embeddings "
                            "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
 
+        self.scoring_mode = scoring_mode
         self.score_docs = self.get_scoring_module(scoring_mode)
 
-        self.loss_func = self.get_loss_func(loss_type)
-        
-        self.scoring_mode = scoring_mode
-        self.loss_type = loss_type
+        self.loss_module = loss_module
 
     def get_scoring_module(self, scoring_mode):
 
         if scoring_mode.startswith('cross_attention'):
             return CrossAttentionScorer(self.d_model, scoring_mode)
         elif scoring_mode.startswith('dot_product'):
-            return DotProductScorer()
+            if 'gelu' in scoring_mode:
+                pre_activation_func = 'gelu'
+            else:
+                pre_activation_func = None
+            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func)
+        elif scoring_mode.startswith('cosine'):
+            if 'gelu' in scoring_mode:
+                pre_activation_func = 'gelu'
+            else:
+                pre_activation_func = None
+            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func, normalize=True)
         else:
             return Scorer(self.d_model, scoring_mode)
-
-    def get_loss_func(self, loss_type):
-
-        if loss_type == 'multilabelmargin':
-            return nn.MultiLabelMarginLoss()
-        elif loss_type == 'crossentropy':
-            return RelevanceCrossEntropyLoss()
-        else:
-            raise NotImplementedError("Loss type '{}' not implemented!".format(loss_type))
 
     def forward(self, query_token_ids: Tensor, query_mask: Tensor = None, doc_emb: Tensor = None,
                 docinds: Tensor = None, local_emb_mat: Tensor = None, doc_padding_mask: Tensor = None,
@@ -446,28 +794,30 @@ class MDSTransformer(nn.Module):
         # and 0 is used in attention, which is the opposite of HuggingFace.
         memory_key_padding_mask = ~query_mask
 
-        SELFATTENTION_OFF = False  # TODO: for ablation study
-        if SELFATTENTION_OFF:
-            doc_attention_mat_mask = ~torch.eye(doc_emb.shape[0], dtype=bool)  # (max_docs_per_query, max_docs_per_query)
-        # (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
-        output_emb = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,
-                                  tgt_key_padding_mask=~doc_padding_mask,  # again, MultiHeadAttention opposite of HF
-                                  memory_key_padding_mask=memory_key_padding_mask)
-        # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
+        if self.no_decoder:
+            output_emb = doc_emb
+        else:
+            if self.selfatten_mode == 1:  # TODO: for ablation study
+                doc_attention_mat_mask = ~torch.eye(doc_emb.shape[0], dtype=bool).to(device=doc_emb.device)  # (max_docs_per_query, max_docs_per_query)
+            # (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
+            output_emb = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,
+                                      tgt_key_padding_mask=~doc_padding_mask,  # again, MultiHeadAttention opposite of HF
+                                      memory_key_padding_mask=memory_key_padding_mask)
+            # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
 
         predictions = self.score_docs(output_emb, enc_hidden_states, memory_key_padding_mask)  # relevance scores. dimensions vary depending on scoring_mode
         
         if self.scoring_mode.endswith('softmax'):
             rel_scores = torch.exp(predictions[:, :, 0])  # (batch_size, num_docs) relevance scores
+            if labels is not None:
+                loss = self.loss_module(predictions, labels)  # loss is scalar tensor
+                return {'loss': loss, 'rel_scores': rel_scores}
+
         else:
             rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores
-        
-        if labels is not None:
-            if self.loss_type != 'crossentropy':
-                loss = self.loss_func(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
-            else:
-                loss = self.loss_func(predictions, labels)  # loss is scalar tensor
-            return {'loss': loss, 'rel_scores': rel_scores}
+            if labels is not None:
+                loss = self.loss_module(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
+                return {'loss': loss, 'rel_scores': rel_scores}
         return {'rel_scores': rel_scores}
 
     def lookup_doc_emb(self, docinds, local_emb_mat):
@@ -494,3 +844,11 @@ class MDSTransformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+
+def _get_activation_fn(activation):
+    if activation == "relu":
+        return F.relu
+    elif activation == "gelu":
+        return F.gelu
+
+    raise RuntimeError("activation should be relu/gelu, not {}".format(activation))

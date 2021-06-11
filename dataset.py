@@ -210,7 +210,7 @@ def load_querydoc_pairs(msmarco_dir, mode):
     qids, pids, labels = [], [], []
     if mode == "train":
         for line in tqdm(open(f"{msmarco_dir}/qidpidtriples.train.small.tsv"),
-                         # TODO: this file does not exist. they made it themselves
+                         # TODO: this file does not exist. RepBERT team made it
                          desc="load train triples"):
             qid, pos_pid, neg_pid = line.split("\t")
             qid, pos_pid, neg_pid = int(qid), int(pos_pid), int(neg_pid)
@@ -236,61 +236,39 @@ def load_querydoc_pairs(msmarco_dir, mode):
 
 
 def load_qrels(filepath):
-    """Load ground truth relevant passages from file. Assumes a *single* level of relevance (1), an assumption that holds
-    for MSMARCO qrels.{train,dev}.tsv
+    """Load ground truth relevant passages from file. Can handle several levels of relevance.
+    Assumes that if a passage is not listed for a query, it is non-relevant.
     :param filepath: path to file of ground truth relevant passages in the following format:
-        "qID1 \t Q0 \t pID1 \t 1\n qID1 \t Q0 \t pID2 \t 1\n ..."
+        "qID1 \t Q0 \t pID1 \t 2\n qID1 \t Q0 \t pID2 \t 0\n qID1 \t Q0 \t pID3 \t 1\n..."
     :return:
-        qrels: dict: {int qID : set of ground truth relevant int pIDs}
+        qid2relevance (dict): dictionary mapping from query_id (int) to relevant passages (dict {passageid : relevance})
     """
-    qrels = defaultdict(set)
+    qid2relevance = defaultdict(dict)
     with open(filepath, 'r') as f:
         for line in f:
-            qid, _, pid, _ = line.split()  # the _ account for uninformative placeholders in TREC format
-            qrels[int(qid)].add(int(pid))
-    return qrels
+            try:
+                qid, _, pid, relevance = line.strip().split()
+                if relevance:  # only if label is not zero
+                    qid2relevance[int(qid)][int(pid)] = float(relevance)
+            except Exception as x:
+                print(x)
+                raise IOError("'{}' is not valid format".format(line))
+    return qid2relevance
 
 
-# Not used currently, CandidatesDataset is used instead
-# def load_candidates(path_to_candidates):
+# Not used because of REALLY SLOW access by pandas multi-row indexing when the number of queries is large
+# def load_candidates_pandas(path_to_candidates):
 #     """
 #     Load candidate (retrieved) documents/passages from a file.
 #     Assumes that retrieved documents per query are given in the order of rank (most relevant first) in the first 2
 #     columns (ignores rest columns) as "qID1 \t pID1\n qID1 \t pID2\n ..."  but not necessarily contiguously (sorted by qID).
 #     :param path_to_candidates: path to file of candidate (retrieved) documents/passages per query
-#     :return:
-#         qid_to_candidate_passages: dict: {int qID : list of retrieved int pIDs in order of relevance}
+#     :return: pandas dataframe of candidate passage IDs indexed by qID. Multiple rows correspond to the same qID, each row is a pID
 #     """
+#     # internally uses C for parsing, and multiple chunks
+#     candidates_df = pd.read_csv(path_to_candidates, delimiter='\t', header=None, index_col=0, memory_map=True, dtype=np.int32)
 #
-#     qid_to_candidate_passages = defaultdict(list)  # dict: {qID : list of retrieved pIDs in order of relevance}
-#
-#     with open(path_to_candidates, 'r') as f:
-#         for line in f:
-#             try:
-#                 fields = line.strip().split('\t')
-#                 qid = int(fields[0])
-#                 pid = int(fields[1])
-#
-#                 qid_to_candidate_passages[qid].append(pid)
-#             except Exception as x:
-#                 print(x)
-#                 logger.warning("Line \"{}\" is not in valid format and resulted in: {}".format(line, fields))
-#     return qid_to_candidate_passages
-
-
-# Not used because of REALLY SLOW access by pandas multi-row indexing when the number of queries is large
-def load_candidates_pandas(path_to_candidates):
-    """
-    Load candidate (retrieved) documents/passages from a file.
-    Assumes that retrieved documents per query are given in the order of rank (most relevant first) in the first 2
-    columns (ignores rest columns) as "qID1 \t pID1\n qID1 \t pID2\n ..."  but not necessarily contiguously (sorted by qID).
-    :param path_to_candidates: path to file of candidate (retrieved) documents/passages per query
-    :return: pandas dataframe of candidate passage IDs indexed by qID. Multiple rows correspond to the same qID, each row is a pID
-    """
-    # internally uses C for parsing, and multiple chunks
-    candidates_df = pd.read_csv(path_to_candidates, delimiter='\t', header=None, index_col=0, memory_map=True, dtype=np.int32)
-
-    return candidates_df.iloc[:, 0]  # select only 1st column (pIDs), ignoring ranking and scores
+#     return candidates_df.iloc[:, 0]  # select only 1st column (pIDs), ignoring ranking and scores
 
 
 class MYMARCO_Dataset(Dataset):
@@ -308,7 +286,7 @@ class MYMARCO_Dataset(Dataset):
     def __init__(self, mode,
                  embedding_memmap_dir, queries_tokenids_path, candidates_path, qrels_path=None,
                  tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
-                 limit_size=None, emb_collection=None, load_collection_to_memory=False):
+                 limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
@@ -329,8 +307,16 @@ class MYMARCO_Dataset(Dataset):
             Needs ~26GB for MSMARCO (~50GB project total), but is faster.
         :param emb_collection: (optional) already initialized EmbeddedCollection object. Will be used instead of
             reading matrix from `embedding_memmap_dir`
+        :param inject_ground_truth: if True, during evaluation the ground truth relevant documents will be always included in the
+            candidate documents, even if they weren't part of the original candidates. (Helps isolate effect of first-stage recall)
         """
         self.mode = mode  # "train", "dev", "eval"
+        self.inject_ground_truth = inject_ground_truth  # if True, during evaluation the ground truth relevant documents will be always part of the candidate documents
+        if self.inject_ground_truth:
+            if self.mode == 'dev':
+                logger.warning("Will include ground truth document(s) in candidates for each query during evaluation!")
+            elif self.mode == 'eval':
+                raise ValueError("It is not possible to use args.inject_ground_truth in 'eval' mode")
         if emb_collection is not None:
             self.emb_collection = emb_collection
         else:
@@ -358,7 +344,7 @@ class MYMARCO_Dataset(Dataset):
             if os.path.isdir(qrels_path):
                 qrels_path = os.path.join(qrels_path, "qrels.{}.tsv".format(mode))
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
-            self.qrels = load_qrels(qrels_path)  # dict: {qID : set of ground truth relevant pIDs}
+            self.qrels = load_qrels(qrels_path)  # dict{qID: dict{pID: relevance}}
         else:
             self.qrels = None
 
@@ -418,8 +404,8 @@ class MYMARCO_Dataset(Dataset):
             rel_docs = None
         else:
             tic = time.perf_counter()
-            rel_docs = self.qrels[qid]
-            if self.mode == "train":
+            rel_docs = self.qrels[qid].keys()
+            if self.mode == "train" or self.inject_ground_truth:
                 # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
                 # while ensuring that they are only included once
                 num_candidates = len(doc_ids)
@@ -436,7 +422,7 @@ class MYMARCO_Dataset(Dataset):
 
     def sample_candidates(self, candidates):
         """
-        Sample `self.num_candidates` from all retrieved candiadate document IDs corersponding to a query,
+        Sample `self.num_candidates` from all retrieved candidate document IDs corersponding to a query,
         according to method `self.candidate_sampling`
         :param candidates: iterable of candidate document/passage IDs (corresponding to a query) in order of relevance
         :return: list of len(self.num_candidates) subset of `candidates`
@@ -457,12 +443,14 @@ class MYMARCO_Dataset(Dataset):
         """
         if self.mode != 'train':
             num_inbatch_neg = 0
+
         return partial(collate_function, mode=self.mode, pad_token_id=self.pad_id, num_inbatch_neg=num_inbatch_neg,
-                       max_candidates=max_candidates, n_gpu=n_gpu)
+                       max_candidates=max_candidates, n_gpu=n_gpu, inject_ground_truth=self.inject_ground_truth)
 
 
 # TODO: can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
-def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=MAX_DOCS, n_gpu=1):
+def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=MAX_DOCS, n_gpu=1,
+                     inject_ground_truth=False):
     """
     :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, rel_docs)
     :param mode: 'train', 'dev', or 'eval'
@@ -547,14 +535,26 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
-    if mode != "eval":
-        # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
-        # It is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
-        # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
-        # that 1 or more positives (rel. docs) will be at the beginning of the list (and only there)
-        labels = [list(range(len(rd))) for rd in rel_docs]
+    if mode != 'eval':
+        if mode == "train" or inject_ground_truth:
+            # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
+            # In this case, it is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
+            # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
+            # that 1 or more positives (rel. docs) will be at the beginning of the list (and only there)
+            labels = [list(range(len(rd))) for rd in rel_docs]
+        else:  # this is when 'dev', but not inject_ground_truth
+            labels = []
+            for i in range(batch_size):
+                query_labels = []
+                for ind in range(len(doc_ids[i])):
+                    if doc_ids[i][ind] in rel_docs[i]:
+                        query_labels.append(ind)
+                labels.append(query_labels)
+
         # must be padded with -1 to have same dimensions as the transformer decoder output: (batch_size, max_docs_per_query)
         data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)  # no more than a couple of rel. documents per query exist, so even int8 could be used
+
+
 
     global collation_times
     collation_times.update(time.perf_counter() - start_collation_time)
@@ -585,29 +585,29 @@ def prepare_docinds_and_mask(doc_ids, docID_to_localind, padding_idx, length=Non
 
 
 # Not used! We use nn.Embedding instead! ~10 times faster!
-def assemble_3D_tensors(doc_ids, local_emb_mat, docID_to_localind):
-    """Pack 3D tensors for doc embeddings and corresponding padding mask
-    :param doc_ids: (batch_size) list of candidate (retrieved) document IDs (int list) corresponding to a query in `qids`
-        Includes the docIDs of randomly sampled in-batch negatives
-    :param local_emb_mat: (num_unique_docIDs, emb_dim) tensor of local doc embedding matrix containing emb. vectors
-            of all unique documents in the batch
-    :param docID_to_localind: OrderedDict mapping unique docIDs to rows of `local_emb_mat`
-    :return:
-        doc_emb_tensor: (max_docs_per_query, batch_size, emb_dim) document embeddings tensor, input to "decoder"
-        doc_emb_mask: (batch_size, max_docs_per_query) boolean tensor indicating padding (0) or valid (1) elements
-    """
-
-    batch_size = len(doc_ids)
-    max_docs_per_query = max(len(cands) for cands in doc_ids)  # length used for padding
-
-    doc_emb_tensor = torch.zeros(max_docs_per_query, batch_size, local_emb_mat.shape[1])  # (padded_length, batch_size, emb_dim)
-    doc_emb_mask = torch.zeros((batch_size, max_docs_per_query), dtype=torch.bool)  # (batch_size, padded_length)
-    for i in range(batch_size):
-        num_docs = len(doc_ids[i])
-        doc_emb_mask[i, :num_docs] = 1
-        for j in range(num_docs):
-            doc_emb_tensor[j, i, :] = local_emb_mat[docID_to_localind[j], :]
-    return doc_emb_tensor, doc_emb_mask
+# def assemble_3D_tensors(doc_ids, local_emb_mat, docID_to_localind):
+#     """Pack 3D tensors for doc embeddings and corresponding padding mask
+#     :param doc_ids: (batch_size) list of candidate (retrieved) document IDs (int list) corresponding to a query in `qids`
+#         Includes the docIDs of randomly sampled in-batch negatives
+#     :param local_emb_mat: (num_unique_docIDs, emb_dim) tensor of local doc embedding matrix containing emb. vectors
+#             of all unique documents in the batch
+#     :param docID_to_localind: OrderedDict mapping unique docIDs to rows of `local_emb_mat`
+#     :return:
+#         doc_emb_tensor: (max_docs_per_query, batch_size, emb_dim) document embeddings tensor, input to "decoder"
+#         doc_emb_mask: (batch_size, max_docs_per_query) boolean tensor indicating padding (0) or valid (1) elements
+#     """
+#
+#     batch_size = len(doc_ids)
+#     max_docs_per_query = max(len(cands) for cands in doc_ids)  # length used for padding
+#
+#     doc_emb_tensor = torch.zeros(max_docs_per_query, batch_size, local_emb_mat.shape[1])  # (padded_length, batch_size, emb_dim)
+#     doc_emb_mask = torch.zeros((batch_size, max_docs_per_query), dtype=torch.bool)  # (batch_size, padded_length)
+#     for i in range(batch_size):
+#         num_docs = len(doc_ids[i])
+#         doc_emb_mask[i, :num_docs] = 1
+#         for j in range(num_docs):
+#             doc_emb_tensor[j, i, :] = local_emb_mat[docID_to_localind[j], :]
+#     return doc_emb_tensor, doc_emb_mask
 
 
 # TODO: only used by RepBERT! (consider removing)
@@ -666,8 +666,7 @@ class MSMARCODataset(Dataset):
                 "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
                 "position_ids": pack_tensor_2D(position_ids_lst, default=0, dtype=torch.int64),
             }
-            qid_lst = [x['qid'] for x in
-                       batch]  # TODO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
+            qid_lst = [x['qid'] for x in batch]  # TODO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
             docid_lst = [x['docid'] for x in batch]
             if self.mode == "train":
                 # labels holds the in-batch indices of the relevant doc IDs for each query

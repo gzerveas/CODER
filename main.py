@@ -23,7 +23,7 @@ from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel,
 
 # Package modules
 from options import *
-from modeling import RepBERT_Train, MDSTransformer
+from modeling import RepBERT_Train, MDSTransformer, get_loss_module
 from dataset import MYMARCO_Dataset, MSMARCODataset
 from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiScheduler
 import utils
@@ -42,7 +42,7 @@ def train(args, model, val_dataloader, tokenizer=None):
     logger.info("Preparing {} dataset ...".format('train'))
     start_time = time.time()
     train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_path, args.train_candidates_path,
-                                    qrels_path=args.msmarco_dir, tokenizer=tokenizer,
+                                    qrels_path=args.qrels_path, tokenizer=tokenizer,
                                     max_query_length=args.max_query_length, num_candidates=args.num_candidates,
                                     limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
@@ -73,8 +73,8 @@ def train(args, model, val_dataloader, tokenizer=None):
 
     # Prepare optimizer and schedule
     nonencoder_optimizer, encoder_optimizer = get_optimizers(args, model)
-    logger.debug("args.learning_rate: ", args.learning_rate)
-    logger.debug('nonencoder_optimizer.defaults["lr"]: ', nonencoder_optimizer.defaults["lr"])
+    logger.debug("args.learning_rate: {}".format(args.learning_rate))
+    logger.debug('nonencoder_optimizer.defaults["lr"]: {}'.format(nonencoder_optimizer.defaults["lr"]))
     optimizer = MultiOptimizer(nonencoder_optimizer)
     if args.encoder_delay <= start_step:
         optimizer.add_optimizer(encoder_optimizer)
@@ -84,11 +84,11 @@ def train(args, model, val_dataloader, tokenizer=None):
         # utils.move_to_device(nonencoder_optimizer, args.device)
         # utils.move_to_device(encoder_optimizer, args.device)
         logger.info('Loaded optimizer(s) state')
-        logger.debug('optimizer.defaults["lr"]: ', optimizer.optimizers[0].defaults["lr"])
+        logger.debug('optimizer.defaults["lr"]: {}'.format(optimizer.optimizers[0].defaults["lr"]))
 
     schedulers = get_schedulers(args, total_training_steps, nonencoder_optimizer, encoder_optimizer)
 
-    logger.debug("schedulers['nonencoder_scheduler'].get_last_lr(): ", schedulers['nonencoder_scheduler'].get_last_lr())
+    logger.debug("schedulers['nonencoder_scheduler'].get_last_lr(): {}".format(schedulers['nonencoder_scheduler'].get_last_lr()))
     scheduler = MultiScheduler(schedulers['nonencoder_scheduler'])
     if args.reduce_on_plateau:
         ROP_scheduler = MultiScheduler(schedulers['ROP_nonencoder_scheduler'])
@@ -100,7 +100,7 @@ def train(args, model, val_dataloader, tokenizer=None):
         scheduler.load_state_dict(sched_state)
         logger.info('Loaded scheduler(s) state')
     scheduler.step()  # this is done to correctly initialize learning rate (otherwise optimizer.defaults["lr"] is the first value when using get_constant_schedule_with_warmup)
-    logger.debug("schedulers['nonencoder_scheduler'].get_last_lr(): ", scheduler.schedulers[0].get_last_lr())
+    logger.debug("schedulers['nonencoder_scheduler'].get_last_lr(): {}".format(scheduler.schedulers[0].get_last_lr()))
 
     global_step = start_step  # counts how many times the weights have been updated, i.e. num. batches // gradient acc. steps
     start_epoch = global_step // epoch_steps
@@ -134,6 +134,8 @@ def train(args, model, val_dataloader, tokenizer=None):
     logging_loss = 0  # this is synchronized with `train_loss` every args.logging_steps
     model.zero_grad()
     model.train()
+    # TODO: DEBUG
+    score_params = [(name, p) for name, p in model.named_parameters() if name.startswith('score')]
     epoch_iterator = trange(start_epoch, int(args.num_epochs), desc="Epochs")
 
     batch_times = utils.Timer()  # average time for the model to train (forward + backward pass) on a single batch of queries
@@ -194,6 +196,8 @@ def train(args, model, val_dataloader, tokenizer=None):
                         logger.debug("Average sample fetching time: {} s /samp".format(sample_fetching_times.get_average()))
                         logger.debug("Average collation time: {} s /batch".format(collation_times.get_average()))
                         logger.debug("Average total batch processing time: {} s /batch".format(batch_times.get_average()))
+
+                        logger.debug("Score parameters: {}".format(score_params))  # TODO: DEBUG
 
                     logging_loss = train_loss
 
@@ -301,11 +305,11 @@ def evaluate(args, model, dataloader):
         eval_metrics: dict containing metrics (at least 1, batch processing time)
         rank_df: dataframe with indexed by qID (shared by multiple rows) and columns: PID, rank, score
     """
-    qrels = dataloader.dataset.qrels
+    qrels = dataloader.dataset.qrels  # dict{qID: dict{pID: relevance}}
     labels_exist = qrels is not None
 
     # num_docs is the (potentially variable) number of candidates per query
-    relevances = []  # (total_num_queries) list of (num_docs) lists with 1 at the indices corresponding to actually relevant passages
+    relevances = []  # (total_num_queries) list of (num_docs) lists with non-zeros at the indices corresponding to actually relevant passages
     num_relevant = []  # (total_num_queries) list of number of ground truth relevant documents per query
     df_chunks = []  # (total_num_queries) list of dataframes, each with index a single qID and corresponding (num_docs) columns PID, rank, score
     query_time = 0  # average time for the model to score candidates for a single query
@@ -406,17 +410,17 @@ def rank_docs(docids, scores, shuffle=True):
 
 
 def get_relevances(gt_relevant, candidates, max_docs=None):
-    """Assumes a *single* level of relevance (1), an assumption that holds for MSMARCO qrels.{train, dev}.tsv
-    Args: # TODO: can be easily extended to account for multiple levels of relevance in ground truth labels
-        gt_relevant: set of ground-truth relevant passage IDs corresponding to a single query
+    """Can handle multiple levels of relevance.
+    Args:
+        gt_relevant: for a given query, it's a dict mapping from ground-truth relevant passage ID to level of relevance
         candidates: list of candidate pids
         max_docs: consider only the first this many documents
-    Returns: list of length min(max_docs, len(pred)) with 1 at the indices corresponding to passages in `gt_relevant`
-        e.g. [0 1 1 0 0 1 0]
+    Returns: list of length min(max_docs, len(pred)) with non-zero at the indices corresponding to passages in `gt_relevant`
+        e.g. [0 2 1 0 0 1 0]
     """
     if max_docs is None:
         max_docs = len(candidates)
-    return [1 if pid in gt_relevant else 0 for pid in candidates[:max_docs]]
+    return [gt_relevant[pid] if pid in gt_relevant else 0 for pid in candidates[:max_docs]]
 
 
 def calculate_metrics(relevances, num_relevant, k):
@@ -631,10 +635,11 @@ def get_dataset(args, eval_mode, tokenizer):
                               args.max_query_length, args.max_doc_length, limit_size=args.eval_limit_size)
     else:
         return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_path, args.eval_candidates_path,
-                               qrels_path=args.msmarco_dir, tokenizer=tokenizer,
+                               qrels_path=args.qrels_path, tokenizer=tokenizer,
                                max_query_length=args.max_query_length, num_candidates=None,
                                limit_size=args.eval_limit_size,
-                               load_collection_to_memory=args.load_collection_to_memory)
+                               load_collection_to_memory=args.load_collection_to_memory,
+                               inject_ground_truth=args.inject_ground_truth)
 
 
 def get_query_encoder(args):
@@ -653,6 +658,8 @@ def get_model(args, doc_emb_dim=None):
 
     if args.model_type == 'mdstransformer':
 
+        loss_module = get_loss_module(args)
+
         return MDSTransformer(custom_encoder=query_encoder,
                               d_model=args.d_model,
                               num_heads=args.num_heads,
@@ -660,9 +667,13 @@ def get_model(args, doc_emb_dim=None):
                               dim_feedforward=args.dim_feedforward,
                               dropout=args.dropout,
                               activation=args.activation,
+                              normalization=args.normalization_layer,
                               doc_emb_dim=doc_emb_dim,
                               scoring_mode=args.scoring_mode,
-                              loss_type=args.loss_type)
+                              loss_module=loss_module,
+                              selfatten_mode=args.selfatten_mode,
+                              no_decoder=args.no_decoder,
+                              no_dec_crossatten=args.no_dec_crossatten)
     else:
         raise NotImplementedError('Unknown model type')
 
