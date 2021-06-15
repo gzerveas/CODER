@@ -797,7 +797,7 @@ class MDSTransformer(nn.Module):
         if self.no_decoder:
             output_emb = doc_emb
         else:
-            if self.selfatten_mode == 1:  # TODO: for ablation study
+            if self.selfatten_mode == 1:  # TODO: for ablation study. Turn off SA by using diagonal SA matrix (no interactions between documents)
                 doc_attention_mat_mask = ~torch.eye(doc_emb.shape[0], dtype=bool).to(device=doc_emb.device)  # (max_docs_per_query, max_docs_per_query)
             # (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
             output_emb = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,

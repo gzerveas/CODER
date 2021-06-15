@@ -176,7 +176,7 @@ def run_parse_args():
                         help='What kind of positional encoding to use for the transformer decoder input sequence') # TODO: not implemented
     parser.add_argument('--activation', choices={'relu', 'gelu'}, default='gelu',
                         help='Activation to be used in transformer decoder')
-    parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm', 'None'}, default='BatchNorm',
+    parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm', 'None'}, default='LayerNorm',
                         help='Normalization layer to be used internally in the transformer decoder')
     parser.add_argument('--scoring_mode',
                         choices={'raw', 'sigmoid', 'tanh', 'softmax',
