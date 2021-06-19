@@ -290,11 +290,12 @@ class MultiTierLoss(nn.Module):
     """
     Multiple tiers of relevance for negative documents.
     """
-
-    def __init__(self, num_tiers=3, tier_size=50, diff_function='maxmargin', gt_function=None, gt_factor=2, reduction='mean'):
+    def __init__(self, num_tiers=3, tier_size=50, tier_distance=None, diff_function='maxmargin', gt_function=None, gt_factor=2, reduction='mean'):
         """
         :param num_tiers: total number of tiers (ground truth documents are not considered a separate tier)
         :param tier_size: number of documents in each tier
+        :param tier_distance: number of documents acting as a buffer between each tier.
+            If None, the distance will be automatically calculated so as to place the tier centers as widely apart as possible.
         :param diff_function: function to be applied to score differences between documents belonging to different tiers
         :param gt_function: special loss function to be applied for calculating the extra contribution of the ground truth
                             relevant documents. If None, no special treatment will be given to ground truth relevant
@@ -307,6 +308,7 @@ class MultiTierLoss(nn.Module):
 
         self.num_tiers = num_tiers
         self.tier_size = tier_size
+        self.tier_distance = tier_distance
 
         if diff_function == 'exp':
             self.diff_function = lambda x: torch.exp(-x)
@@ -325,21 +327,6 @@ class MultiTierLoss(nn.Module):
 
         self.reduction = reduction
 
-    # def compute_diffs_slow(self, scores, inds1, inds2):
-    #     """
-    #     complexity of O(inds1), but calculates the loss contributions for num_queries*inds1*inds2 elements
-    #     :param scores: (batch_size, num_docs) relevance scores for each candidate document and query
-    #     :param inds1: (num_tier1docs,) indices (locations) of documents within first tier. Same across batch (i.e. for all queries)! Can be a list or range.
-    #     :param inds2: (num_tier2docs,) indices (locations) of documents within second tier. Same across batch (i.e. for all queries)! Can be a list or range.
-    #     :return query_losses: (batch_size,) loss for each query corresponding
-    #         to the score differences between documents with inds1 and documents with inds2
-    #     """
-
-    #     query_losses = torch.zeros(scores.shape[0], dtype=torch.float32, device=scores.device)
-    #     for i in inds1:
-    #         query_losses += torch.sum(self.diff_function(scores[:, i].unsqueeze(dim=-1) - scores[:, inds2]), dim=1)
-    #     return query_losses / (len(inds1) + len(inds2))  # normalize by the number of terms
-
     def compute_diffs(self, scores, inds1, inds2):
         """
         :param scores: (batch_size, num_docs) relevance scores for each candidate document and query
@@ -349,9 +336,10 @@ class MultiTierLoss(nn.Module):
             to the score differences between documents with inds1 and documents with inds2
         """
 
+        # normalize by the number of terms: num_pos + num_neg to be consistent with MultiLabelMargin, or num_pos*num_neg to properly neutralize the effect of the tier size
         query_losses = torch.sum(
             self.diff_function(scores[:, inds1].unsqueeze(dim=2) - scores[:, inds2].unsqueeze(dim=1)), dim=(1, 2)) / (
-                                   len(inds1) + len(inds2))
+                                   len(inds1) * len(inds2))
 
         return query_losses
 
@@ -378,7 +366,24 @@ class MultiTierLoss(nn.Module):
             scores[i, range(num_relevant[i])].unsqueeze(dim=-1) - scores[i, range(num_relevant[i], scores.shape[1])]))
                                      for i in range(scores.shape[0])]).to(device=scores.device)
 
+        # normalize by the number of terms: num_pos + num_neg to be consistent with MultiLabelMargin, or num_pos*num_neg to properly neutralize the effect of the tier size
         return query_losses / scores.shape[1]
+
+    def get_tier_inds(self, num_negatives):
+
+        if self.tier_distance is None:
+            # places tier centers in maximal distance from one another
+            mids_distance = math.ceil((num_negatives - 2 * self.tier_size) / (self.num_tiers - 1))
+            start_inds = [0] + [int(self.tier_size / 2) + i * mids_distance for i in range(1, self.num_tiers-1)] + [num_negatives - self.tier_size]
+        else:  # starting from the most relevant candidates, makes tiers using the pre-specified distance to separate them
+            start_inds = []  # for-loop to make it fool-proof (safely allow larger number of tiers than would be legal)
+            for i in range(0, self.num_tiers):
+                new_ind = i*(self.tier_distance + self.tier_size)
+                if new_ind >= num_negatives:
+                    break
+                else:
+                    start_inds.append(new_ind)
+        return start_inds
 
     def forward(self, scores, labels):
         """
@@ -395,9 +400,7 @@ class MultiTierLoss(nn.Module):
         # num_relevant = is_relevant.sum(dim=1)  # total number of relevant documents in the batch
         # num_negatives = scores.shape[1] - num_relevant
         num_negatives = scores.shape[1]  # this is approximately correct; we hereby include the g.t. relevant in tier 1
-        mids_distance = math.ceil((num_negatives - 2 * self.tier_size) / (self.num_tiers - 1))
-        start_inds = [0] + [int(self.tier_size / 2) + i * mids_distance for i in range(self.num_tiers - 2)] + [
-            scores.shape[1] - self.tier_size]
+        start_inds = self.get_tier_inds(num_negatives)
 
         # Treating as "positives" the documents within each tier, the loss compares
         # their scores to the scores of documents in all lower tiers (and the ones in-between lower tiers)
@@ -430,7 +433,8 @@ def get_loss_module(args):
     elif args.loss_type == 'crossentropy':
         return RelevanceCrossEntropyLoss()
     elif args.loss_type == 'multitier':
-        return MultiTierLoss(num_tiers=args.num_tiers, tier_size=args.tier_size, diff_function=args.diff_function,
+        return MultiTierLoss(num_tiers=args.num_tiers, tier_size=args.tier_size, tier_distance=args.tier_distance,
+                             diff_function=args.diff_function,
                              gt_function=args.gt_function,
                              gt_factor=args.gt_factor)
     else:

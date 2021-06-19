@@ -190,6 +190,10 @@ def run_parse_args():
                         help="Number of relevance tiers for `loss_type` 'multitier'")
     parser.add_argument('--tier_size', type=int, default=50,
                         help="Number of candidates within each tier of relevance for `loss_type` 'multitier'")
+    parser.add_argument('--tier_distance', type=int, default=None,
+                        help="Number of candidates separating (as a buffer) tiers of relevance for `loss_type` 'multitier'. "
+                             "If None, the distance will be automatically calculated so as to place the tier centers "
+                             "as widely apart as possible.")
     parser.add_argument('--diff_function', choices={'exp', 'maxmargin'}, default='maxmargin',
                         help="Function to be applied to score differences between documents belonging to different tiers, "
                              "when `loss_type` is 'multitier'.")
