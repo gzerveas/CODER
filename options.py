@@ -216,6 +216,17 @@ def run_parse_args():
     parser.add_argument('--no_decoder', action='store_true',
                         help="If used, no transformer decoder will be used to transform document embeddings")
 
+    ##Fairness
+    parser.add_argument("--collection_neutrality_path", type=str,
+                        help="path to the file containing neutrality values of documents in tsv format (docid [tab] score)")
+    parser.add_argument("--background_set_runfile_path", type=str, 
+                        default="fair_retrieval/resources/msmarco_fair.background_run.txt",
+                        help="path to the TREC run file containing the documents of the background set")
+    parser.add_argument('--bias_regul_coeff', type=float, default=0.0,
+                        help='Coefficient of the bias term added to loss')
+    parser.add_argument('--bias_regul_cutoff', type=int, default=100,
+                        help='Bias term is calculated according to the top-X predicted results')
+
     args = parser.parse_args()
 
     if (args.task is None) and (args.config_filepath is None):

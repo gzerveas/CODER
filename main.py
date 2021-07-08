@@ -29,11 +29,12 @@ from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiSche
 import utils
 import metrics
 from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
+from fair_retrieval.metrics_FaiRR import FaiRRMetric, FaiRRMetricHelper
 
 val_times = utils.Timer()  # stores measured validation times
 
 
-def train(args, model, val_dataloader, tokenizer=None):
+def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
     """Prepare training dataset, train the model and handle results"""
 
     tb_writer = SummaryWriter(args.tensorboard_dir)
@@ -46,7 +47,8 @@ def train(args, model, val_dataloader, tokenizer=None):
                                     max_query_length=args.max_query_length, num_candidates=args.num_candidates,
                                     limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
-                                    emb_collection=val_dataloader.dataset.emb_collection)
+                                    emb_collection=val_dataloader.dataset.emb_collection,
+                                    collection_neutrality_path=args.collection_neutrality_path)
     collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg, n_gpu=args.n_gpu)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
@@ -206,7 +208,8 @@ def train(args, model, val_dataloader, tokenizer=None):
 
                     logger.info("\n\n***** Running evaluation of step {} on dev set *****".format(global_step))
                     val_metrics, best_metrics, best_value = validate(args, model, val_dataloader, tb_writer,
-                                                                     best_metrics, best_value, global_step)
+                                                                     best_metrics, best_value, global_step,
+                                                                     fairrmetric=fairrmetric)
                     metrics_names, metrics_values = zip(*val_metrics.items())
                     running_metrics.append(list(metrics_values))
 
@@ -249,12 +252,12 @@ def train(args, model, val_dataloader, tokenizer=None):
     return best_metrics
 
 
-def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best_value, global_step):
+def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best_value, global_step, fairrmetric=None):
     """Run an evaluation on the validation set while logging metrics, and handle result"""
 
     model.eval()
     eval_start_time = time.time()
-    val_metrics, ranked_df = evaluate(args, model, val_dataloader)
+    val_metrics, ranked_df = evaluate(args, model, val_dataloader, fairrmetric=fairrmetric)
     eval_runtime = time.time() - eval_start_time
     model.train()
     logger.info("Validation runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(eval_runtime)))
@@ -296,7 +299,7 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best
     return val_metrics, best_metrics, best_value
 
 
-def evaluate(args, model, dataloader):
+def evaluate(args, model, dataloader, fairrmetric=None):
     """
     Evaluate a given model on the dataset contained in the given dataloader and compile a dataframe with
     document ranks and scores for each query. If the dataset includes relevance labels (qrels), then metrics
@@ -377,6 +380,23 @@ def evaluate(args, model, dataloader):
         eval_metrics = OrderedDict()
     eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
     ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
+
+    ## evaluate fairness
+    if fairrmetric is not None:
+        try:
+            _retrievalresults = {}
+            for _item in df_chunks:
+                _qid = _item.index[0]
+                _retrievalresults[_qid] = _item['PID'].tolist()
+
+            eval_FaiRR, eval_NFaiRR = fairrmetric.calc_FaiRR_retrievalresults(retrievalresults=_retrievalresults)
+
+            #for _cutoff in eval_FaiRR:
+            #    eval_metrics['FaiRR_cutoff_%d' % _cutoff] = eval_FaiRR[_cutoff]
+            for _cutoff in eval_FaiRR:
+                eval_metrics['NFaiRR_cutoff_%d' % _cutoff] = eval_NFaiRR[_cutoff]    
+        except:
+            logger.error('Fairness metrics calculation failed!')
 
     if labels_exist and (args.debug or args.task != 'train'):
         try:
@@ -529,6 +549,15 @@ def main(config):
     logger.info("Number of {} samples: {}".format(eval_mode, len(eval_dataset)))
     logger.info("Batch size: %d", args.eval_batch_size)
 
+    
+    # initialize fairness 
+    fairrmetric = None 
+    if args.collection_neutrality_path is not None:
+        logger.info("Loading FaiRRMetric ...")
+        _fairrmetrichelper = FaiRRMetricHelper()
+        _background_doc_set = _fairrmetrichelper.read_documentset_from_retrievalresults(args.background_set_runfile_path)
+        fairrmetric = FaiRRMetric(args.collection_neutrality_path, _background_doc_set)
+
     # Initialize model. This is done after loading the data, to know the doc. embeddings dimension
     logger.info("Initializing model ...")
     if args.model_type == 'repbert':
@@ -549,7 +578,7 @@ def main(config):
     model.to(args.device)
 
     if args.task == "train":
-        return train(args, model, eval_dataloader, tokenizer)
+        return train(args, model, eval_dataloader, tokenizer, fairrmetric=fairrmetric)
     else:
         # Just evaluate trained model on some dataset (needs ~27GB for MS MARCO dev set)
 
@@ -565,7 +594,7 @@ def main(config):
 
         model.eval()
         eval_start_time = time.time()
-        eval_metrics, ranked_df = evaluate(args, model, eval_dataloader)
+        eval_metrics, ranked_df = evaluate(args, model, eval_dataloader, fairrmetric=fairrmetric)
         eval_runtime = time.time() - eval_start_time
         logger.info("Evaluation runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(eval_runtime)))
         print()
@@ -673,7 +702,9 @@ def get_model(args, doc_emb_dim=None):
                               loss_module=loss_module,
                               selfatten_mode=args.selfatten_mode,
                               no_decoder=args.no_decoder,
-                              no_dec_crossatten=args.no_dec_crossatten)
+                              no_dec_crossatten=args.no_dec_crossatten,
+                              bias_regul_coeff=args.bias_regul_coeff,
+                              bias_regul_cutoff=args.bias_regul_cutoff)
     else:
         raise NotImplementedError('Unknown model type')
 
