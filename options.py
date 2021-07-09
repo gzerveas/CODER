@@ -184,8 +184,8 @@ def run_parse_args():
                                  'dot_product', 'dot_product_gelu', 'dot_product_softmax',
                                  'cosine', 'cosine_gelu', 'cosine_softmax'},
                         default='raw', help='Scoring function to map the final embeddings to scores')
-    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'multitier'}, default='multilabelmargin',
-                        help='Loss applied to document scores')
+    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier'},
+                        default='multilabelmargin', help='Loss applied to document scores')
     parser.add_argument('--num_tiers', type=int, default=4,
                         help="Number of relevance tiers for `loss_type` 'multitier'")
     parser.add_argument('--tier_size', type=int, default=50,
@@ -215,6 +215,8 @@ def run_parse_args():
                              "query term embeddings in the output of the query encoder")
     parser.add_argument('--no_decoder', action='store_true',
                         help="If used, no transformer decoder will be used to transform document embeddings")
+    parser.add_argument('--transform_doc_emb', action='store_true',
+                        help="Performs a linear transformation to document embeddings")
 
     ##Fairness
     parser.add_argument("--collection_neutrality_path", type=str,

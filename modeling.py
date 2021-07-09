@@ -288,6 +288,37 @@ class RelevanceCrossEntropyLoss(nn.Module):
         return loss
 
 
+class RelevanceListnetLoss(nn.Module):
+    """
+    ListNet loss
+    """
+    def __init__(self):
+        super(RelevanceListnetLoss, self).__init__()
+
+    def forward(self, predictions, labels):
+        """
+        :param predictions: (batch_size, num_docs, 2) relevance class log-probabilities for each candidate document and query.
+            Dimension [:, :, 0] corresponds to the log-prob. for the "relevant" class and [:, :, 1] to the "non-relevant" class.
+        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+                indicating non-relevance.
+        :return: loss: scalar tensor. Mean loss per document
+        """
+        
+        _labels_values = labels.new_zeros(labels.shape, dtype=torch.float32)
+        _labels_values[labels!=-1] = 1
+        #_labels_mask = labels.new_zeros(labels.shape, dtype=torch.float32)
+        _labels_values[labels==-1] = float("-Inf")
+        
+        labels_probs = torch.nn.Softmax(dim=1)(_labels_values)
+        predictions_logprobs = torch.nn.LogSoftmax(dim=1)(predictions)
+
+        loss = torch.nn.KLDivLoss(reduction='batchmean')(predictions_logprobs, labels_probs)
+        
+        return loss
+
+
 class MultiTierLoss(nn.Module):
     """
     Multiple tiers of relevance for negative documents.
@@ -434,6 +465,8 @@ def get_loss_module(args):
         return nn.MultiLabelMarginLoss()
     elif args.loss_type == 'crossentropy':
         return RelevanceCrossEntropyLoss()
+    elif args.loss_type == 'listnet':
+        return RelevanceListnetLoss()
     elif args.loss_type == 'multitier':
         return MultiTierLoss(num_tiers=args.num_tiers, tier_size=args.tier_size, tier_distance=args.tier_distance,
                              diff_function=args.diff_function,
@@ -664,7 +697,7 @@ class MDSTransformer(nn.Module):
                  activation: str = "relu", normalization: str = "LayerNorm", positional_encoding=None,
                  doc_emb_dim: int = None, custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
                  scoring_mode='cross_attention', loss_module=None, selfatten_mode=0, no_decoder=False,
-                 no_dec_crossatten=False, bias_regul_coeff = 0.0, bias_regul_cutoff = 100) -> None:
+                 no_dec_crossatten=False, transform_doc_emb=False, bias_regul_coeff = 0.0, bias_regul_cutoff = 100) -> None:
         super(MDSTransformer, self).__init__()
 
         if custom_encoder is not None:
@@ -718,7 +751,8 @@ class MDSTransformer(nn.Module):
             self.project_query = nn.Linear(self.query_dim, self.d_model)
 
         # project document representation vectors to match dimensionality of d_model
-        if self.doc_emb_dim != self.d_model:
+        self.project_documents = None
+        if (self.doc_emb_dim != self.d_model) or (transform_doc_emb):
             self.project_documents = nn.Linear(self.doc_emb_dim, self.d_model)
             logger.warning("Using {} dim. for transformer model dimension; will project document embeddings "
                            "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
@@ -783,8 +817,7 @@ class MDSTransformer(nn.Module):
         if doc_emb is None:  # happens only in training, when additionally there is in-batch negative sampling
             doc_emb = self.lookup_doc_emb(docinds, local_emb_mat)  # (batch_size, max_docs_per_query, doc_emb_dim)
             
-        if self.doc_emb_dim != self.d_model:
-            # project document representation vectors to match dimensionality of d_model
+        if self.project_documents is not None:
             doc_emb = self.project_documents(doc_emb)
         # permute because pytorch convention for transformers is [seq_length, batch_size, feat_dim]
         doc_emb = doc_emb.permute(1, 0, 2)  # (max_docs_per_query, batch_size, doc_emb_dim) document embeddings

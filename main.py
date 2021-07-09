@@ -703,6 +703,7 @@ def get_model(args, doc_emb_dim=None):
                               selfatten_mode=args.selfatten_mode,
                               no_decoder=args.no_decoder,
                               no_dec_crossatten=args.no_dec_crossatten,
+                              transform_doc_emb=args.transform_doc_emb,
                               bias_regul_coeff=args.bias_regul_coeff,
                               bias_regul_cutoff=args.bias_regul_cutoff)
     else:
