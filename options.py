@@ -3,11 +3,11 @@ import logging
 logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
 
+
 NEG_METRICS = ['loss']  # metrics which are better when smaller
 POS_METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']  # metrics which are better when higher
 POS_METRICS.extend(m + '@' for m in POS_METRICS[:])
 METRICS = NEG_METRICS + POS_METRICS
-
 
 def run_parse_args():
     parser = argparse.ArgumentParser(description='Run a complete training or evaluation. Optionally, a JSON configuration '
@@ -64,6 +64,7 @@ def run_parse_args():
     parser.add_argument("--tokenizer_from", type=str, default=None,
                         help="""Path to a directory containing a saved custom tokenizer (vocabulary and added tokens).
                         It is optional and used together with `query_encoder_type`.""")
+    
 
     ## Dataset
     parser.add_argument('--train_limit_size', type=float, default=None,
@@ -215,8 +216,6 @@ def run_parse_args():
                              "query term embeddings in the output of the query encoder")
     parser.add_argument('--no_decoder', action='store_true',
                         help="If used, no transformer decoder will be used to transform document embeddings")
-    parser.add_argument('--transform_doc_emb', action='store_true',
-                        help="Performs a linear transformation to document embeddings")
 
     ##Fairness
     parser.add_argument("--collection_neutrality_path", type=str,
