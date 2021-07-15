@@ -33,7 +33,7 @@ params_init = {'task': 'train',
                'output_dir': '/share/home/navid/experiments/neuralir/msmarco-passage/multidocscoring',
                'embedding_memmap_dir': '/share/cp/datasets/ir/msmarco/passage/repbert/representations/doc_embedding',
                'tokenized_path': '/share/cp/datasets/ir/msmarco/passage/repbert/preprocessed',
-               'msmarco_dir': '/share/cp/datasets/ir/msmarco/passage/',
+               'qrels_path': '/share/cp/datasets/ir/msmarco/passage/qrels.dev.tsv',
                'train_candidates_path': '/share/cp/datasets/ir/msmarco/passage/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap',
                'eval_candidates_path': '/share/cp/datasets/ir/msmarco/passage/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap',
                'records_file': 'MDST_records.xls'

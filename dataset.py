@@ -286,7 +286,8 @@ class MYMARCO_Dataset(Dataset):
     def __init__(self, mode,
                  embedding_memmap_dir, queries_tokenids_path, candidates_path, qrels_path=None,
                  tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
-                 limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False):
+                 limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False,
+                 collection_neutrality_path=None):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
@@ -311,6 +312,13 @@ class MYMARCO_Dataset(Dataset):
             candidate documents, even if they weren't part of the original candidates. (Helps isolate effect of first-stage recall)
         """
         self.mode = mode  # "train", "dev", "eval"
+        self.documents_neutrality = None
+        if collection_neutrality_path is not None:
+            logger.info("Loading document neutrality scores ...")
+            self.documents_neutrality = {}
+            for l in open(collection_neutrality_path):
+                vals = l.strip().split('\t')
+                self.documents_neutrality[int(vals[0])] = float(vals[1])    
         self.inject_ground_truth = inject_ground_truth  # if True, during evaluation the ground truth relevant documents will be always part of the candidate documents
         if self.inject_ground_truth:
             if self.mode == 'dev':
@@ -445,12 +453,13 @@ class MYMARCO_Dataset(Dataset):
             num_inbatch_neg = 0
 
         return partial(collate_function, mode=self.mode, pad_token_id=self.pad_id, num_inbatch_neg=num_inbatch_neg,
-                       max_candidates=max_candidates, n_gpu=n_gpu, inject_ground_truth=self.inject_ground_truth)
+                       max_candidates=max_candidates, n_gpu=n_gpu, inject_ground_truth=self.inject_ground_truth,
+                       documents_neutrality=self.documents_neutrality)
 
 
 # TODO: can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
 def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=MAX_DOCS, n_gpu=1,
-                     inject_ground_truth=False):
+                     inject_ground_truth=False, documents_neutrality=None):
     """
     :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, rel_docs)
     :param mode: 'train', 'dev', or 'eval'
@@ -535,6 +544,24 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
+    if documents_neutrality is not None:
+        doc_neutscores = []
+        for doc_ids_batch in doc_ids:
+            doc_neutscores_batch = []
+            for doc_id in doc_ids_batch:
+                if doc_id in documents_neutrality:
+                    doc_neutscores_batch.append(documents_neutrality[doc_id])    
+                else:
+                    logger.debug("Document neutrality score of ID %d is not found (set to 1)" % doc_id)
+                    doc_neutscores_batch.append(1.0)
+            doc_neutscores.append(doc_neutscores_batch)
+
+        doc_neutscores_tensor = torch.zeros(batch_size, max_docs_per_query)  # (batch_size, padded_length)
+        for i, doc_neutscores_batch in enumerate(doc_neutscores):
+            end = min(len(doc_neutscores_batch), max_docs_per_query)
+            doc_neutscores_tensor[i, :end] = torch.tensor(doc_neutscores_batch)[:end]
+        data['doc_neutscore'] = doc_neutscores_tensor
+        
     if mode != 'eval':
         if mode == "train" or inject_ground_truth:
             # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`

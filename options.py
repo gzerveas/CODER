@@ -3,11 +3,11 @@ import logging
 logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
 
+
 NEG_METRICS = ['loss']  # metrics which are better when smaller
 POS_METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']  # metrics which are better when higher
 POS_METRICS.extend(m + '@' for m in POS_METRICS[:])
 METRICS = NEG_METRICS + POS_METRICS
-
 
 def run_parse_args():
     parser = argparse.ArgumentParser(description='Run a complete training or evaluation. Optionally, a JSON configuration '
@@ -64,6 +64,7 @@ def run_parse_args():
     parser.add_argument("--tokenizer_from", type=str, default=None,
                         help="""Path to a directory containing a saved custom tokenizer (vocabulary and added tokens).
                         It is optional and used together with `query_encoder_type`.""")
+    
 
     ## Dataset
     parser.add_argument('--train_limit_size', type=float, default=None,
@@ -184,8 +185,8 @@ def run_parse_args():
                                  'dot_product', 'dot_product_gelu', 'dot_product_softmax',
                                  'cosine', 'cosine_gelu', 'cosine_softmax'},
                         default='raw', help='Scoring function to map the final embeddings to scores')
-    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'multitier'}, default='multilabelmargin',
-                        help='Loss applied to document scores')
+    parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier'},
+                        default='multilabelmargin', help='Loss applied to document scores')
     parser.add_argument('--num_tiers', type=int, default=4,
                         help="Number of relevance tiers for `loss_type` 'multitier'")
     parser.add_argument('--tier_size', type=int, default=50,
@@ -215,6 +216,17 @@ def run_parse_args():
                              "query term embeddings in the output of the query encoder")
     parser.add_argument('--no_decoder', action='store_true',
                         help="If used, no transformer decoder will be used to transform document embeddings")
+
+    ##Fairness
+    parser.add_argument("--collection_neutrality_path", type=str,
+                        help="path to the file containing neutrality values of documents in tsv format (docid [tab] score)")
+    parser.add_argument("--background_set_runfile_path", type=str, 
+                        default="fair_retrieval/resources/msmarco_fair.background_run.txt",
+                        help="path to the TREC run file containing the documents of the background set")
+    parser.add_argument('--bias_regul_coeff', type=float, default=0.0,
+                        help='Coefficient of the bias term added to loss')
+    parser.add_argument('--bias_regul_cutoff', type=int, default=100,
+                        help='Bias term is calculated according to the top-X predicted results')
 
     args = parser.parse_args()
 

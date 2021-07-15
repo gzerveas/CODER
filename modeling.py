@@ -1,8 +1,10 @@
 import math
 import logging
 from typing import Optional, Any, Dict
+import ipdb
 
 import torch
+import numpy as np
 from torch import nn, Tensor
 import torch.nn.functional as F
 from transformers import BertModel, BertPreTrainedModel, RobertaModel
@@ -286,6 +288,37 @@ class RelevanceCrossEntropyLoss(nn.Module):
         return loss
 
 
+class RelevanceListnetLoss(nn.Module):
+    """
+    ListNet loss
+    """
+    def __init__(self):
+        super(RelevanceListnetLoss, self).__init__()
+
+    def forward(self, predictions, labels):
+        """
+        :param predictions: (batch_size, num_docs, 2) relevance class log-probabilities for each candidate document and query.
+            Dimension [:, :, 0] corresponds to the log-prob. for the "relevant" class and [:, :, 1] to the "non-relevant" class.
+        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+                indicating non-relevance.
+        :return: loss: scalar tensor. Mean loss per document
+        """
+        
+        _labels_values = labels.new_zeros(labels.shape, dtype=torch.float32)
+        _labels_values[labels!=-1] = 1
+        #_labels_mask = labels.new_zeros(labels.shape, dtype=torch.float32)
+        _labels_values[labels==-1] = float("-Inf")
+        
+        labels_probs = torch.nn.Softmax(dim=1)(_labels_values)
+        predictions_logprobs = torch.nn.LogSoftmax(dim=1)(predictions)
+
+        loss = torch.nn.KLDivLoss(reduction='batchmean')(predictions_logprobs, labels_probs)
+        
+        return loss
+
+
 class MultiTierLoss(nn.Module):
     """
     Multiple tiers of relevance for negative documents.
@@ -432,6 +465,8 @@ def get_loss_module(args):
         return nn.MultiLabelMarginLoss()
     elif args.loss_type == 'crossentropy':
         return RelevanceCrossEntropyLoss()
+    elif args.loss_type == 'listnet':
+        return RelevanceListnetLoss()
     elif args.loss_type == 'multitier':
         return MultiTierLoss(num_tiers=args.num_tiers, tier_size=args.tier_size, tier_distance=args.tier_distance,
                              diff_function=args.diff_function,
@@ -662,7 +697,7 @@ class MDSTransformer(nn.Module):
                  activation: str = "relu", normalization: str = "LayerNorm", positional_encoding=None,
                  doc_emb_dim: int = None, custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
                  scoring_mode='cross_attention', loss_module=None, selfatten_mode=0, no_decoder=False,
-                 no_dec_crossatten=False) -> None:
+                 no_dec_crossatten=False, transform_doc_emb=False, bias_regul_coeff = 0.0, bias_regul_cutoff = 100) -> None:
         super(MDSTransformer, self).__init__()
 
         if custom_encoder is not None:
@@ -716,7 +751,8 @@ class MDSTransformer(nn.Module):
             self.project_query = nn.Linear(self.query_dim, self.d_model)
 
         # project document representation vectors to match dimensionality of d_model
-        if self.doc_emb_dim != self.d_model:
+        self.project_documents = None
+        if (self.doc_emb_dim != self.d_model) or (transform_doc_emb):
             self.project_documents = nn.Linear(self.doc_emb_dim, self.d_model)
             logger.warning("Using {} dim. for transformer model dimension; will project document embeddings "
                            "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
@@ -725,6 +761,9 @@ class MDSTransformer(nn.Module):
         self.score_docs = self.get_scoring_module(scoring_mode)
 
         self.loss_module = loss_module
+        
+        self.bias_regul_coeff = bias_regul_coeff
+        self.bias_regul_cutoff = bias_regul_cutoff
 
     def get_scoring_module(self, scoring_mode):
 
@@ -747,7 +786,7 @@ class MDSTransformer(nn.Module):
 
     def forward(self, query_token_ids: Tensor, query_mask: Tensor = None, doc_emb: Tensor = None,
                 docinds: Tensor = None, local_emb_mat: Tensor = None, doc_padding_mask: Tensor = None,
-                doc_attention_mat_mask: Tensor = None, labels: Tensor = None) -> Dict[str, Tensor]:
+                doc_attention_mat_mask: Tensor = None, doc_neutscore: Tensor = None, labels: Tensor = None) -> Dict[str, Tensor]:
         r"""
         num_docs is the number of candidate docs per query and corresponds to the length of the padded "decoder" sequence
         :param  query_token_ids: (batch_size, max_query_len) tensor of padded sequence of token IDs fed to the encoder
@@ -765,6 +804,7 @@ class MDSTransformer(nn.Module):
         :param  doc_attention_mat_mask: (num_docs, num_docs) float additive mask for the decoder sequence (optional).
                     This is for causality, and if FloatTensor, can be directly added on top of the attention matrix.
                     If BoolTensor, positions with ``True`` are ignored, while ``False`` values will be considered.
+        :param  doc_neutscore: (batch_size, num_docs) sequence of document neutrality scores to calculate fairness.
         :param  labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices of the
                 relevant documents within its corresponding pool of candidates (docinds).
                     Optional: If provided, the loss will be computed.
@@ -777,8 +817,7 @@ class MDSTransformer(nn.Module):
         if doc_emb is None:  # happens only in training, when additionally there is in-batch negative sampling
             doc_emb = self.lookup_doc_emb(docinds, local_emb_mat)  # (batch_size, max_docs_per_query, doc_emb_dim)
             
-        if self.doc_emb_dim != self.d_model:
-            # project document representation vectors to match dimensionality of d_model
+        if self.project_documents is not None:
             doc_emb = self.project_documents(doc_emb)
         # permute because pytorch convention for transformers is [seq_length, batch_size, feat_dim]
         doc_emb = doc_emb.permute(1, 0, 2)  # (max_docs_per_query, batch_size, doc_emb_dim) document embeddings
@@ -813,15 +852,39 @@ class MDSTransformer(nn.Module):
         
         if self.scoring_mode.endswith('softmax'):
             rel_scores = torch.exp(predictions[:, :, 0])  # (batch_size, num_docs) relevance scores
-            if labels is not None:
-                loss = self.loss_module(predictions, labels)  # loss is scalar tensor
-                return {'loss': loss, 'rel_scores': rel_scores}
-
         else:
             rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores
-            if labels is not None:
-                loss = self.loss_module(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
-                return {'loss': loss, 'rel_scores': rel_scores}
+            
+        ## fairness regularization term
+        bias_regul_term = None
+        if doc_neutscore is not None:
+
+            _cutoff = np.min([self.bias_regul_cutoff, doc_neutscore.shape[1]])
+
+            _indices_sorted = torch.argsort(rel_scores, dim=1, descending=True)
+            _indices_sorted[_indices_sorted<_cutoff] = -1
+            _indices_sorted[_indices_sorted!=-1] = 0
+            _indices_sorted[_indices_sorted==-1] = 1
+            _indices_mask = doc_neutscore.new_zeros(doc_neutscore.shape)    
+            _indices_mask[_indices_sorted==0] = float("-Inf")
+
+            doc_neutscore_probs = torch.nn.Softmax(dim=1)(doc_neutscore + _indices_mask)
+            rel_scores_logprobs = torch.nn.LogSoftmax(dim=1)(rel_scores + _indices_mask)
+
+            bias_regul_term = torch.nn.KLDivLoss(reduction='batchmean')(rel_scores_logprobs, doc_neutscore_probs)
+
+        ## final loss
+        if labels is not None:
+            loss = self.loss_module(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
+            
+            if bias_regul_term is not None:
+                if self.bias_regul_coeff < 0:
+                    loss = rel_scores.new([0])[0]
+                    loss += - self.bias_regul_coeff * bias_regul_term
+                else:    
+                    loss += self.bias_regul_coeff * bias_regul_term
+            
+            return {'loss': loss, 'rel_scores': rel_scores}
         return {'rel_scores': rel_scores}
 
     def lookup_doc_emb(self, docinds, local_emb_mat):
