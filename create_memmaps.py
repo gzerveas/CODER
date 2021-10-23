@@ -1,3 +1,12 @@
+"""
+Creates memmap arrays (a triad of files) of:
+    1) integer document IDs and respective integer *token IDs*
+    2) integer query IDs and respective (retrieved) *document IDs*
+The collection memmap triad is processed by `precompute.py` to obtain document vector embeddings/representations, which
+are necessary for training and evaluation of the retrieval model.
+The query_ID -> candidate_doc_IDs memmap triad is necessary for training the retrieval model.
+"""
+
 import os
 import json
 import argparse
@@ -18,12 +27,20 @@ logging.basicConfig(format='%(asctime)s-%(levelname)s-%(name)s- %(message)s',
 
 
 def convert_collection_to_memmap(tokenized_file, memmap_dir, max_length, file_prefix=''):
+    """
+    Converts a line-JSON file containing a collection of passage/doc IDs (key: "id") and a respective list of tokens (key: "ids")
+    into a triad of related memmap files inside the same directory:
+    (collection_size, max_seq_length) array of integer token IDs
+    (collection_size,) array of respective passage IDs
+    (collection_size,) array of num. of tokens per passage ID
+    """
     collection_size = sum(1 for _ in open(tokenized_file))
 
     tokenids_memmap_path = os.path.join(memmap_dir, file_prefix + "token_ids.memmap")
     pids_memmap_path = os.path.join(memmap_dir, file_prefix + "pids.memmap")
     lengths_memmap_path = os.path.join(memmap_dir, file_prefix + "lengths.memmap")
 
+    # NOTE: int32 should be enough for token_ids, pids and lengths (max 2'147'483'647)
     token_ids = np.memmap(tokenids_memmap_path, dtype='int32', mode='w+', shape=(collection_size, args.max_seq_length))
     pids = np.memmap(pids_memmap_path, dtype='int32', mode='w+', shape=(collection_size,))
     lengths = np.memmap(lengths_memmap_path, dtype='int32', mode='w+', shape=(collection_size,))
@@ -171,7 +188,9 @@ def create_candidates_memmap(candidates_filepath, memmap_dir, max_docs, num_qids
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Creates binary memmap files out of a tokenized/numerized document collection"
-                                                 "JSON file and/or a candidate (retrieved) documents text file.")
+                                                 "JSON file and/or a candidate (retrieved) documents text file. "
+                                                 "Collection memmap (integer token ids per document) must be further "
+                                                 "processed by `precompute.py` to obtain embedding vectors per document.")
     parser.add_argument("--tokenized_collection", type=str, default=None,
                         help="JSON file containing {docID : list of document token IDs} pairs, "
                              "produced by convert_text_to_tokenized.py")
@@ -186,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument("--auto_name_dir", action='store_true',
                         help="If set, will use `candidates` path to create the output directory name. "
                              "In this case, `output_candidates_dir` will specify the root.")
-    parser.add_argument("--max_seq_length", type=int, default=512,
+    parser.add_argument("--max_seq_length", type=int, default=256,
                         help="The maximum length of each document in tokens. Affects memory footprint of memmap. "
                              "It is typically reduced later in the dataloader.")
     parser.add_argument("--max_candidates", type=int, default=1000,

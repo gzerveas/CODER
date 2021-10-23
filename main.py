@@ -19,7 +19,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, SequentialSampler
 # from transformers.modeling_bert import BERT_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel
+from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, AutoTokenizer, AutoModel
 
 # Package modules
 from options import *
@@ -674,10 +674,14 @@ def get_dataset(args, eval_mode, tokenizer):
 def get_query_encoder(args):
     """Initialize and return query encoder model object based on args"""
 
-    if args.query_encoder_type == 'bert':
-        return BertModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
-    elif args.query_encoder_type == 'roberta':
-        return RobertaModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
+    if os.path.exists(args.query_encoder_from):
+        logger.info("Will load pre-trained query encoder from: {}".format(args.query_encoder_from))
+    else:
+        logger.warning("Will initialize standard HuggingFace '{}' as a query encoder!".format(args.query_encoder_from))
+    start_time = time.time()
+    encoder = AutoModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
+    logger.info("Query encoder loaded in {} s".format(time.time() - start_time))
+    return encoder
 
 
 def get_model(args, doc_emb_dim=None):
@@ -712,14 +716,10 @@ def get_model(args, doc_emb_dim=None):
 def get_tokenizer(args):
     """Initialize and return tokenizer object based on args"""
 
-    if args.query_encoder_type == 'bert':
-        if args.tokenizer_from is None:  # if not a directory path
-            args.tokenizer_from = 'bert-base-uncased'
-        return BertTokenizer.from_pretrained(args.tokenizer_from)
-    elif args.query_encoder_type == 'roberta':
-        if args.tokenizer_from is None:  # if not a directory path
-            args.tokenizer_from = 'roberta-base'
-        return RobertaTokenizer.from_pretrained(args.tokenizer_from)
+    if args.tokenizer_from is None:  # use same config as specified for the query encoder model
+        return AutoTokenizer.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
+    else:
+        return AutoTokenizer.from_pretrained(args.tokenizer_from)
 
 
 if __name__ == "__main__":

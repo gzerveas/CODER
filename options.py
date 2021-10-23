@@ -55,15 +55,16 @@ def run_parse_args():
     parser.add_argument("--query_encoder_from", type=str, default="bert-base-uncased",
                         help="""A string used to initialize the query encoder weights and config object: 
                         can be either a pre-defined HuggingFace transformers string (e.g. "bert-base-uncased"), or
-                        a path of a directory containing weights and config file""")
+                        a path of a directory containing weights and config file.""")
     parser.add_argument("--query_encoder_config", type=str, default=None,
-                        help="""A string used to define the query encoder configuration (optional):
-                        Used in case only the weights should be initialized by `query_encoder_from`. 
+                        help="""Optional: A string used to define the query encoder configuration.
+                        Used for flexibility, in case only the weights should be initialized by `query_encoder_from`. 
                         Can be either a pre-defined HuggingFace transformers string (e.g. "bert-base-uncased"), or
                         a path of a directory containing the config file, or directly the JSON config path.""")
     parser.add_argument("--tokenizer_from", type=str, default=None,
-                        help="""Path to a directory containing a saved custom tokenizer (vocabulary and added tokens).
-                        It is optional and used together with `query_encoder_type`.""")
+                        help="""Optional: Path to a directory containing a saved custom tokenizer (vocabulary and added tokens)
+                        for queries, or a HuggingFace built-in string. Only used if for whatever reason 
+                        the query tokenizer should differfrom what is specified by `query_encoder_from` and `query_encoder_config`""")
     
 
     ## Dataset
@@ -132,7 +133,7 @@ def run_parse_args():
     parser.add_argument('--reduce_on_plateau', default=None, choices=METRICS,
                         help="If a metric is specified with this option, then this metric will be monitored, and in "
                              "case of no improvement within `ROP_patience` steps, the learning rate will be reduced by"
-                             "`ROP_factor`.")
+                             "`ROP_factor`, until `final_lr_ratio` is reached")
     parser.add_argument("--ROP_patience", default=10000, type=int,
                         help="Number of steps after which the learning rate will be reduced in case of no performance"
                              " improvement. Must be higher than `validation_steps` (usually, multiple).")
@@ -160,8 +161,7 @@ def run_parse_args():
     ## Model
     parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer'], default='mdstransformer',
                         help="""Type of the entire (end-to-end) information retrieval model""")
-    parser.add_argument("--query_encoder_type", type=str, choices=['bert', 'roberta'], default='bert',
-                        help="""Type of the model component used for encoding queries""")
+
     # The following refer to the transformer "decoder" (which processes an input sequence of document embeddings)
     parser.add_argument('--d_model', type=int, default=None,
                         help='Internal dimension of transformer decoder embeddings')
@@ -217,7 +217,7 @@ def run_parse_args():
     parser.add_argument('--no_decoder', action='store_true',
                         help="If used, no transformer decoder will be used to transform document embeddings")
 
-    ##Fairness
+    ## Fairness
     parser.add_argument("--collection_neutrality_path", type=str,
                         help="path to the file containing neutrality values of documents in tsv format (docid [tab] score)")
     parser.add_argument("--background_set_runfile_path", type=str, 

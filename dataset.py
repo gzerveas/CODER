@@ -291,8 +291,8 @@ class MYMARCO_Dataset(Dataset):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
-            embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs
-        :param queries_tokenids_path: path to dir or JSON file of {int qid: tokenized and numerized query} pairs
+            embeddings and an accompanying (num_docs_in_collection,) memmap array of corresponding doc/passage IDs
+        :param queries_tokenids_path: path to dir or JSON file of {qid: list of token IDs} pairs
         :param candidates_path: directory containing memmap file of passage/doc IDs per query, and the
             corresponding query IDs, and the number of candidates per query in two more memmpap files
         :param qrels_path: dir or path to file of ground truth relevant passages in the following format:

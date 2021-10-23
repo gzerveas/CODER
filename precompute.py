@@ -1,3 +1,13 @@
+"""
+Creates memmap files containing embedding vectors of a document collection and/or queries.
+Document embeddings are necessary for training and evaluation. Query embeddings are only used when evaluating a trained
+retrieval model for 1-stage retrieval (`retrieve.py`)
+Requires:
+    For document embeddings: doc_ID -> doc_token_IDs *memmap triad files*, produced by `create_memmaps.py`
+    For query embeddings: query_ID -> query_token_IDs *JSON file*, produced by `convert_text_to_tokenized`
+
+"""
+
 import os
 import math
 import json
@@ -8,7 +18,7 @@ import numpy as np
 from tqdm import tqdm
 from timeit import default_timer as timer
 from collections import namedtuple, defaultdict
-from transformers import BertTokenizer, BertConfig, RobertaTokenizer
+from transformers import BertTokenizer, BertConfig, AutoTokenizer, AutoModel
 from torch.utils.data import DataLoader, Dataset
 from dataset import CollectionDataset, pack_tensor_2D
 from modeling import RepBERT
@@ -20,6 +30,17 @@ logging.basicConfig(format='%(asctime)s-%(levelname)s-%(name)s- %(message)s',
 
 
 def create_embed_memmap(ids, memmap_dir, dim, file_prefix=''):
+    """
+    Creates memmap files containing embedding vectors of a document collection and/or queries.
+
+    :param ids: iterable of all IDs
+    :param memmap_dir: directory where memmap files will be created
+    :param dim: dimensionality of embedding vectors
+    :param file_prefix: optional prefix prepended to memmap files
+
+    :return embedding_memmap: (len(ids), dim) numpy memmap array of embedding vectors
+    :return id_memmap: (len(ids),) numpy memmap array of IDs corresponding to rows of `embedding_memmap`
+    """
 
     if not os.path.exists(memmap_dir):
         os.makedirs(memmap_dir)
@@ -49,9 +70,10 @@ def load_queries(filepath):
 
 
 class MSMARCO_QueryDataset(Dataset):
-    def __init__(self, tokenized_filepath, max_query_length):
+    def __init__(self, tokenized_filepath, max_query_length, tokenizer=None):
         self.max_query_length = max_query_length
-        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        if tokenizer is None:
+            tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.queries = load_queries(tokenized_filepath)
         self.qids = list(self.queries.keys())
         self.cls_id = tokenizer.cls_token_id
@@ -77,11 +99,10 @@ class MSMARCO_DocDataset(Dataset):
     """The difference from CollectionDataset is that it adds special tokens.
     It can also further limit max sequence length"""
 
-    def __init__(self, collection_memmap_dir, max_doc_length):
+    def __init__(self, collection_memmap_dir, max_doc_length, tokenizer):
         self.max_doc_length = max_doc_length
         self.collection = CollectionDataset(collection_memmap_dir)
         self.pids = self.collection.pids
-        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.cls_id = tokenizer.cls_token_id
         self.sep_id = tokenizer.sep_token_id
         self.all_ids = self.collection.pids
@@ -126,10 +147,10 @@ def generate_embeddings(args, model, dataset):
     collate_fn = get_collate_function()
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)  # TODO: Why not more workers?
 
-    # multi-gpu eval
+    # multi-gpu inference
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)  # automatically splits the batch into chunks for each process/GPU
-    # Eval!
+    # Inference
     logger.info("  Num examples = %d", len(dataset))
     logger.info("  Batch size = %d", batch_size)
 
@@ -143,14 +164,16 @@ def generate_embeddings(args, model, dataset):
             positions = [id2pos[identity] for identity in ids]
             embedding_memmap[positions] = sequence_embeddings
     end = timer()
-    print("time:", end - start)
+    logger.info("Done in {} sec".format(end - start))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Creates memmap files containing embedding vectors of a document "
                                                  "collection and/or queries.")
     ## Required parameters
-    parser.add_argument("--load_model_path", type=str, required=True)
+    parser.add_argument("--load_model", type=str, required=True,
+                        help="Either path of a pre-trained model directory, "
+                             "or string corresponding to a HuggingFace built-in model.")
     parser.add_argument("--output_dir", type=str, default=".")
     parser.add_argument("--collection_memmap_dir", type=str, default=None,
                         help="""Contains memmap files of tokenized/numerized collection of documents. If specified, will 
@@ -161,9 +184,10 @@ if __name__ == "__main__":
     # parser.add_argument("--tokenizer_type", type=str, choices=['bert', 'roberta'], default='bert',
     #                     help="""Type of tokenizer for the model component used for encoding queries (and passages)""")
     # parser.add_argument("--tokenizer_from", type=str, default=None,
-    #                     help="""A path of a directory containing a saved custom tokenizer (vocabulary and added tokens).
-    #                     It is optional and used together with `tokenizer_type`.""")
-    parser.add_argument("--max_query_length", type=int, default=20)
+    #                     help="""When used together with `tokenizer_type`, it is an optional path of a directory
+    #                     containing a saved custom tokenizer (vocabulary and added tokens). When `tokenizer_type` is not
+    #                     set, it is a string used to initialize one of the built-in HuggingFace tokenizers.""")
+    parser.add_argument("--max_query_length", type=int, default=32)
     parser.add_argument("--max_doc_length", type=int, default=256)
     parser.add_argument("--per_gpu_batch_size", default=100, type=int)
     args = parser.parse_args()
@@ -179,27 +203,43 @@ if __name__ == "__main__":
     # Setup logging
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
 
-    config = BertConfig.from_pretrained(args.load_model_path)
+    # Get tokenizer and model
+    if os.path.exists(args.load_model):
+        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        logger.info("Loaded tokenizer: {}".format(tokenizer))
+        config = BertConfig.from_pretrained(args.load_model)
+        model = None
+        builtin_model = False
+    else:  # for example, "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"
+        tokenizer = AutoTokenizer.from_pretrained(args.load_model)
+        logger.info("Loaded tokenizer: {}".format(tokenizer))
+        logger.info("Loading model from '{}' ...".format(args.load_model))
+        model = AutoModel.from_pretrained(args.load_model)
+        model.to(args.device)
+        builtin_model = True
 
     if args.tokenized_queries:
-        config.encode_type = "doc"
-        logger.info("Loading model ...")
-        model = RepBERT.from_pretrained(args.load_model_path, config=config)
-        model.to(args.device)
+        if not builtin_model:
+            config.encode_type = "query"
+            logger.info("Loading model from '{}' ...".format(args.load_model))
+            model = RepBERT.from_pretrained(args.load_model, config=config)
+            model.to(args.device)
 
         logger.info("Loading dataset ...")
-        dataset = MSMARCO_QueryDataset(args.tokenized_queries, args.max_query_length)
+        dataset = MSMARCO_QueryDataset(args.tokenized_queries, args.max_query_length, tokenizer)
         queries_dir = os.path.splitext(os.path.basename(args.tokenized_queries))[0] + "_embeddings_memmap"
         args.memmap_dir = os.path.join(args.output_dir, queries_dir)
         logger.info("Generating embeddings in {} ...".format(args.memmap_dir))
         generate_embeddings(args, model, dataset)
     if args.collection_memmap_dir:
-        config.encode_type = "query"
-        model = RepBERT.from_pretrained(args.load_model_path, config=config)
-        model.to(args.device)
+        if not builtin_model:
+            config.encode_type = "doc"
+            logger.info("Loading model from '{}' ...".format(args.load_model))
+            model = RepBERT.from_pretrained(args.load_model, config=config)
+            model.to(args.device)
 
         logger.info("Loading dataset ...")
-        dataset = MSMARCO_DocDataset(args.collection_memmap_dir, args.max_doc_length)
+        dataset = MSMARCO_DocDataset(args.collection_memmap_dir, args.max_doc_length, tokenizer)
         args.memmap_dir = os.path.join(args.output_dir, "doc_embeddings_memmap")
         logger.info("Generating embeddings in {} ...".format(args.memmap_dir))
         generate_embeddings(args, model, dataset)
