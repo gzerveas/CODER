@@ -7,7 +7,7 @@ import torch
 import numpy as np
 from torch import nn, Tensor
 import torch.nn.functional as F
-from transformers import BertModel, BertPreTrainedModel, RobertaModel
+from transformers import BertModel, BertPreTrainedModel, AutoModel
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +89,26 @@ class RepBERT_Train(BertPreTrainedModel):
 
 
 def _average_sequence_embeddings(sequence_output, valid_mask):
+    """
+    :param sequence_output: (batch_size, sequence_len, d_model) tensor of output embeddings for each sequence position
+    :param valid_mask: (batch_size, query_length) attention mask bool tensor for sequence positions; 1 use, 0 ignore
+    :return: (batch_size, d_model) aggregate representation vector for each sequence in the batch
+    """
     flags = valid_mask.bool()  # (valid_mask == 1) seems superfluous, but is prob. there to convert to bool
     lengths = torch.sum(flags, dim=-1)
     lengths = torch.clamp(lengths, 1, None)
     sequence_embeddings = torch.sum(sequence_output * flags[:, :, None], dim=1)
     sequence_embeddings = sequence_embeddings/lengths[:, None]
     return sequence_embeddings
+
+
+def _select_first_embedding(sequence_output, valid_mask=None):
+    """
+    :param sequence_output: (batch_size, sequence_len, d_model) tensor of output embeddings for each sequence position
+    :param valid_mask: not used; for compatibility
+    :return: (batch_size, d_model) aggregate representation vector for each sequence in the batch
+    """
+    return sequence_output[:, 0, :]
 
 
 class RepBERT(BertPreTrainedModel):
@@ -215,12 +229,14 @@ class DotProductScorer(Scorer):
     Computes scores as a dot product between the aggregate (e.g. mean) query representation and each final document
     embedding.
     """
-    def __init__(self, scoring_mode='', pre_activation=None, normalize=False):
+    def __init__(self, scoring_mode='', pre_activation=None, normalize=False, aggregation='mean'):
         """
         :param scoring_mode: string, same as the option used to initialize `MDSTransformer`. At this point, the string
             must start with "doc_product" or "cosine", but the suffix can specify a (non)linear transformation to be used on scores
         :param pre_activation: activation function to use on representations BEFORE computing the inner product
         :param normalize: if True, will divide product by vector norms, i.e. will compute the cosine similarity
+        :param aggregation: defines how to aggregate final query token representations to obtain a single vector
+            representation for the query. 'mean' will average, 'first' will simply select the first vector
         """
         super(DotProductScorer, self).__init__(d_model=1, scoring_mode=scoring_mode)
 
@@ -228,6 +244,11 @@ class DotProductScorer(Scorer):
             self.pre_activation_func = torch.nn.GELU()
         else:
             self.pre_activation_func = None
+
+        if aggregation == 'mean':
+            self.aggregation_func = _average_sequence_embeddings
+        else:
+            self.aggregation_func = _select_first_embedding
 
         self.normalize = normalize
 
@@ -245,14 +266,14 @@ class DotProductScorer(Scorer):
 
         output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, d_model)
         query_emb = query_emb.permute(1, 0, 2)  # (batch_size, query_len, d_model)
-        avg_query_emb = _average_sequence_embeddings(query_emb, ~query_mask)  # (batch_size, d_model)
+        agg_query_emb = self.aggregation_func(query_emb, ~query_mask)  # (batch_size, d_model)
 
         if self.normalize:
-            scores = F.cosine_similarity(output_emb, avg_query_emb[:, None, :], dim=2, eps=1e-6)
+            scores = F.cosine_similarity(output_emb, agg_query_emb[:, None, :], dim=2, eps=1e-6)
         else:
             # scores = torch.matmul(output_emb, avg_query_emb[:, :, None])  # (batch_size, num_docs, 1) when using self.score_func for re-scaling
             # scores = self.score_func(self.linear(scores))
-            scores = torch.matmul(output_emb, avg_query_emb[:, :, None]).squeeze()  # to disable scaling
+            scores = torch.matmul(output_emb, agg_query_emb[:, :, None]).squeeze()  # to disable scaling
 
         return scores
 
@@ -297,23 +318,25 @@ class RelevanceListnetLoss(nn.Module):
 
     def forward(self, predictions, labels):
         """
-        :param predictions: (batch_size, num_docs, 2) relevance class log-probabilities for each candidate document and query.
-            Dimension [:, :, 0] corresponds to the log-prob. for the "relevant" class and [:, :, 1] to the "non-relevant" class.
+        :param predictions: (batch_size, num_docs) relevance scores (arb. range) for each candidate document and query.
         :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
                 relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
                 then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
                 indicating non-relevance.
-        :return: loss: scalar tensor. Mean loss per document
+        :return: loss: scalar tensor. Mean loss per query
         """
-        
-        _labels_values = labels.new_zeros(labels.shape, dtype=torch.float32)
-        _labels_values[labels!=-1] = 1
-        #_labels_mask = labels.new_zeros(labels.shape, dtype=torch.float32)
-        _labels_values[labels==-1] = float("-Inf")
-        
-        labels_probs = torch.nn.Softmax(dim=1)(_labels_values)
-        predictions_logprobs = torch.nn.LogSoftmax(dim=1)(predictions)
+        # WARNING: works only because relevant documents are always prepended at the beginning, and thus labels are e.g. [0, 1, 2, -1, ..., -1]
 
+        _labels_values = labels.new_zeros(labels.shape, dtype=torch.float32)
+        is_relevant = (labels > -1)
+        _labels_values[is_relevant] = 1
+        # NOTE: _labels_values = _labels_values / torch.sum(is_relevant, dim=1).unsqueeze(dim=1)
+        # is equivalent but interestingly much slower than setting -Inf and computing Softmax; maybe due to CUDA Softmax code
+        _labels_values[labels == -1] = float("-Inf")
+        labels_probs = torch.nn.Softmax(dim=1)(_labels_values)
+
+        predictions_logprobs = torch.nn.LogSoftmax(dim=1)(predictions)  # (batch, num_docs) log-distribution over docs
+        # KLDivLoss expects predictions ('inputs') as log-probabilities and 'targets' as probabilities
         loss = torch.nn.KLDivLoss(reduction='batchmean')(predictions_logprobs, labels_probs)
         
         return loss
@@ -665,13 +688,13 @@ class ReducedTransformerDecoderLayer(nn.TransformerDecoderLayer):
 
 
 class MDSTransformer(nn.Module):
-    r"""Multiple Document Scoring Transformer. By default, consists of a Roberta query enconder (Huggingface implementation),
+    r"""Multiple Document Scoring Transformer. By default, consists of a query enconder (Huggingface implementation),
     and a "decoder" using self-attention over a sequence (set) of document representations and cross-attention over
     the query term representations in the  encoder output.
     Computes a relevance score for each (transformed) document representation and can be thus used for reranking.
 
     Args:
-        encoder_config: huggingface transformers configuration object for a Roberta query encoder.
+        encoder_config: huggingface transformers configuration object to instantiate a query encoder.
             Used instead of `custom_encoder`.
         custom_encoder: custom encoder object initialized externally (default=None)
             Used instead of `encoder_config`.
@@ -696,14 +719,15 @@ class MDSTransformer(nn.Module):
                  num_decoder_layers: int = 6, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: str = "relu", normalization: str = "LayerNorm", positional_encoding=None,
                  doc_emb_dim: int = None, custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
-                 scoring_mode='cross_attention', loss_module=None, selfatten_mode=0, no_decoder=False,
-                 no_dec_crossatten=False, transform_doc_emb=False, bias_regul_coeff = 0.0, bias_regul_cutoff = 100) -> None:
+                 scoring_mode='cross_attention', query_emb_aggregation='mean',
+                 loss_module=None, selfatten_mode=0, no_decoder=False, no_dec_crossatten=False, transform_doc_emb=False,
+                 bias_regul_coeff=0.0, bias_regul_cutoff=100) -> None:
         super(MDSTransformer, self).__init__()
 
         if custom_encoder is not None:
             self.encoder = custom_encoder
         else:
-            self.encoder = RobertaModel(encoder_config)
+            self.encoder = AutoModel.from_config(encoder_config)
 
         self.doc_emb_dim = doc_emb_dim  # the expected document vector dimension. If None, it will be assumed to be d_model
 
@@ -745,6 +769,7 @@ class MDSTransformer(nn.Module):
         self.num_heads = num_heads
 
         self.query_dim = self.encoder.config.hidden_size  # e.g. 768 for BERT-base
+        self.query_emb_aggregation = query_emb_aggregation  # how to aggregate output query token representations
 
         # project query representation vectors to match dimensionality of doc embeddings (for cross-attention and/or scoring)
         if self.query_dim != self.d_model:
@@ -758,14 +783,14 @@ class MDSTransformer(nn.Module):
                            "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
 
         self.scoring_mode = scoring_mode
-        self.score_docs = self.get_scoring_module(scoring_mode)
+        self.score_docs = self.get_scoring_module(scoring_mode, query_emb_aggregation)
 
         self.loss_module = loss_module
         
         self.bias_regul_coeff = bias_regul_coeff
         self.bias_regul_cutoff = bias_regul_cutoff
 
-    def get_scoring_module(self, scoring_mode):
+    def get_scoring_module(self, scoring_mode, query_emb_aggregation):
 
         if scoring_mode.startswith('cross_attention'):
             return CrossAttentionScorer(self.d_model, scoring_mode)
@@ -774,13 +799,13 @@ class MDSTransformer(nn.Module):
                 pre_activation_func = 'gelu'
             else:
                 pre_activation_func = None
-            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func)
+            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func, aggregation=query_emb_aggregation)
         elif scoring_mode.startswith('cosine'):
             if 'gelu' in scoring_mode:
                 pre_activation_func = 'gelu'
             else:
                 pre_activation_func = None
-            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func, normalize=True)
+            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func, normalize=True, aggregation=query_emb_aggregation)
         else:
             return Scorer(self.d_model, scoring_mode)
 

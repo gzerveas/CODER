@@ -9,7 +9,6 @@ Requires:
 """
 
 import os
-import math
 import json
 import torch
 import logging
@@ -17,11 +16,11 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 from timeit import default_timer as timer
-from collections import namedtuple, defaultdict
 from transformers import BertTokenizer, BertConfig, AutoTokenizer, AutoModel
 from torch.utils.data import DataLoader, Dataset
 from dataset import CollectionDataset, pack_tensor_2D
-from modeling import RepBERT
+from modeling import RepBERT, _select_first_embedding, _average_sequence_embeddings
+from utils import readable_time
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format='%(asctime)s-%(levelname)s-%(name)s- %(message)s',
@@ -70,10 +69,8 @@ def load_queries(filepath):
 
 
 class MSMARCO_QueryDataset(Dataset):
-    def __init__(self, tokenized_filepath, max_query_length, tokenizer=None):
+    def __init__(self, tokenized_filepath, max_query_length, tokenizer):
         self.max_query_length = max_query_length
-        if tokenizer is None:
-            tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.queries = load_queries(tokenized_filepath)
         self.qids = list(self.queries.keys())
         self.cls_id = tokenizer.cls_token_id
@@ -123,13 +120,19 @@ class MSMARCO_DocDataset(Dataset):
         return ret_val
 
 
-def get_collate_function():
+def get_collate_function(model_type='repbert'):
+
+    if model_type == 'repbert':
+        mask_key_string = "valid_mask"
+    else:
+        mask_key_string = 'attention_mask'
+
     def collate_function(batch):
         input_ids_lst = [x["input_ids"] for x in batch]
         valid_mask_lst = [[1] * len(input_ids) for input_ids in input_ids_lst]
         data = {
             "input_ids": pack_tensor_2D(input_ids_lst, default=0, dtype=torch.int64),
-            "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
+            mask_key_string: pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
         }
         id_lst = [x['id'] for x in batch]
         return data, id_lst
@@ -144,15 +147,20 @@ def generate_embeddings(args, model, dataset):
 
     batch_size = args.per_gpu_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly  # TODO: So what?
-    collate_fn = get_collate_function()
+    if isinstance(model, RepBERT):
+        model_type = 'repbert'
+    else:  # This will be used for all HuggingFace models
+        model_type = 'huggingface'
+        aggregation_func = _select_first_embedding
+    collate_fn = get_collate_function(model_type)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)  # TODO: Why not more workers?
 
     # multi-gpu inference
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)  # automatically splits the batch into chunks for each process/GPU
     # Inference
-    logger.info("  Num examples = %d", len(dataset))
-    logger.info("  Batch size = %d", batch_size)
+    logger.info("Num examples: %d", len(dataset))
+    logger.info("Batch size: %d", batch_size)
 
     start = timer()
     for batch, ids in tqdm(dataloader, desc="Computing embeddings"):
@@ -160,11 +168,16 @@ def generate_embeddings(args, model, dataset):
         with torch.no_grad():
             batch = {k: v.to(args.device) for k, v in batch.items()}
             output = model(**batch)
-            sequence_embeddings = output.detach().cpu().numpy()
+            if model_type == 'huggingface':
+                sequence_embeddings = aggregation_func(output[0]).detach().cpu().numpy()
+            else:
+                # RepBERT already aggregates (averages) the embeddings, and only returns tensor
+                sequence_embeddings = output.detach().cpu().numpy()
+
             positions = [id2pos[identity] for identity in ids]
             embedding_memmap[positions] = sequence_embeddings
     end = timer()
-    logger.info("Done in {} sec".format(end - start))
+    logger.info("Done in {} hours, {} minutes, {} seconds\n".format(*readable_time(end - start)))
 
 
 if __name__ == "__main__":

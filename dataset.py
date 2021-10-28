@@ -131,7 +131,7 @@ class CandidatesDataset:
             memmap file on disk.
         :param load_to_memory: If true, will load entire candidates array as np.array to memory, instead of memmap!
             Needs ~2GB for MSMARCO training set (212MB for dev set) with 1000 candidates per query
-            (~XGB project total), but is faster.
+            (~XGB prigram total), but is faster.
         """
         # if max_docs is None:
         #     try:
@@ -315,6 +315,7 @@ class MYMARCO_Dataset(Dataset):
         self.documents_neutrality = None
         if collection_neutrality_path is not None:
             logger.info("Loading document neutrality scores ...")
+            # TODO: put this into separate function
             self.documents_neutrality = {}
             for l in open(collection_neutrality_path):
                 vals = l.strip().split('\t')
@@ -581,8 +582,6 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         # must be padded with -1 to have same dimensions as the transformer decoder output: (batch_size, max_docs_per_query)
         data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)  # no more than a couple of rel. documents per query exist, so even int8 could be used
 
-
-
     global collation_times
     collation_times.update(time.perf_counter() - start_collation_time)
 
@@ -726,6 +725,16 @@ class MSMARCODataset(Dataset):
 
 
 def pack_tensor_2D(lstlst, default, dtype, length=None):
+    """
+    Padds and/or truncates each sequence in the input list of sequences to the specified `length` or the max. sequence
+    length in the list. Padded values are filled with `default`.
+    :param lstlst: list of sequences to be packed into a tensor (batch)
+    :param default: constant value to be used as padding
+    :param dtype: type of tensor
+    :param length: constant output length of all sequences in the batch;
+        if None, the max. sequence length in `lstlst` will be used
+    :return: (len(lstlst), length) tensor of type dtype
+    """
     batch_size = len(lstlst)
     length = length if length is not None else max(len(l) for l in lstlst)
     tensor = torch.full((batch_size, length), default, dtype=dtype)

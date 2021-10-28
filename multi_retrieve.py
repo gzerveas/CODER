@@ -12,6 +12,8 @@ from multiprocessing import Pool, Manager
 from retrieve import get_embed_memmap
 from timeit import default_timer as timer
 
+logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
+logger = logging.getLogger()
 
 def raise_immediately(func):
     @wraps(func)
@@ -113,6 +115,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     num_docs = len(get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)[1])
+
     if args.per_gpu_doc_num is None:
         args.per_gpu_doc_num = math.ceil(num_docs / len(args.gpus))
 

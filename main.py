@@ -381,7 +381,7 @@ def evaluate(args, model, dataloader, fairrmetric=None):
     eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
     ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
 
-    ## evaluate fairness
+    ## evaluate fairness  # TODO: split into separate function
     if fairrmetric is not None:
         try:
             _retrievalresults = {}
@@ -575,11 +575,11 @@ def main(config):
     logger.info("Total number of parameters: {}".format(utils.count_parameters(model)))
     logger.info("Trainable parameters: {}".format(utils.count_parameters(model, trainable=True)))
 
-    model.to(args.device)
+    model.to(args.device)  # will also print model architecture, besides moving to GPU
 
     if args.task == "train":
         return train(args, model, eval_dataloader, tokenizer, fairrmetric=fairrmetric)
-    else:
+    elif args.task == "train":
         # Just evaluate trained model on some dataset (needs ~27GB for MS MARCO dev set)
 
         # only composite (non-repbert) models need to be loaded; repbert is already loaded at this point

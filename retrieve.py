@@ -1,5 +1,8 @@
+import sys
+
 import os
 import math
+import random
 import json
 import torch
 import logging
@@ -29,10 +32,34 @@ def get_embed_memmap(memmap_dir, dim):
     return embedding_memmap, id_memmap
 
 
+def print_memory_info(memmap, docs_per_chunk, device):
+    doc_chunk_size = sys.getsizeof(np.array(memmap[:docs_per_chunk]))/1024**2
+    logger.info("{} chunks of {} documents, each of approx. size {} MB, "
+                "will be loaded to the following device:".format(math.ceil(memmap.shape[0]/docs_per_chunk),
+                                                                 memmap.shape[0], math.ceil(doc_chunk_size)))
+
+    if device == 'cuda':
+        logger.info("Device: {}".format(torch.cuda.get_device_name(0)))
+        total_mem = torch.cuda.get_device_properties(0).total_memory/1024**2
+        logger.info("Total memory: {} MB".format(math.ceil(total_mem)))
+        reserved_mem = torch.cuda.memory_reserved(0)/1024**2
+        logger.info("Reserved memory: {} MB".format(math.ceil(reserved_mem)))
+        allocated_mem = torch.cuda.memory_allocated(0)/1024**2
+        logger.info("Allocated memory: {} MB".format(math.ceil(allocated_mem)))
+        free_mem = total_mem - allocated_mem
+        logger.info("Free memory: {} MB".format(math.ceil(free_mem)))
+        logger.warning("This device could potentially support "
+                       "`per_gpu_doc_num` up to {}".format(math.floor(args.per_gpu_doc_num*free_mem/doc_chunk_size)))
+    else:
+        logger.info("CPU")
+
+
 def allrank(args):
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
-    assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))
+    assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))  # NOTE: valid only for MSMARCO
+
+    print_memory_info(doc_embedding_memmap, args.per_gpu_doc_num, args.device)
 
     logger.info("Loading query embeddings memmap ...")
     query_embedding_memmap, query_id_memmap = get_embed_memmap(args.query_embedding_dir, args.embedding_dim)
@@ -45,8 +72,9 @@ def allrank(args):
         with open(args.query_ids, 'r') as f:
             query_list = [int(line.rstrip()) for line in f]
 
-    logger.info("{} found".format(len(query_list)))
+    logger.info("{} queries found".format(len(query_list)))
 
+    # PriorityQueue has a O(nlogn) insertion, and keeps elements sorted (in ascending order)
     results_dict = {qid: PriorityQueue(maxsize=args.hit) for qid in query_list}
 
     logger.info("Retrieving documents ...")
@@ -79,13 +107,17 @@ def allrank(args):
                 else:
                     cur_q_queue.put_nowait((score, docid))
 
-    score_path = f"{args.output_path}.score"    
-    with open(score_path, 'w') as outputfile:
-        for qid, docqueue in results_dict.items():
+    logger.info("Writing scores and ranks to file: {} ...".format(args.output_path))
+    with open(args.output_path, 'w') as outFile:
+        for qid, docqueue in tqdm(results_dict.items(), desc="Queries: "):
+            candidates_lst = []
             while not docqueue.empty():
                 score, docid = docqueue.get_nowait()
-                outputfile.write(f"{qid}\t{docid}\t{score}\n")
-    generate_rank(score_path, args.output_path)
+                candidates_lst.append((score, docid))
+            random.shuffle(candidates_lst)
+            candidates_lst = sorted(candidates_lst, key=lambda x: x[0], reverse=True)
+            for rank_idx, (score, doc_id) in enumerate(candidates_lst):
+                outFile.write("{}\t{}\t{}\t{}\n".format(qid, doc_id, rank_idx + 1, score))
 
 
 # def rerank(args):
@@ -268,7 +300,7 @@ if __name__ == "__main__":
 
     ## Required parameters
     parser.add_argument("--per_gpu_doc_num", default=1800000, type=int,
-                        help="Number of documents for each GPU. Reduce number in case of insufficient GPU memory.")
+                        help="Number of documents to be loaded on the single GPU. Reduce number in case of insufficient GPU memory.")
     parser.add_argument("--hit", type=int, default=1000)
     parser.add_argument("--embedding_dim", type=int, default=768)
     parser.add_argument("--output_path", type=str,
@@ -297,7 +329,9 @@ if __name__ == "__main__":
 
     # Setup CUDA, GPU 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.n_gpu = torch.cuda.device_count()
+    n_gpu = torch.cuda.device_count()
+    if n_gpu > 1:
+        logger.warning("Found {} GPUs, but only a single GPU will be used by this program.".format(n_gpu))
 
     args.device = device
 
@@ -309,3 +343,5 @@ if __name__ == "__main__":
             rerank3(args)
         else:
             allrank(args)
+
+    logger.info("Done!")

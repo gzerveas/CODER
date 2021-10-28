@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 def generate_rank(input_path, output_path):
+    """
+    Reads a file with scored candidate documents for each query, and writes a new file
+    which sorts candidates per query by score and replaces score with rank
+    """
     score_dict = defaultdict(list)
     for line in open(input_path):
         query_id, para_id, score = line.split("\t")
