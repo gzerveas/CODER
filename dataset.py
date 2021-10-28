@@ -49,7 +49,7 @@ class CollectionDataset:
         :param ind: integer index of passage/doc in collection
         :return: list (unpadded) of token IDs corresponding to ind
         """
-        assert self.pids[ind] == ind  # TODO: pids happen to be stored as 0, 1, 2, ... in collection.tsv.
+        assert self.pids[ind] == ind  # NOTE: pids happen to be stored as 0, 1, 2, ... in collection.tsv of MSMARCO
         return self.token_ids[ind, :self.lengths[ind]].tolist()
 
 

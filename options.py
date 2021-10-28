@@ -15,7 +15,11 @@ def run_parse_args():
     ## Run from config file
     parser.add_argument('--config', dest='config_filepath',
                         help='Configuration .json file (optional, typically *instead* of command line arguments). '
-                             'Overwrites existing command-line args!')
+                             'Existing options inside this file overwrite existing command-line args and defaults, '
+                             'except for the ones defined by `override`!')
+    parser.add_argument('--override', type=str,
+                        help="Optional, to be used with `config`. A string in the format of a python dict, with keys the options "
+                             "which should be overriden in the configuration .json file, e.g. {'task':'inspect'}")
     ## Experiment
     parser.add_argument('--name', dest='experiment_name', type=str, default='',
                         help='A string identifier/name for the experiment to be run '
@@ -23,11 +27,15 @@ def run_parse_args():
     parser.add_argument('--comment', type=str, default='', help='A comment/description of the experiment')
     parser.add_argument('--no_timestamp', action='store_true',
                         help='If set, a timestamp and random suffix will not be appended to the output directory name')
-    parser.add_argument("--task", choices=["train", "dev", "eval"], default=None,
-                        help="'train' is used to train the model (and validate on a validation set specified by `eval_candidates_path`). "
+    parser.add_argument("--task", choices=["train", "dev", "eval", "inspect"], default=None,
+                        help="'train' is used to train the model (and validate on a validation set specified by `eval_candidates_path`).\n"
                              "'dev' is used for evaluation when labels are available: this allows to calculate metrics, "
-                             "plot histograms, inject ground truth relevant document in set of candidates to be reranked. "
-                             "'eval' mode is used for evaluation ONLY if no labels are available.")
+                             "plot histograms, inject ground truth relevant document in set of candidates to be reranked.\n"
+                             "'eval' mode is used for evaluation ONLY if NO labels are available.\n"
+                             "'inspect' is used to interactively examine an existing ranked candidates file/memmap "
+                             "specified by `eval_candidates_path`, together with "
+                             "the respective original queries and documents, reconstructed tokenizations, embeddings, "
+                             "ground truth relevant documents, etc")
     parser.add_argument('--resume', action='store_true',
                         help='Used together with `load_model`. '
                              'If set, will load `start_step` and state of optimizer, scheduler besides model weights.')
@@ -35,8 +43,6 @@ def run_parse_args():
     ## I/O
     parser.add_argument('--output_dir', type=str, default='./output',
                         help='Root output directory. Must exist. Time-stamped directories will be created inside.')
-    # parser.add_argument("--msmarco_dir", type=str, default="~/data/MS_MARCO",  # TODO: remove
-    #                     help="OBSOLETE! Here only for compatibility. Directory where qrels, queries files can be found")
     parser.add_argument("--qrels_path", type=str,
                         help="Path of the text file or directory with the ground truth relevance labels, qrels")
     parser.add_argument("--train_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv",
@@ -48,7 +54,11 @@ def run_parse_args():
                              "embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs")
     parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",  # TODO: rename "queries_path"
                         help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file.")
-    parser.add_argument("--collection_memmap_dir", type=str, default="./data/collection_memmap", help="RepBERT only!")  # RepBERT only
+    parser.add_argument("--raw_queries_path", type=str,
+                        help=".tsv file which contains raw text queries (ID <tab> text). Used only for 'inspect' mode.")
+    parser.add_argument("--raw_collection_path", type=str,
+                        help=".tsv file which contains raw text documents (ID <tab> text). Used only for 'inspect' mode.")
+    parser.add_argument("--collection_memmap_dir", type=str, help="RepBERT or 'inspect' mode only!")  # RepBERT only
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
     parser.add_argument('--load_model', dest='load_model_path', type=str, help='Path to pre-trained model.')
     # The following are currently used only if `model_type` is NOT 'repbert'
@@ -231,10 +241,15 @@ def run_parse_args():
     args = parser.parse_args()
 
     if (args.task is None) and (args.config_filepath is None):
-        raise ValueError('Please specify task! (train, dev, eval)')
+        raise ValueError('Please specify task! (train, dev, eval, inspect)')
 
-    # if (args.task != 'eval') and (args.qrels_path is None):
-    #     logger.warning("Will use `args.msmarco_dir` to find qrels in args.msmarco_dir/qrels.{}.tsv !".format(args.task))
+    if args.task == 'inspect':
+        args.inject_ground_truth = False
+        logger.info("Ground truth documents will not be injected among candidates, because `task == 'inspect'`")
+        if args.raw_queries_path is None:
+            logger.warning("You must set `raw_queries_path` to inspect original queries.")
+        if args.raw_collection_path is None:
+            logger.warning("You must set `raw_collection_path` to inspect original documents.")
 
     # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
     components = args.key_metric.split('@')

@@ -207,7 +207,8 @@ def load_config(args):
     """
     Returns a dictionary with the full experiment configuration settings.
     If a json file is specified with `--config`, its contents will overwrite the defaults or other arguments as
-    extracted by argparse.
+    extracted by argparse. If `--override '{'opt1':val1, 'opt2':val2}'` is used, then the dict-style formatted string
+    will be used to override specified options.
     """
 
     config = args.__dict__  # configuration dictionary
@@ -222,6 +223,9 @@ def load_config(args):
             logger.critical("Failed to load configuration file. Check JSON syntax and verify that files exist")
             traceback.print_exc()
             sys.exit(1)
+        if args.override is not None:
+            override_dict = eval(args.override)  # options to override
+            config.update(override_dict)
 
     return config
 

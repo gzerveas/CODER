@@ -485,6 +485,116 @@ def evaluate_slow(args, model, dataloader, mode, prefix='model'):
         return mrr
 
 
+def inspect(args, model, dataloader):
+    """
+    Interactively examine an existing ranking of candidates by the specified model, alongside with the respective
+    original queries and documents, reconstructed tokenizations, embeddings, ground truth relevant documents, etc"
+    """
+    qrels = dataloader.dataset.qrels  # dict{qID: dict{pID: relevance}}
+    labels_exist = qrels is not None
+
+    # num_docs is the (potentially variable) number of candidates per query
+    relevances = []  # (total_num_queries) list of (num_docs) lists with non-zeros at the indices corresponding to actually relevant passages
+    num_relevant = []  # (total_num_queries) list of number of ground truth relevant documents per query
+    df_chunks = []  # (total_num_queries) list of dataframes, each with index a single qID and corresponding (num_docs) columns PID, rank, score
+    query_time = 0  # average time for the model to score candidates for a single query
+    total_loss = 0  # total loss over dataset
+
+    # rankfile = open(os.path.join(args.pred_dir, "debug_ranking.tsv"), 'w')  # TODO: REMOVE
+
+    with torch.no_grad():
+        for batch_data, qids, docids in tqdm(dataloader, desc="Evaluating"):
+            batch_data = {k: v.to(args.device) for k, v in batch_data.items()}
+            start_time = time.perf_counter()
+            out = model(**batch_data)
+            query_time += time.perf_counter() - start_time
+            rel_scores = out['rel_scores'].detach().cpu().numpy()  # (batch_size, num_docs) relevance scores in [0, 1]
+            if 'loss' in out:
+                total_loss += out['loss'].sum().item()
+            assert len(qids) == len(docids) == len(rel_scores)
+
+            # Rank documents based on their scores
+            num_docs_per_query = [len(cands) for cands in docids]
+            num_lengths = set(num_docs_per_query)
+            no_padding = (len(num_lengths) == 1)  # whether all queries in this batch had the same number of candidates
+
+            if no_padding:  # (only) 10% speedup compared to other case
+                docids_array = np.array(docids, dtype=np.int32)  # (batch_size, num_docs) array of docIDs per query
+                # First shuffle along doc dimension, because relevant document(s) are placed at the beginning and would benefit
+                # in case of score ties! (can happen e.g. with saturating score functions)
+                inds = np.random.permutation(rel_scores.shape[1])
+                np.take(rel_scores, inds, axis=1, out=rel_scores)
+                np.take(docids_array, inds, axis=1, out=docids_array)
+
+                # Sort by descending relevance
+                inds = np.fliplr(np.argsort(rel_scores, axis=1))  # (batch_size, num_docs) inds to sort rel_scores
+                # (batch_size, num_docs) docIDs per query, in order of descending relevance score
+                ranksorted_docs = np.take_along_axis(docids_array, inds, axis=1)
+                sorted_scores = np.take_along_axis(rel_scores, inds, axis=1)
+            else:
+                # (batch_size) iterables of docIDs and scores per query, in order of descending relevance score
+                ranksorted_docs, sorted_scores = zip(*(map(rank_docs, docids, rel_scores)))
+
+            # extend by batch_size elements
+            df_chunks.extend(pd.DataFrame(data={"PID": ranksorted_docs[i],
+                                                "rank": list(range(1, len(docids[i])+1)),
+                                                "score": sorted_scores[i]},
+                                          index=[qids[i]]*len(docids[i])) for i in range(len(qids)))
+
+            # for qid, docid_list, score_list in zip(qids, ranksorted_docs, sorted_scores):  # TODO: REMOVE
+            #     rank = 1
+            #     for docid, score in zip(docid_list, score_list):
+            #         rankfile.write("{}\t{}\t{}\t{}\n".format(qid, docid, rank, score))
+            #         rank += 1
+
+            if labels_exist:
+                relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
+                num_relevant.extend(len(qrels[qid]) for qid in qids)
+
+    if labels_exist:
+        try:
+            eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k)  # aggr. metrics for the entire dataset
+        except:
+            logger.error('Metrics calculation failed!')
+            eval_metrics = OrderedDict()
+        eval_metrics['loss'] = total_loss / len(dataloader.dataset)  # average over samples
+    else:
+        eval_metrics = OrderedDict()
+    eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
+    ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
+
+    ## evaluate fairness  # TODO: split into separate function
+    if fairrmetric is not None:
+        try:
+            _retrievalresults = {}
+            for _item in df_chunks:
+                _qid = _item.index[0]
+                _retrievalresults[_qid] = _item['PID'].tolist()
+
+            eval_FaiRR, eval_NFaiRR = fairrmetric.calc_FaiRR_retrievalresults(retrievalresults=_retrievalresults)
+
+            #for _cutoff in eval_FaiRR:
+            #    eval_metrics['FaiRR_cutoff_%d' % _cutoff] = eval_FaiRR[_cutoff]
+            for _cutoff in eval_FaiRR:
+                eval_metrics['NFaiRR_cutoff_%d' % _cutoff] = eval_NFaiRR[_cutoff]
+        except:
+            logger.error('Fairness metrics calculation failed!')
+
+    if labels_exist and (args.debug or args.task != 'train'):
+        try:
+            rs = (np.nonzero(r)[0] for r in relevances)
+            ranks = [1 + int(r[0]) if r.size else 1e10 for r in rs]  # for each query, what was the rank of the rel. doc
+            freqs, bin_edges = np.histogram(ranks, bins=[1, 5, 10, 20, 30] + list(range(50, 1050, 50)))
+            bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i+1])
+                          for i in range(len(bin_edges)-1)] + ["[{}, inf)".format(bin_edges[-1])]
+            logger.info('\nHistogram of ranks for the ground truth documents:\n')
+            utils.ascii_bar_plot(bin_labels, freqs, width=50, logger=logger)
+        except:
+            logger.error('Not possible!')
+
+    return eval_metrics, ranked_df
+
+
 def main(config):
 
     args = utils.dict2obj(config)  # Convert config dict to args object
@@ -532,12 +642,14 @@ def main(config):
     # Load evaluation set and initialize evaluation dataloader
     if args.task == 'train':
         eval_mode = 'dev'  # 'eval' here is the name of the MSMARCO test set, 'dev' is the validation set
+    elif args.task == 'inspect':
+        eval_mode = 'dev'
     else:
         eval_mode = args.task
 
     logger.info("Preparing {} dataset ...".format(eval_mode))
     start_time = time.time()
-    eval_dataset = get_dataset(args, eval_mode, tokenizer) # CHANGED here from eval_mode
+    eval_dataset = get_dataset(args, eval_mode, tokenizer)  # CHANGED here from eval_mode
     collate_fn = eval_dataset.get_collate_func(n_gpu=args.n_gpu)
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
 
@@ -579,7 +691,7 @@ def main(config):
 
     if args.task == "train":
         return train(args, model, eval_dataloader, tokenizer, fairrmetric=fairrmetric)
-    elif args.task == "train":
+    else:
         # Just evaluate trained model on some dataset (needs ~27GB for MS MARCO dev set)
 
         # only composite (non-repbert) models need to be loaded; repbert is already loaded at this point
@@ -593,6 +705,11 @@ def main(config):
             model = torch.nn.DataParallel(model, device_ids=args.cuda_ids)
 
         model.eval()
+        if args.task == 'inspect':
+            # Interactive inspection
+            inspect() # TODO: DEVELOP HERE
+            return
+        # Run evaluation
         eval_start_time = time.time()
         eval_metrics, ranked_df = evaluate(args, model, eval_dataloader, fairrmetric=fairrmetric)
         eval_runtime = time.time() - eval_start_time
@@ -627,7 +744,7 @@ def setup(args):
 
     config = utils.load_config(args)  # configuration dictionary
 
-    # Create output directory
+    # Create output directory and subdirectories
     initial_timestamp = datetime.now()
     output_dir = config['output_dir']
     if not os.path.isdir(output_dir):

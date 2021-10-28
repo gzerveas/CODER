@@ -3,8 +3,8 @@ Creates memmap arrays (a triad of files) of:
     1) integer document IDs and respective integer *token IDs*
     2) integer query IDs and respective (retrieved) *document IDs*
 The collection memmap triad is processed by `precompute.py` to obtain document vector embeddings/representations, which
-are necessary for training and evaluation of the retrieval model.
-The query_ID -> candidate_doc_IDs memmap triad is necessary for training the retrieval model.
+are necessary for training and evaluation of the retrieval model (and are stored in another memmap).
+The query_ID -> candidate_doc_IDs memmap triad is necessary for training the retrieval model (and can be used for reranking).
 """
 
 import os
