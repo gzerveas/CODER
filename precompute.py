@@ -19,7 +19,7 @@ from timeit import default_timer as timer
 from transformers import BertTokenizer, BertConfig, AutoTokenizer, AutoModel
 from torch.utils.data import DataLoader, Dataset
 from dataset import CollectionDataset, pack_tensor_2D
-from modeling import RepBERT, _select_first_embedding, _average_sequence_embeddings
+from modeling import RepBERT, _select_first_embedding, _average_sequence_embeddings, get_aggregation_function
 from utils import readable_time
 
 logger = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ def generate_embeddings(args, model, dataset):
         model_type = 'repbert'
     else:  # This will be used for all HuggingFace models
         model_type = 'huggingface'
-        aggregation_func = _select_first_embedding
+        aggregation_func = get_aggregation_function(args.aggregation)
     collate_fn = get_collate_function(model_type)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)  # TODO: Why not more workers?
 
@@ -202,6 +202,8 @@ if __name__ == "__main__":
     #                     set, it is a string used to initialize one of the built-in HuggingFace tokenizers.""")
     parser.add_argument("--max_query_length", type=int, default=32)
     parser.add_argument("--max_doc_length", type=int, default=256)
+    parser.add_argument("--aggregation", type=str, choices=['first', 'mean'], default='first',
+                        help="How to aggregate individual token embeddings")
     parser.add_argument("--per_gpu_batch_size", default=100, type=int)
     args = parser.parse_args()
 

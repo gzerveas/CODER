@@ -1,4 +1,5 @@
 import logging
+
 logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
 logger.info("Loading packages ...")
@@ -23,12 +24,13 @@ from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel,
 
 # Package modules
 from options import *
-from modeling import RepBERT_Train, MDSTransformer, get_loss_module
-from dataset import MYMARCO_Dataset, MSMARCODataset
+from modeling import RepBERT_Train, MDSTransformer, get_loss_module, get_aggregation_function
+from dataset import MYMARCO_Dataset, MSMARCODataset, load_original_sequences, EmbeddedSequences
+from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
 from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiScheduler
 import utils
 import metrics
-from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
+
 from fair_retrieval.metrics_FaiRR import FaiRRMetric, FaiRRMetricHelper
 
 val_times = utils.Timer()  # stores measured validation times
@@ -109,12 +111,23 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
     if start_step >= total_training_steps:
         logger.error("The loaded model has been already trained for {} steps ({} epochs), "
                      "while specified `num_epochs` is {} (total steps {})".format(start_epoch, start_step,
-                                                                                  args.num_epochs, total_training_steps))
+                                                                                  args.num_epochs,
+                                                                                  total_training_steps))
         sys.exit(1)
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=args.cuda_ids)
+
+    # Initialize performance tracking and evaluate model before training
+    best_value = 1e16 if args.key_metric in NEG_METRICS else -1e16  # initialize with +inf or -inf depending on key metric
+    running_metrics = []  # (for validation) list of lists: for every evaluation, stores metrics like loss, MRR, MAP, ...
+    best_metrics = {}
+
+    logger.info("\n\n***** Initial evaluation on dev set *****".format(global_step))
+    val_metrics, best_metrics, best_value = validate(args, model, val_dataloader, tb_writer, best_metrics, best_value, global_step, fairrmetric=fairrmetric)
+    metrics_names, metrics_values = zip(*val_metrics.items())
+    running_metrics.append(list(metrics_values))
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
@@ -126,11 +139,6 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                 train_batch_size * args.grad_accum_steps)
     logger.info("Gradient Accumulation steps: %d", args.grad_accum_steps)
     logger.info("Total optimization steps: %d", total_training_steps)
-
-    best_value = 1e16 if args.key_metric in NEG_METRICS else -1e16  # initialize with +inf or -inf depending on key metric
-    running_metrics = []  # (for validation) list of lists: for every evaluation, stores metrics like loss, MRR, MAP, ...
-    best_metrics = {}
-    # val_metrics = {metric_name: 1e16 if metric_name in NEG_METRICS else -1e16 for metric_name in METRICS}
 
     train_loss = 0  # this is the training loss accumulated from the beginning of training
     logging_loss = 0  # this is synchronized with `train_loss` every args.logging_steps
@@ -188,8 +196,9 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                     if args.debug:
                         logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
                         logger.debug("Learning rate(s): {}".format(scheduler.get_last_lr()))
-                        logger.debug("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
-                                                                                   np.round(utils.get_current_memory_usage2())))
+                        logger.debug(
+                            "Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
+                                                                          np.round(utils.get_current_memory_usage2())))
                         logger.debug("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
                         logger.debug("Average lookup time: {} s /samp".format(lookup_times.get_average()))
@@ -197,7 +206,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                         logger.debug("Average prep. docids time: {} s /samp".format(prep_docids_times.get_average()))
                         logger.debug("Average sample fetching time: {} s /samp".format(sample_fetching_times.get_average()))
                         logger.debug("Average collation time: {} s /batch".format(collation_times.get_average()))
-                        logger.debug("Average total batch processing time: {} s /batch".format(batch_times.get_average()))
+                        logger.debug(
+                            "Average total batch processing time: {} s /batch".format(batch_times.get_average()))
 
                         logger.debug("Score parameters: {}".format(score_params))  # TODO: DEBUG
 
@@ -236,7 +246,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
 
     avg_batch_time = batch_times.total_time / (epoch_idx * epoch_steps + step + 1)
     logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec"
-                " ({:.6f}s per sample)".format(train_batch_size, avg_batch_time, avg_batch_time/train_batch_size))
+                " ({:.6f}s per sample)".format(train_batch_size, avg_batch_time, avg_batch_time / train_batch_size))
     logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec".format(train_batch_size, batch_times.get_average()))
     logger.info('Best {} was {}. Other metrics: {}'.format(args.key_metric, best_value, best_metrics))
 
@@ -355,9 +365,9 @@ def evaluate(args, model, dataloader, fairrmetric=None):
 
             # extend by batch_size elements
             df_chunks.extend(pd.DataFrame(data={"PID": ranksorted_docs[i],
-                                                "rank": list(range(1, len(docids[i])+1)),
+                                                "rank": list(range(1, len(docids[i]) + 1)),
                                                 "score": sorted_scores[i]},
-                                          index=[qids[i]]*len(docids[i])) for i in range(len(qids)))
+                                          index=[qids[i]] * len(docids[i])) for i in range(len(qids)))
 
             # for qid, docid_list, score_list in zip(qids, ranksorted_docs, sorted_scores):  # TODO: REMOVE
             #     rank = 1
@@ -391,10 +401,10 @@ def evaluate(args, model, dataloader, fairrmetric=None):
 
             eval_FaiRR, eval_NFaiRR = fairrmetric.calc_FaiRR_retrievalresults(retrievalresults=_retrievalresults)
 
-            #for _cutoff in eval_FaiRR:
+            # for _cutoff in eval_FaiRR:
             #    eval_metrics['FaiRR_cutoff_%d' % _cutoff] = eval_FaiRR[_cutoff]
             for _cutoff in eval_FaiRR:
-                eval_metrics['NFaiRR_cutoff_%d' % _cutoff] = eval_NFaiRR[_cutoff]    
+                eval_metrics['NFaiRR_cutoff_%d' % _cutoff] = eval_NFaiRR[_cutoff]
         except:
             logger.error('Fairness metrics calculation failed!')
 
@@ -403,8 +413,8 @@ def evaluate(args, model, dataloader, fairrmetric=None):
             rs = (np.nonzero(r)[0] for r in relevances)
             ranks = [1 + int(r[0]) if r.size else 1e10 for r in rs]  # for each query, what was the rank of the rel. doc
             freqs, bin_edges = np.histogram(ranks, bins=[1, 5, 10, 20, 30] + list(range(50, 1050, 50)))
-            bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i+1])
-                          for i in range(len(bin_edges)-1)] + ["[{}, inf)".format(bin_edges[-1])]
+            bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i + 1])
+                          for i in range(len(bin_edges) - 1)] + ["[{}, inf)".format(bin_edges[-1])]
             logger.info('\nHistogram of ranks for the ground truth documents:\n')
             utils.ascii_bar_plot(bin_labels, freqs, width=50, logger=logger)
         except:
@@ -444,7 +454,6 @@ def get_relevances(gt_relevant, candidates, max_docs=None):
 
 
 def calculate_metrics(relevances, num_relevant, k):
-
     eval_metrics = OrderedDict([('MRR@{}'.format(k), metrics.mean_reciprocal_rank(relevances, k)),
                                 ('MAP@{}'.format(k), metrics.mean_average_precision(relevances, k)),
                                 ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
@@ -488,8 +497,27 @@ def evaluate_slow(args, model, dataloader, mode, prefix='model'):
 def inspect(args, model, dataloader):
     """
     Interactively examine an existing ranking of candidates by the specified model, alongside with the respective
-    original queries and documents, reconstructed tokenizations, embeddings, ground truth relevant documents, etc"
+    original queries and documents, reconstructed tokenizations, embeddings, ground truth relevant documents,
+    and a (raw .tsv) reference ranked candidates file, which may or may not correspond to the same ranking
+    as `eval_candidates_path`
     """
+
+    QUERY_LENGTH = args.max_query_length
+    DOC_LENGTH = args.max_doc_length
+    DISPLAY_DOCS = 10
+    ERROR_TOLERANCE = 1e-4
+    np.set_printoptions(linewidth=200)
+    torch.set_printoptions(linewidth=200)
+    pd.options.display.width = 400  # will automatically detect console width
+    pd.set_option('display.max_colwidth', 0)
+
+    # Modify existing console handler
+    logging.getLogger().removeHandler(logging.getLogger().handlers[0])
+    console_handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
     qrels = dataloader.dataset.qrels  # dict{qID: dict{pID: relevance}}
     labels_exist = qrels is not None
 
@@ -499,8 +527,18 @@ def inspect(args, model, dataloader):
     df_chunks = []  # (total_num_queries) list of dataframes, each with index a single qID and corresponding (num_docs) columns PID, rank, score
     query_time = 0  # average time for the model to score candidates for a single query
     total_loss = 0  # total loss over dataset
+    error_queries = []
+    error_docs = []
 
-    # rankfile = open(os.path.join(args.pred_dir, "debug_ranking.tsv"), 'w')  # TODO: REMOVE
+    logger.info("Loading raw queries ...")
+    query_dict = load_original_sequences(args.raw_queries_path)
+    logger.info("Loading raw documents ...")
+    doc_dict = load_original_sequences(args.raw_collection_path)
+
+    if args.query_emb_memmap_dir:
+        logger.info("Loading query embeddings from '{}' ...".format(args.query_emb_memmap_dir))
+        query_embeddings = EmbeddedSequences(embedding_memmap_dir=args.query_emb_memmap_dir, seq_type='query')
+    aggregation_func = get_aggregation_function(args.query_aggregation)
 
     with torch.no_grad():
         for batch_data, qids, docids in tqdm(dataloader, desc="Evaluating"):
@@ -512,6 +550,11 @@ def inspect(args, model, dataloader):
             if 'loss' in out:
                 total_loss += out['loss'].sum().item()
             assert len(qids) == len(docids) == len(rel_scores)
+
+            # Calculate and extract encoder final query representations
+            encoder_out = model.encoder(batch_data['query_token_ids'].to(torch.int64),
+                                        attention_mask=batch_data['query_token_ids'])
+            enc_hidden_states = encoder_out['last_hidden_state']  # (batch_size, max_query_len, query_dim)
 
             # Rank documents based on their scores
             num_docs_per_query = [len(cands) for cands in docids]
@@ -536,20 +579,144 @@ def inspect(args, model, dataloader):
                 ranksorted_docs, sorted_scores = zip(*(map(rank_docs, docids, rel_scores)))
 
             # extend by batch_size elements
-            df_chunks.extend(pd.DataFrame(data={"PID": ranksorted_docs[i],
-                                                "rank": list(range(1, len(docids[i])+1)),
-                                                "score": sorted_scores[i]},
-                                          index=[qids[i]]*len(docids[i])) for i in range(len(qids)))
-
-            # for qid, docid_list, score_list in zip(qids, ranksorted_docs, sorted_scores):  # TODO: REMOVE
-            #     rank = 1
-            #     for docid, score in zip(docid_list, score_list):
-            #         rankfile.write("{}\t{}\t{}\t{}\n".format(qid, docid, rank, score))
-            #         rank += 1
+            batch_dfs = [pd.DataFrame(data={"PID": ranksorted_docs[i],
+                                            "rank": list(range(1, len(docids[i]) + 1)),
+                                            "score": sorted_scores[i]},
+                                      index=[qids[i]] * len(docids[i])) for i in range(len(qids))]
+            df_chunks.extend(batch_dfs)
 
             if labels_exist:
                 relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
                 num_relevant.extend(len(qrels[qid]) for qid in qids)
+
+            # Display input and output information for retrieval on each query
+            for i in range(len(qids)):  # iterate over batch_size
+                # Check integrity of queries
+                query_ok = True
+                logger.info("Query ID: {}".format(qids[i]))
+                logger.info("Original Text: {}".format(query_dict[qids[i]]))
+
+                logger.debug("Input query token IDs (as in '{}'):\n{}".format(args.tokenized_path,
+                                                                              batch_data['query_token_ids'][i, :]))
+                logger.debug("Rec. input query tokens:\n{}".format(
+                    dataloader.dataset.tokenizer.convert_ids_to_tokens(batch_data['query_token_ids'][i, :])))
+                start_time = time.perf_counter()
+                tokenized_query = dataloader.dataset.tokenizer([query_dict[qids[i]]], padding=True, return_tensors="pt")
+                tokenization_time = time.perf_counter() - start_time
+                logger.debug("Time to tokenize: {} s".format(tokenization_time))
+                tokenized_query = {k: v.to(args.device) for k, v in tokenized_query.items()}
+                qtokenized_ids = tokenized_query["input_ids"][0]
+                logger.debug("Tokenized query IDs: {}".format(qtokenized_ids))
+                qtokenized_tokens = dataloader.dataset.tokenizer.convert_ids_to_tokens(qtokenized_ids)
+                logger.debug("Query tokens: {}".format(qtokenized_tokens))
+
+                if not (torch.equal(qtokenized_ids, batch_data['query_token_ids'][i, :len(qtokenized_ids)])):
+                    logger.warning("Tokenization error!")
+                    query_ok = False
+
+                query_emb_model = aggregation_func(enc_hidden_states)[i, :]  # .detach().cpu().numpy()
+                logger.debug("Query embedding (inside model):\n{}".format(query_emb_model))
+                encoder_out2 = model.encoder(**tokenized_query)  # using currently tokenized query
+                query_emb_model2 = aggregation_func(encoder_out2[0])  # [0] selects 'encoder_hidden_states'
+                L2_diff = torch.linalg.norm(query_emb_model - query_emb_model2).detach().cpu().numpy()
+                if L2_diff > ERROR_TOLERANCE:
+                    logger.warning("Query embedding as calculated from pre-tokenized query inside model differs from "
+                                   "the embedding as calculated directly by encoder! L2-norm of difference: {}".format(L2_diff))
+                    logger.debug("Query embedding (directly from encoder):\n{}".format(query_emb_model2))
+                    query_ok = False
+
+                if args.query_emb_memmap_dir:
+                    loaded_query_emb = torch.Tensor(query_embeddings[[qids[i]]]).to(args.device)
+                    logger.debug(
+                        "Loaded query embedding (from '{}'):\n{}".format(args.query_emb_memmap_dir, loaded_query_emb))
+                    L2_diff2 = torch.linalg.norm(query_emb_model2 - loaded_query_emb).detach().cpu().numpy()
+                    if L2_diff2 > ERROR_TOLERANCE:
+                        logger.warning("Query embedding as calculated directly by encoder differs from "
+                                       "the embedding as loaded from '{}'! L2-norm of difference: {}".format(
+                            args.query_emb_memmap_dir, L2_diff2))
+                        query_ok = False
+
+                if not query_ok:
+                    error_queries.append(qids[i])
+
+                # Check integrity of documents and scores
+                # Checks DISPLAY_DOCS top and bottom candidate docs, and ground-truth relevant docs, if they exist
+                docs_df = batch_dfs[i]  # df with PIDs, ranks, scores for a single qID
+                ranksorted_docids = list(ranksorted_docs[i])
+                docs_text = [doc_dict[did] for did in ranksorted_docids]  # list of candidate doc texts (for 1 query)
+                docs_df['text'] = docs_text
+                docs_df['text'] = docs_df['text'].str.wrap(200)  # to set max line width for text (wrap)
+                docs_to_check_text = []  # list of candidate doc texts to be checked
+                docs_to_check_ids = []  # list of candidate doc IDs to be checked
+
+                if labels_exist:
+                    gt_docids = list(qrels[qids[i]].keys())
+                    gt_doc_text = []
+                    logger.info("Ground truth relevant document(s): ")
+                    for d, did in enumerate(gt_docids):
+                        print("{}: DocID:{:8}: {}\n".format(d, did, doc_dict[did]))
+                        gt_doc_text.append(doc_dict[did])
+                    docs_to_check_text = gt_doc_text
+                    docs_to_check_ids = gt_docids
+
+                logger.info("Top-Scored candidates:\n{}\n".format(docs_df.iloc[:DISPLAY_DOCS]))
+                logger.info("Bottom-Scored candidates:\n{}\n".format(docs_df.iloc[-DISPLAY_DOCS:]))
+
+                docs_to_check_text += docs_text[:DISPLAY_DOCS] + docs_text[-DISPLAY_DOCS:]
+                docs_to_check_ids += ranksorted_docids[:DISPLAY_DOCS] + ranksorted_docids[-DISPLAY_DOCS:]
+                start_time = time.perf_counter()
+                tokenized_docs = dataloader.dataset.tokenizer(docs_to_check_text, max_length=DOC_LENGTH, padding=True, return_tensors="pt")
+                tokenization_time = time.perf_counter() - start_time
+                logger.debug("Time to tokenize {} documents: {} s".format(len(docs_to_check_text), tokenization_time))
+
+                logger.debug("Doc tokens:\n")
+                for j in range(tokenized_docs["input_ids"].shape[0]):
+                    doc_tokens = dataloader.dataset.tokenizer.convert_ids_to_tokens(tokenized_docs["input_ids"][j])
+                    logger.debug("{:8}: {}\n".format(docs_to_check_ids[j], doc_tokens))
+
+                tokenized_docs = {k: v.to(args.device) for k, v in tokenized_docs.items()}
+                model_out = model.encoder(**tokenized_docs)
+                doc_emb_model = aggregation_func(model_out[0])  # (num_check_docs, d_emb) . [0] selects 'encoder_hidden_states'
+                loaded_doc_emb = torch.Tensor(dataloader.dataset.emb_collection[docs_to_check_ids]).to(args.device)  # (num_check_docs, d_emb)
+                abs_diffs = torch.abs(doc_emb_model - loaded_doc_emb)
+                max_abs_diff = torch.max(abs_diffs)
+
+                if max_abs_diff > ERROR_TOLERANCE:
+                    logger.warning("Doc embeddings as computed directly by model differ from "
+                                   "the embeddings as loaded from '{}'! Max. abs. difference: {}".format(args.embedding_memmap_dir, max_abs_diff))
+                    logger.debug("Loaded doc embeddings (from '{}'):\n{}".format(args.embedding_memmap_dir, loaded_doc_emb))
+                    logger.debug("Computed doc embeddings:\n{}".format(doc_emb_model))
+                    error_inds = abs_diffs > ERROR_TOLERANCE
+                    logger.debug("{} / {} elements have an absolute "
+                                 "difference larger than {}".format(torch.sum(error_inds), torch.numel(doc_emb_model), ERROR_TOLERANCE))
+
+                # Compare scores between MDST model output and computed encoder scores (emb. dot product)
+                docs_to_check_inds = list(np.nonzero(relevances[i])[0]) if labels_exist else []  # insert indices of gt documents
+                docs_to_check_inds += list(range(DISPLAY_DOCS)) + list(range(-DISPLAY_DOCS, 0, 1))
+                model_scores = sorted_scores[i][docs_to_check_inds]  # scores as calculated in MDST model
+                encoder_scores = torch.matmul(query_emb_model2, doc_emb_model.T).detach().cpu().numpy()  # encoder scores (emb. dot product)
+                # encoder_scores = torch.matmul(query_emb_model2, loaded_doc_emb.T).detach().cpu().numpy()  # encoder scores (emb. dot product)
+                abs_diffs = np.abs(model_scores - encoder_scores)
+                max_abs_diff = np.max(abs_diffs)
+
+                if max_abs_diff > ERROR_TOLERANCE:
+                    logger.warning("Scores as computed directly by encoder model (dot product) differ from "
+                                   "the scores in the output of MDST model. Max. abs. difference: {}".format(max_abs_diff))
+                    logger.debug("Scores in the output of MDST model:\n{}\n".format(model_scores))
+                    logger.debug("Scores computed by encoder model (query-doc emb. dot product):\n{}\n".format(encoder_scores))
+
+                print()
+                inp = input("Press any key to continue")
+
+    if len(error_queries):
+        logger.error(
+            "Errors found in {} out of {} ({:.3f}%) queries:\n{}".format(len(error_queries), len(dataloader.dataset.qids),
+                                                                         100*len(error_queries)/len(dataloader.dataset.qids),
+                                                                         error_queries))
+        for q in error_queries:
+            print("QID:{:7}: {}".format(q, query_dict[q]))
+    else:
+        logger.info("Queries all ok!")
 
     if labels_exist:
         try:
@@ -563,30 +730,13 @@ def inspect(args, model, dataloader):
     eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
     ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
 
-    ## evaluate fairness  # TODO: split into separate function
-    if fairrmetric is not None:
-        try:
-            _retrievalresults = {}
-            for _item in df_chunks:
-                _qid = _item.index[0]
-                _retrievalresults[_qid] = _item['PID'].tolist()
-
-            eval_FaiRR, eval_NFaiRR = fairrmetric.calc_FaiRR_retrievalresults(retrievalresults=_retrievalresults)
-
-            #for _cutoff in eval_FaiRR:
-            #    eval_metrics['FaiRR_cutoff_%d' % _cutoff] = eval_FaiRR[_cutoff]
-            for _cutoff in eval_FaiRR:
-                eval_metrics['NFaiRR_cutoff_%d' % _cutoff] = eval_NFaiRR[_cutoff]
-        except:
-            logger.error('Fairness metrics calculation failed!')
-
     if labels_exist and (args.debug or args.task != 'train'):
         try:
             rs = (np.nonzero(r)[0] for r in relevances)
             ranks = [1 + int(r[0]) if r.size else 1e10 for r in rs]  # for each query, what was the rank of the rel. doc
             freqs, bin_edges = np.histogram(ranks, bins=[1, 5, 10, 20, 30] + list(range(50, 1050, 50)))
-            bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i+1])
-                          for i in range(len(bin_edges)-1)] + ["[{}, inf)".format(bin_edges[-1])]
+            bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i + 1])
+                          for i in range(len(bin_edges) - 1)] + ["[{}, inf)".format(bin_edges[-1])]
             logger.info('\nHistogram of ranks for the ground truth documents:\n')
             utils.ascii_bar_plot(bin_labels, freqs, width=50, logger=logger)
         except:
@@ -596,7 +746,6 @@ def inspect(args, model, dataloader):
 
 
 def main(config):
-
     args = utils.dict2obj(config)  # Convert config dict to args object
 
     if args.debug:
@@ -615,7 +764,7 @@ def main(config):
             args.device = torch.device("cuda:%d" % args.cuda_ids[0])
     else:
         args.device = torch.device("cpu")
-    
+
     # Log current hardware setup
     logger.info("Device: %s, n_gpu: %s", args.device, args.n_gpu)
 
@@ -640,10 +789,8 @@ def main(config):
     tokenizer = get_tokenizer(args)
 
     # Load evaluation set and initialize evaluation dataloader
-    if args.task == 'train':
+    if args.task == 'train' or args.task == 'inspect':
         eval_mode = 'dev'  # 'eval' here is the name of the MSMARCO test set, 'dev' is the validation set
-    elif args.task == 'inspect':
-        eval_mode = 'dev'
     else:
         eval_mode = args.task
 
@@ -661,9 +808,8 @@ def main(config):
     logger.info("Number of {} samples: {}".format(eval_mode, len(eval_dataset)))
     logger.info("Batch size: %d", args.eval_batch_size)
 
-    
-    # initialize fairness 
-    fairrmetric = None 
+    # initialize fairness
+    fairrmetric = None
     if args.collection_neutrality_path is not None:
         logger.info("Loading FaiRRMetric ...")
         _fairrmetrichelper = FaiRRMetricHelper()
@@ -695,7 +841,7 @@ def main(config):
         # Just evaluate trained model on some dataset (needs ~27GB for MS MARCO dev set)
 
         # only composite (non-repbert) models need to be loaded; repbert is already loaded at this point
-        if args.model_type != 'repbert':
+        if args.load_model_path and (args.model_type != 'repbert'):
             model, global_step, _, _ = utils.load_model(model, args.load_model_path, device=args.device)
 
         logger.info("Will evaluate model on candidates in: {}".format(args.eval_candidates_path))
@@ -705,13 +851,14 @@ def main(config):
             model = torch.nn.DataParallel(model, device_ids=args.cuda_ids)
 
         model.eval()
-        if args.task == 'inspect':
-            # Interactive inspection
-            inspect() # TODO: DEVELOP HERE
-            return
         # Run evaluation
         eval_start_time = time.time()
-        eval_metrics, ranked_df = evaluate(args, model, eval_dataloader, fairrmetric=fairrmetric)
+        if args.task == 'inspect':
+            # Interactive inspection mode
+            logger.info("Interactive inspection mode")
+            eval_metrics, ranked_df = inspect(args, model, eval_dataloader)
+        else:
+            eval_metrics, ranked_df = evaluate(args, model, eval_dataloader, fairrmetric=fairrmetric)
         eval_runtime = time.time() - eval_start_time
         logger.info("Evaluation runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(eval_runtime)))
         print()
@@ -806,6 +953,10 @@ def get_model(args, doc_emb_dim=None):
 
     query_encoder = get_query_encoder(args)
 
+    # TODO: REMOVE! DEBUGGING!
+    # query_encoder.apply(lambda x: (torch.nn.init.xavier_uniform_ if hasattr(x, 'dim') else lambda y: y))
+    # query_encoder.init_weights()
+
     if args.model_type == 'mdstransformer':
 
         loss_module = get_loss_module(args)
@@ -824,6 +975,7 @@ def get_model(args, doc_emb_dim=None):
                               selfatten_mode=args.selfatten_mode,
                               no_decoder=args.no_decoder,
                               no_dec_crossatten=args.no_dec_crossatten,
+                              query_emb_aggregation=args.query_aggregation,
                               bias_regul_coeff=args.bias_regul_coeff,
                               bias_regul_cutoff=args.bias_regul_cutoff)
     else:

@@ -53,18 +53,19 @@ class CollectionDataset:
         return self.token_ids[ind, :self.lengths[ind]].tolist()
 
 
-class EmbeddedCollection:
-    """Document / passage collection in the form of document embedding memmap"""
+class EmbeddedSequences:
+    """Document / passage collection or queries in the form of embeddings memmap"""
 
-    def __init__(self, embedding_memmap_dir, sorted_nat_ids=False, load_to_memory=False):
+    def __init__(self, embedding_memmap_dir, sorted_nat_ids=False, load_to_memory=False, seq_type='document'):
         """
-        :param embedding_memmap_dir: directory containing memmap file of precomputed document embeddings, and the
-            corresponding passage/doc IDs in another memmpap file
+        :param embedding_memmap_dir: directory containing memmap file of precomputed document/query embeddings, and the
+            corresponding passage/doc/queries IDs in another memmpap file
         :param sorted_nat_ids: whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1, and
             doc embeddings are stored exactly in that order (is True for MSMARCO passage collection). A bit more efficient.
         :param load_to_memory: If true, will load entire embedding array as np.array to memory, instead of memmap!
-            Needs ~26GB for MSMARCO (~50GB project total), but is faster.
-        REMOVED emb_dim: dimensionality of document vectors. If None, `embedding_memmap_dir` will be used to infer it,
+            Needs ~26GB for MSMARCO document collection (~50GB project total), but is faster.
+        :param seq_type: 'document' or 'query'. What type of sequences are contained in specified memmap
+        REMOVED emb_dim: dimensionality of document/query vectors. If None, `embedding_memmap_dir` will be used to infer it,
             and in case this is not possible, the default value BERT_BASE_DIM will be used
         """
 
@@ -80,42 +81,48 @@ class EmbeddedCollection:
         #         emb_dim = BERT_BASE_DIM
         #         logger.warning("Using default document embedding dimensionality: {}".format(emb_dim))
 
-        pids = np.memmap(os.path.join(embedding_memmap_dir, "pids.memmap"), mode='r', dtype='int32')
+        if seq_type == 'document':
+            # unfortunately, for no reason, names differ between queries and documents
+            id_filename = "pids.memmap"
+        else:
+            id_filename = 'ids.memmap'
+            sorted_nat_ids = False  # even in MSMARCO, query IDs are NOT the sequence 0, 1, 2 ...
+        ids = np.memmap(os.path.join(embedding_memmap_dir, id_filename), mode='r', dtype='int32')
 
         self.sorted_nat_ids = sorted_nat_ids  # whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1
-        self.pid2ind = None  # no mapping dictionary in case sorted == True
-        self.map_pid_to_ind = self.get_pid_to_ind_mapping(pids)  # pID-to-matrix_index mapping function
+        self.id2ind = None  # no mapping dictionary in case sorted == True
+        self.map_id_to_ind = self.get_id_to_ind_mapping(ids)  # ID-to-matrix_index mapping function
 
-        self.num_docs = len(pids)
+        self.num_sequences = len(ids)  # number of rows of embedding matrix (i.e. number of sequences)
         # shape is necessary input argument; this information is not stored and a 1D array is loaded by default
         self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
                                            dtype='float32')
-        self.embedding_vectors = self.embedding_vectors.reshape((self.num_docs, -1))
+        self.embedding_vectors = self.embedding_vectors.reshape((self.num_sequences, -1))
         if load_to_memory:
-            logger.warning("Loading all collection document embeddings to memory!")
+            logger.warning("Loading all {} embeddings to memory!".format(seq_type))
             self.embedding_vectors = np.array(self.embedding_vectors)
-        logger.info("Collection document embeddings array shape: {}, "
-                    "type: {}".format(self.embedding_vectors.shape, type(self.embedding_vectors)))
+        logger.info("{} embeddings array shape: {}, "
+                    "type: {}".format(seq_type, self.embedding_vectors.shape, type(self.embedding_vectors)))
         return
 
-    def get_pid_to_ind_mapping(self, pids):
-        """Returns function used to map a list of passage IDs to the corresponding integer indices of the embedding matrix"""
+    def get_id_to_ind_mapping(self, ids):
+        """Returns function used to map a list of IDs to the corresponding integer indices of the embedding matrix"""
         if self.sorted_nat_ids:
-            assert np.array_equal(pids, np.array(range(len(pids)), dtype=int))  # TODO: REMOVE as soon as verified
+            assert np.array_equal(ids, np.array(range(len(ids)), dtype=int))  # check that indeed IDs are the sequence 0, 1, ...
             return lambda x: x
         else:
-            self.pid2ind = OrderedDict((pid, i) for i, pid in enumerate(pids))
-            return lambda x: [self.pid2ind[pid] for pid in x]
+            self.id2ind = OrderedDict((ID, i) for i, ID in enumerate(ids))
+            return lambda x: [self.id2ind[ID] for ID in x]
 
     def __len__(self):
-        return self.num_docs
+        return self.num_sequences
 
     def __getitem__(self, ids):
         """
         :param ids: iterable of some IDs of passages/docs in collection
         :return: (num_ids, emb_dim) slice of numpy.memmap embedding vectors corresponding to `ids`
         """
-        inds = self.map_pid_to_ind(ids)
+        inds = self.map_id_to_ind(ids)
         return self.embedding_vectors[inds, :]
 
 
@@ -179,6 +186,21 @@ class CandidatesDataset:
         """
         ind = self.qid2ind[qid]
         return self.doc_ids[ind, :self.lengths[ind]]
+
+
+def load_original_sequences(seq_path):
+    """
+    For a specified collection or queries file, loads original sequence IDs and respective text into a dictionary. Used for 'inspect' mode.
+    :param seq_path: path of the raw queries/collection file (each line: seqID \t text)
+    :return: {seqID: sequence_text} dictionary
+    """
+    total_size = sum(1 for _ in open(seq_path))  # simply to get number of lines
+    sequence_dict = {}
+    with open(seq_path, 'r') as qFile:
+        for line in tqdm(qFile, total=total_size, desc="Sequences: "):
+            query_id, text = line.split("\t")
+            sequence_dict[int(query_id)] = text
+    return sequence_dict
 
 
 def load_query_tokenids(query_tokenids_path):
@@ -306,7 +328,7 @@ class MYMARCO_Dataset(Dataset):
             be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
         :param load_collection_to_memory: If true, will load entire embedding array as np.array to memory, instead of memmap!
             Needs ~26GB for MSMARCO (~50GB project total), but is faster.
-        :param emb_collection: (optional) already initialized EmbeddedCollection object. Will be used instead of
+        :param emb_collection: (optional) already initialized EmbeddedSequences object. Will be used instead of
             reading matrix from `embedding_memmap_dir`
         :param inject_ground_truth: if True, during evaluation the ground truth relevant documents will be always included in the
             candidate documents, even if they weren't part of the original candidates. (Helps isolate effect of first-stage recall)
@@ -330,8 +352,8 @@ class MYMARCO_Dataset(Dataset):
             self.emb_collection = emb_collection
         else:
             logger.info("Opening collection document embeddings memmap in '{}' ...".format(embedding_memmap_dir))
-            self.emb_collection = EmbeddedCollection(embedding_memmap_dir, sorted_nat_ids=True,
-                                                     load_to_memory=load_collection_to_memory)
+            self.emb_collection = EmbeddedSequences(embedding_memmap_dir, sorted_nat_ids=True,
+                                                    load_to_memory=load_collection_to_memory)
         logger.info("Size of emb. collection:"
                     " {} MB".format(round(sys.getsizeof(self.emb_collection.embedding_vectors) / 1024**2)))
         if os.path.isdir(queries_tokenids_path):
@@ -359,6 +381,7 @@ class MYMARCO_Dataset(Dataset):
 
         if tokenizer is None:  # TODO: for backwards compatibility. Consider removing
             tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        self.tokenizer = tokenizer
         self.cls_id = tokenizer.cls_token_id
         self.sep_id = tokenizer.sep_token_id
         self.pad_id = tokenizer.pad_token_id

@@ -35,7 +35,8 @@ def run_parse_args():
                              "'inspect' is used to interactively examine an existing ranked candidates file/memmap "
                              "specified by `eval_candidates_path`, together with "
                              "the respective original queries and documents, reconstructed tokenizations, embeddings, "
-                             "ground truth relevant documents, etc")
+                             "ground truth relevant documents, and a (raw .tsv) reference ranked candidates file, "
+                             "which may or may not correspond to the same ranking as `eval_candidates_path`")
     parser.add_argument('--resume', action='store_true',
                         help='Used together with `load_model`. '
                              'If set, will load `start_step` and state of optimizer, scheduler besides model weights.')
@@ -56,9 +57,12 @@ def run_parse_args():
                         help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file.")
     parser.add_argument("--raw_queries_path", type=str,
                         help=".tsv file which contains raw text queries (ID <tab> text). Used only for 'inspect' mode.")
+    parser.add_argument("--query_emb_memmap_dir", type=str, default="repbert/representations/doc_embedding",
+                        help="Optional: Directory containing (num_queries, query_emb_dim) memmap array of query "
+                             "embeddings and an accompanying (num_queries,) memmap array of query IDs. Used only for 'inspect' mode")
     parser.add_argument("--raw_collection_path", type=str,
                         help=".tsv file which contains raw text documents (ID <tab> text). Used only for 'inspect' mode.")
-    parser.add_argument("--collection_memmap_dir", type=str, help="RepBERT or 'inspect' mode only!")  # RepBERT only
+    parser.add_argument("--collection_memmap_dir", type=str, help="RepBERT or 'inspect' mode only!")  # RepBERT/inspect only
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
     parser.add_argument('--load_model', dest='load_model_path', type=str, help='Path to pre-trained model.')
     # The following are currently used only if `model_type` is NOT 'repbert'
@@ -74,7 +78,7 @@ def run_parse_args():
     parser.add_argument("--tokenizer_from", type=str, default=None,
                         help="""Optional: Path to a directory containing a saved custom tokenizer (vocabulary and added tokens)
                         for queries, or a HuggingFace built-in string. Only used if for whatever reason 
-                        the query tokenizer should differfrom what is specified by `query_encoder_from` and `query_encoder_config`""")
+                        the query tokenizer should differ from what is specified by `query_encoder_from` and `query_encoder_config`""")
     
 
     ## Dataset
@@ -86,8 +90,10 @@ def run_parse_args():
                         help="Limit  dataset to specified smaller random sample, e.g. for debugging purposes. "
                              "If in [0,1], it will be interpreted as a proportion of the dataset, "
                              "otherwise as an integer absolute number of samples")
-    parser.add_argument("--max_query_length", type=int, default=32)
-    parser.add_argument("--max_doc_length", type=int, default=256)  # RepBERT only
+    parser.add_argument("--max_query_length", type=int, default=32,
+                        help="Number of tokens to keep from each query.")
+    parser.add_argument("--max_doc_length", type=int, default=256,  # RepBERT/inspect only
+                        help="Number of tokens to keep from each document. Used for RepBERT or 'inspect' mode only")
     parser.add_argument('--num_candidates', type=int, default=None,
                         help="Number of document IDs to sample from all document IDs corresponding to a query and found"
                              " in `candidates_path` file. If None, all found document IDs will be used.")
@@ -171,6 +177,9 @@ def run_parse_args():
     ## Model
     parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer'], default='mdstransformer',
                         help="""Type of the entire (end-to-end) information retrieval model""")
+    parser.add_argument("--query_aggregation", type=str, choices=['mean', 'first'], default='mean',
+                        help="""How to aggregate the individual final encoder embeddings corresponding to query tokens into 
+                        a single vector.""")
 
     # The following refer to the transformer "decoder" (which processes an input sequence of document embeddings)
     parser.add_argument('--d_model', type=int, default=None,
@@ -189,6 +198,18 @@ def run_parse_args():
                         help='Activation to be used in transformer decoder')
     parser.add_argument('--normalization_layer', choices={'BatchNorm', 'LayerNorm', 'None'}, default='LayerNorm',
                         help='Normalization layer to be used internally in the transformer decoder')
+    parser.add_argument('--selfatten_mode', type=int, default=0, choices=[0, 1, 2, 3],
+                        help="Self-attention (SA) mode for contextualizing documents. Choices: "
+                             "0: regular SA "
+                             "1: turn off SA by using diagonal SA matrix (no interactions between documents) "
+                             "2: linear layer + non-linearity instead of SA "
+                             "3: SA layer has simply been removed")
+    parser.add_argument('--no_dec_crossatten', action='store_true',
+                        help="If used, the transformer decoder will not have cross-attention over the sequence of "
+                             "query term embeddings in the output of the query encoder")
+    parser.add_argument('--no_decoder', action='store_true',
+                        help="If used, no transformer decoder will be used to transform document embeddings")
+    # Scoring and loss
     parser.add_argument('--scoring_mode',
                         choices={'raw', 'sigmoid', 'tanh', 'softmax',
                                  'cross_attention', 'cross_attention_sigmoid', 'cross_attention_tanh', 'cross_attention_softmax',
@@ -215,17 +236,7 @@ def run_parse_args():
                              "in the top tier.")
     parser.add_argument('--gt_factor', type=float, default=2.0,
                         help="Scaling factor of ground truth component for `loss_type` 'multitier'")
-    parser.add_argument('--selfatten_mode', type=int, default=0, choices=[0, 1, 2, 3],
-                        help="Self-attention (SA) mode for contextualizing documents. Choices: "
-                             "0: regular SA "
-                             "1: turn off SA by using diagonal SA matrix (no interactions between documents) "
-                             "2: linear layer + non-linearity instead of SA "
-                             "3: SA layer has simply been removed")
-    parser.add_argument('--no_dec_crossatten', action='store_true',
-                        help="If used, the transformer decoder will not have cross-attention over the sequence of "
-                             "query term embeddings in the output of the query encoder")
-    parser.add_argument('--no_decoder', action='store_true',
-                        help="If used, no transformer decoder will be used to transform document embeddings")
+
 
     ## Fairness
     parser.add_argument("--collection_neutrality_path", type=str,
@@ -244,8 +255,8 @@ def run_parse_args():
         raise ValueError('Please specify task! (train, dev, eval, inspect)')
 
     if args.task == 'inspect':
-        args.inject_ground_truth = False
-        logger.info("Ground truth documents will not be injected among candidates, because `task == 'inspect'`")
+        # args.inject_ground_truth = False
+        # logger.info("Ground truth documents will not be injected among candidates, because `task == 'inspect'`")
         if args.raw_queries_path is None:
             logger.warning("You must set `raw_queries_path` to inspect original queries.")
         if args.raw_collection_path is None:

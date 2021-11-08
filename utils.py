@@ -223,9 +223,14 @@ def load_config(args):
             logger.critical("Failed to load configuration file. Check JSON syntax and verify that files exist")
             traceback.print_exc()
             sys.exit(1)
+        # Support command line override of config file options
         if args.override is not None:
             override_dict = eval(args.override)  # options to override
             config.update(override_dict)
+        # Check for misspelled options in config file or command line override:
+        unknown_config_keys = [k for k in config if not(k in args.__dict__)]
+        if len(unknown_config_keys):
+            raise ValueError("The following options/keys are not supported: {}".format(unknown_config_keys))
 
     return config
 

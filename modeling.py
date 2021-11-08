@@ -224,6 +224,19 @@ class CrossAttentionScorer(Scorer):
         return self.score_func(self.linear(out))
 
 
+def get_aggregation_function(aggregation):
+    """
+    :param aggregation: defines how to aggregate final query token representations to obtain a single vector
+            representation for the query. 'mean' will average, 'first' will simply select the first vector
+    :return aggregation_func: aggregation function
+    """
+    if aggregation == 'mean':
+        aggregation_func = _average_sequence_embeddings
+    else:
+        aggregation_func = _select_first_embedding
+    return aggregation_func
+
+
 class DotProductScorer(Scorer):
     """
     Computes scores as a dot product between the aggregate (e.g. mean) query representation and each final document
@@ -245,11 +258,7 @@ class DotProductScorer(Scorer):
         else:
             self.pre_activation_func = None
 
-        if aggregation == 'mean':
-            self.aggregation_func = _average_sequence_embeddings
-        else:
-            self.aggregation_func = _select_first_embedding
-
+        self.aggregation_func = get_aggregation_function(aggregation)
         self.normalize = normalize
 
     def forward(self, output_emb, query_emb, query_mask):
@@ -694,8 +703,8 @@ class MDSTransformer(nn.Module):
     Computes a relevance score for each (transformed) document representation and can be thus used for reranking.
 
     Args:
-        encoder_config: huggingface transformers configuration object to instantiate a query encoder.
-            Used instead of `custom_encoder`.
+        encoder_config: huggingface transformers configuration object (could be string, dir, ...)
+            to instantiate a query encoder.  Used instead of `custom_encoder`.
         custom_encoder: custom encoder object initialized externally (default=None)
             Used instead of `encoder_config`.
         custom_decoder: custom decoder object initialized externally (default=None).
@@ -715,10 +724,11 @@ class MDSTransformer(nn.Module):
         >>> model = MDSTransformer(custom_encoder=my_HF_encoder, num_heads=16, num_decoder_layers=4)
     """
 
-    def __init__(self, encoder_config=None, d_model: int = 768, num_heads: int = 8,
+    def __init__(self, encoder_config=None, custom_encoder=None, custom_decoder=None,
+                 d_model: int = 768, num_heads: int = 8,
                  num_decoder_layers: int = 6, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: str = "relu", normalization: str = "LayerNorm", positional_encoding=None,
-                 doc_emb_dim: int = None, custom_encoder: Optional[Any] = None, custom_decoder: Optional[Any] = None,
+                 doc_emb_dim: int = None,
                  scoring_mode='cross_attention', query_emb_aggregation='mean',
                  loss_module=None, selfatten_mode=0, no_decoder=False, no_dec_crossatten=False, transform_doc_emb=False,
                  bias_regul_coeff=0.0, bias_regul_cutoff=100) -> None:
@@ -746,13 +756,13 @@ class MDSTransformer(nn.Module):
 
             self.no_decoder = no_decoder
             if not no_decoder:
-                self.selfatten_mode = selfatten_mode  # TODO: for ablation study
+                self.selfatten_mode = selfatten_mode  # NOTE: used for ablation study
                 self.no_dec_crossatten = no_dec_crossatten
                 if selfatten_mode == 2:  # transformer decoder block with the self-attention layer replaced by linear layer + non-linearity
                     decoder_layer = LinearTransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
                 elif selfatten_mode == 3:  # transformer decoder block with the self-attention layer simply removed
                     decoder_layer = ReducedTransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
-                elif no_dec_crossatten:
+                elif no_dec_crossatten:  # decoder does not have cross-attention over encoder states
                     decoder_layer = NoCrossTransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation, normalization)
                 else:  # usual transformer decoder block
                     decoder_layer = nn.TransformerDecoderLayer(self.d_model, num_heads, dim_feedforward, dropout, activation)
@@ -865,7 +875,7 @@ class MDSTransformer(nn.Module):
         if self.no_decoder:
             output_emb = doc_emb
         else:
-            if self.selfatten_mode == 1:  # TODO: for ablation study. Turn off SA by using diagonal SA matrix (no interactions between documents)
+            if self.selfatten_mode == 1:  # NOTE: for ablation study. Turn off SA by using diagonal SA matrix (no interactions between documents)
                 doc_attention_mat_mask = ~torch.eye(doc_emb.shape[0], dtype=bool).to(device=doc_emb.device)  # (max_docs_per_query, max_docs_per_query)
             # (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
             output_emb = self.decoder(doc_emb, enc_hidden_states, tgt_mask=doc_attention_mat_mask,
@@ -880,7 +890,7 @@ class MDSTransformer(nn.Module):
         else:
             rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores
             
-        ## fairness regularization term
+        ## fairness regularization term  # TODO: put in a separate function
         bias_regul_term = None
         if doc_neutscore is not None:
 
