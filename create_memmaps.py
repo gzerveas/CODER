@@ -41,7 +41,7 @@ def convert_collection_to_memmap(tokenized_file, memmap_dir, max_length, file_pr
     lengths_memmap_path = os.path.join(memmap_dir, file_prefix + "lengths.memmap")
 
     # NOTE: int32 should be enough for token_ids, pids and lengths (max 2'147'483'647)
-    token_ids = np.memmap(tokenids_memmap_path, dtype='int32', mode='w+', shape=(collection_size, args.max_seq_length))
+    token_ids = np.memmap(tokenids_memmap_path, dtype='int32', mode='w+', shape=(collection_size, max_length))
     pids = np.memmap(pids_memmap_path, dtype='int32', mode='w+', shape=(collection_size,))
     lengths = np.memmap(lengths_memmap_path, dtype='int32', mode='w+', shape=(collection_size,))
 
@@ -49,8 +49,8 @@ def convert_collection_to_memmap(tokenized_file, memmap_dir, max_length, file_pr
         data = json.loads(line)
         assert int(data['id']) == idx
         pids[idx] = idx
-        lengths[idx] = len(data['ids'])
         ids = data['ids'][:max_length]
+        lengths[idx] = len(data['ids'])
         token_ids[idx, :lengths[idx]] = ids
     return
 

@@ -56,13 +56,14 @@ def run_parse_args():
     parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",  # TODO: rename "queries_path"
                         help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file.")
     parser.add_argument("--raw_queries_path", type=str,
-                        help=".tsv file which contains raw text queries (ID <tab> text). Used only for 'inspect' mode.")
+                        help="Optional: .tsv file which contains raw text queries (ID <tab> text). Used only for 'inspect' mode.")
     parser.add_argument("--query_emb_memmap_dir", type=str, default="repbert/representations/doc_embedding",
                         help="Optional: Directory containing (num_queries, query_emb_dim) memmap array of query "
                              "embeddings and an accompanying (num_queries,) memmap array of query IDs. Used only for 'inspect' mode")
     parser.add_argument("--raw_collection_path", type=str,
                         help=".tsv file which contains raw text documents (ID <tab> text). Used only for 'inspect' mode.")
-    parser.add_argument("--collection_memmap_dir", type=str, help="RepBERT or 'inspect' mode only!")  # RepBERT/inspect only
+    parser.add_argument("--collection_memmap_dir", type=str,
+                        help="Optional: Memmap dir containing token IDs for each collection document. RepBERT or 'inspect' mode only!")  # RepBERT/inspect only
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
     parser.add_argument('--load_model', dest='load_model_path', type=str, help='Path to pre-trained model.')
     # The following are currently used only if `model_type` is NOT 'repbert'
@@ -93,7 +94,7 @@ def run_parse_args():
     parser.add_argument("--max_query_length", type=int, default=32,
                         help="Number of tokens to keep from each query.")
     parser.add_argument("--max_doc_length", type=int, default=256,  # RepBERT/inspect only
-                        help="Number of tokens to keep from each document. Used for RepBERT or 'inspect' mode only")
+                        help="Optional: Number of tokens to keep from each document. Used for RepBERT or 'inspect' mode only")
     parser.add_argument('--num_candidates', type=int, default=None,
                         help="Number of document IDs to sample from all document IDs corresponding to a query and found"
                              " in `candidates_path` file. If None, all found document IDs will be used.")

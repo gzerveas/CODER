@@ -29,17 +29,27 @@ collation_times = utils.Timer()
 prep_docids_times = utils.Timer()
 retrieve_candidates_times = utils.Timer()
 
-
-# only used by RepBERT
+# only used by RepBERT and `precompute.py`
 class CollectionDataset:
-    """Document / passage collection"""
+    """Document / passage collection in form of integer token IDs"""
 
-    def __init__(self, collection_memmap_dir):
-        self.pids = np.memmap(f"{collection_memmap_dir}/pids.memmap", dtype='int32', )
-        self.lengths = np.memmap(f"{collection_memmap_dir}/lengths.memmap", dtype='int32', )
+    def __init__(self, collection_memmap_dir, max_doc_length=None):
+        """
+        :param collection_memmap_dir: directory containing memmap files of token IDs and lengths for each document ID
+        :param max_doc_length: if provided, it will force reading the memmap with specified dimensions, rather than
+            inferring size. This can be useful in the unfortunate case a memmap has been created and overwritten with different sizes
+        """
+
+        self.pids = np.memmap(os.path.join(collection_memmap_dir, 'pids.memmap'), mode='r', dtype='int32')
+        self.lengths = np.memmap(os.path.join(collection_memmap_dir, "lengths.memmap"), mode='r', dtype='int32')
         self.collection_size = len(self.pids)
-        self.token_ids = np.memmap(f"{collection_memmap_dir}/token_ids.memmap",
-                                   dtype='int32', shape=(self.collection_size, 512))
+        if max_doc_length:  # force certain array dimensions
+            self.token_ids = np.memmap(os.path.join(collection_memmap_dir, 'token_ids.memmap'),
+                                       mode='r', dtype='int32', shape=(self.collection_size, max_doc_length))
+        else:
+            self.token_ids = np.memmap(os.path.join(collection_memmap_dir, 'token_ids.memmap'), mode='r', dtype='int32')
+            self.token_ids = self.token_ids.reshape((self.collection_size, -1))
+        logger.info("Tokenized doc collection memmap array shape: {}, type: {}".format(self.token_ids.shape, type(self.token_ids)))
 
     def __len__(self):
         return self.collection_size
@@ -95,8 +105,7 @@ class EmbeddedSequences:
 
         self.num_sequences = len(ids)  # number of rows of embedding matrix (i.e. number of sequences)
         # shape is necessary input argument; this information is not stored and a 1D array is loaded by default
-        self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r',
-                                           dtype='float32')
+        self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r', dtype='float32')
         self.embedding_vectors = self.embedding_vectors.reshape((self.num_sequences, -1))
         if load_to_memory:
             logger.warning("Loading all {} embeddings to memory!".format(seq_type))

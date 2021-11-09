@@ -30,6 +30,7 @@ from dataset import lookup_times, sample_fetching_times, collation_times, retrie
 from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiScheduler
 import utils
 import metrics
+from precompute import MSMARCO_DocDataset
 
 from fair_retrieval.metrics_FaiRR import FaiRRMetric, FaiRRMetricHelper
 
@@ -502,10 +503,11 @@ def inspect(args, model, dataloader):
     as `eval_candidates_path`
     """
 
+    # to have agreement between loaded and computed embeddings, sequence lengths must correspond to the max. length used for precomputed embeddings
     QUERY_LENGTH = args.max_query_length
     DOC_LENGTH = args.max_doc_length
-    DISPLAY_DOCS = 10
-    ERROR_TOLERANCE = 1e-4
+    DISPLAY_DOCS = 10  # how many candidate documents (from the top and bottom) to display and use for integrity calculation
+    ERROR_TOLERANCE = 1e-4  # torerable absolute difference in embeddings
     np.set_printoptions(linewidth=200)
     torch.set_printoptions(linewidth=200)
     pd.options.display.width = 400  # will automatically detect console width
@@ -527,17 +529,25 @@ def inspect(args, model, dataloader):
     df_chunks = []  # (total_num_queries) list of dataframes, each with index a single qID and corresponding (num_docs) columns PID, rank, score
     query_time = 0  # average time for the model to score candidates for a single query
     total_loss = 0  # total loss over dataset
-    error_queries = []
-    error_docs = []
+    error_queries = []  # query IDs corresponding to tokenization or embedding errors
+    error_docs = set([])  # document IDs corresponding to tokenization or embedding errors
+    num_inspected_docs = 0  # total number of inspected documents
+    total_num_score_errors = 0  # total number of errors in scores
+    total_queries = 0  # total number of inspected queries
 
     logger.info("Loading raw queries ...")
     query_dict = load_original_sequences(args.raw_queries_path)
-    logger.info("Loading raw documents ...")
-    doc_dict = load_original_sequences(args.raw_collection_path)
-
     if args.query_emb_memmap_dir:
         logger.info("Loading query embeddings from '{}' ...".format(args.query_emb_memmap_dir))
         query_embeddings = EmbeddedSequences(embedding_memmap_dir=args.query_emb_memmap_dir, seq_type='query')
+
+    logger.info("Loading raw documents ...")
+    doc_dict = load_original_sequences(args.raw_collection_path)
+
+    if args.collection_memmap_dir:
+        logger.info("Loading tokenized documents collection from '{}' ...".format(args.collection_memmap_dir))
+        doc_tokens_collection = MSMARCO_DocDataset(args.collection_memmap_dir, DOC_LENGTH, dataloader.dataset.tokenizer)
+
     aggregation_func = get_aggregation_function(args.query_aggregation)
 
     with torch.no_grad():
@@ -591,6 +601,7 @@ def inspect(args, model, dataloader):
 
             # Display input and output information for retrieval on each query
             for i in range(len(qids)):  # iterate over batch_size
+                total_queries += 1
                 # Check integrity of queries
                 query_ok = True
                 logger.info("Query ID: {}".format(qids[i]))
@@ -601,7 +612,7 @@ def inspect(args, model, dataloader):
                 logger.debug("Rec. input query tokens:\n{}".format(
                     dataloader.dataset.tokenizer.convert_ids_to_tokens(batch_data['query_token_ids'][i, :])))
                 start_time = time.perf_counter()
-                tokenized_query = dataloader.dataset.tokenizer([query_dict[qids[i]]], padding=True, return_tensors="pt")
+                tokenized_query = dataloader.dataset.tokenizer([query_dict[qids[i]]], max_length=QUERY_LENGTH, padding=True, return_tensors="pt")
                 tokenization_time = time.perf_counter() - start_time
                 logger.debug("Time to tokenize: {} s".format(tokenization_time))
                 tokenized_query = {k: v.to(args.device) for k, v in tokenized_query.items()}
@@ -611,7 +622,7 @@ def inspect(args, model, dataloader):
                 logger.debug("Query tokens: {}".format(qtokenized_tokens))
 
                 if not (torch.equal(qtokenized_ids, batch_data['query_token_ids'][i, :len(qtokenized_ids)])):
-                    logger.warning("Tokenization error!")
+                    logger.warning("Query tokenization error!")
                     query_ok = False
 
                 query_emb_model = aggregation_func(enc_hidden_states)[i, :]  # .detach().cpu().numpy()
@@ -664,15 +675,23 @@ def inspect(args, model, dataloader):
 
                 docs_to_check_text += docs_text[:DISPLAY_DOCS] + docs_text[-DISPLAY_DOCS:]
                 docs_to_check_ids += ranksorted_docids[:DISPLAY_DOCS] + ranksorted_docids[-DISPLAY_DOCS:]
+                num_inspected_docs += len(docs_to_check_ids)
                 start_time = time.perf_counter()
                 tokenized_docs = dataloader.dataset.tokenizer(docs_to_check_text, max_length=DOC_LENGTH, padding=True, return_tensors="pt")
                 tokenization_time = time.perf_counter() - start_time
                 logger.debug("Time to tokenize {} documents: {} s".format(len(docs_to_check_text), tokenization_time))
 
-                logger.debug("Doc tokens:\n")
                 for j in range(tokenized_docs["input_ids"].shape[0]):
+                    logger.debug("DocID {}:\n".format(docs_to_check_ids[j]))
                     doc_tokens = dataloader.dataset.tokenizer.convert_ids_to_tokens(tokenized_docs["input_ids"][j])
-                    logger.debug("{:8}: {}\n".format(docs_to_check_ids[j], doc_tokens))
+                    logger.debug("Tokenized: {}\n".format(doc_tokens))
+                    if args.collection_memmap_dir:
+                        loaded_token_ids = torch.tensor(doc_tokens_collection[docs_to_check_ids[j]]['input_ids'])
+                        loaded_tokens = dataloader.dataset.tokenizer.convert_ids_to_tokens(loaded_token_ids)
+                        logger.debug("Loaded: {}\n\n".format(loaded_tokens))
+                        if not (torch.equal(tokenized_docs["input_ids"][j][:len(loaded_token_ids)], loaded_token_ids)):
+                            logger.warning("Doc tokenization error!")
+                            error_docs.add(docs_to_check_ids[j])
 
                 tokenized_docs = {k: v.to(args.device) for k, v in tokenized_docs.items()}
                 model_out = model.encoder(**tokenized_docs)
@@ -684,39 +703,66 @@ def inspect(args, model, dataloader):
                 if max_abs_diff > ERROR_TOLERANCE:
                     logger.warning("Doc embeddings as computed directly by model differ from "
                                    "the embeddings as loaded from '{}'! Max. abs. difference: {}".format(args.embedding_memmap_dir, max_abs_diff))
+                    error_inds = abs_diffs > ERROR_TOLERANCE  # (num_docs, emb_dim)
+                    logger.warning("{} / {} elements have an absolute "
+                                   "difference larger than {}".format(torch.sum(error_inds), torch.numel(doc_emb_model), ERROR_TOLERANCE))
+                    error_inds = torch.any(error_inds, dim=1)  # (num_docs,) boolean array showing which docs differed
+                    error_docs.update(docs_to_check_ids[k] for k in range(len(error_inds)) if error_inds[k])
                     logger.debug("Loaded doc embeddings (from '{}'):\n{}".format(args.embedding_memmap_dir, loaded_doc_emb))
                     logger.debug("Computed doc embeddings:\n{}".format(doc_emb_model))
-                    error_inds = abs_diffs > ERROR_TOLERANCE
-                    logger.debug("{} / {} elements have an absolute "
-                                 "difference larger than {}".format(torch.sum(error_inds), torch.numel(doc_emb_model), ERROR_TOLERANCE))
 
                 # Compare scores between MDST model output and computed encoder scores (emb. dot product)
                 docs_to_check_inds = list(np.nonzero(relevances[i])[0]) if labels_exist else []  # insert indices of gt documents
                 docs_to_check_inds += list(range(DISPLAY_DOCS)) + list(range(-DISPLAY_DOCS, 0, 1))
                 model_scores = sorted_scores[i][docs_to_check_inds]  # scores as calculated in MDST model
                 encoder_scores = torch.matmul(query_emb_model2, doc_emb_model.T).detach().cpu().numpy()  # encoder scores (emb. dot product)
-                # encoder_scores = torch.matmul(query_emb_model2, loaded_doc_emb.T).detach().cpu().numpy()  # encoder scores (emb. dot product)
+                # encoder_scores = torch.matmul(query_emb_model2, loaded_doc_emb.T).detach().cpu().numpy()  # encoder scores (emb. dot product)  # TODO: just for DEBUG, to confirm that scoring module does simple dot product
                 abs_diffs = np.abs(model_scores - encoder_scores)
                 max_abs_diff = np.max(abs_diffs)
 
                 if max_abs_diff > ERROR_TOLERANCE:
                     logger.warning("Scores as computed directly by encoder model (dot product) differ from "
                                    "the scores in the output of MDST model. Max. abs. difference: {}".format(max_abs_diff))
+                    error_inds = abs_diffs > ERROR_TOLERANCE
+                    num_score_errors = np.sum(error_inds)
+                    total_num_score_errors += num_score_errors
+                    logger.warning("{} / {} scores have an absolute difference larger than {}".format(num_score_errors, len(model_scores), ERROR_TOLERANCE))
                     logger.debug("Scores in the output of MDST model:\n{}\n".format(model_scores))
                     logger.debug("Scores computed by encoder model (query-doc emb. dot product):\n{}\n".format(encoder_scores))
 
                 print()
-                inp = input("Press any key to continue")
+                inp = input("Press any key to continue, or 'q' to exit: ")
+                if inp == 'q':
+                    break
+            if inp == 'q':
+                break
 
     if len(error_queries):
-        logger.error(
-            "Errors found in {} out of {} ({:.3f}%) queries:\n{}".format(len(error_queries), len(dataloader.dataset.qids),
-                                                                         100*len(error_queries)/len(dataloader.dataset.qids),
-                                                                         error_queries))
+        logger.error("Errors found in {} "
+                     "out of {} ({:.3f}%) queries:\n{}".format(len(error_queries), total_queries,
+                                                               100*len(error_queries)/total_queries,
+                                                               error_queries))
         for q in error_queries:
-            print("QID:{:7}: {}".format(q, query_dict[q]))
+            logger.debug("QID:{:7}: {}".format(q, query_dict[q]))
     else:
-        logger.info("Queries all ok!")
+        logger.info("All {} queries ok!".format(len(dataloader.dataset.qids)))
+    print()
+
+    if len(error_docs):
+        logger.error("Errors found in {} "
+                     "out of {} ({:.3f}%) inspected documents:\n{}".format(len(error_docs), num_inspected_docs,
+                                                                           100*len(error_docs)/num_inspected_docs,
+                                                                           error_docs))
+        for d in error_docs:
+            logger.debug("docID:{:8}: {}".format(d, doc_dict[d]))
+    else:
+        logger.info("All {} documents ok!".format(num_inspected_docs))
+    print()
+
+    if total_num_score_errors:
+        logger.error("Errors found in {} score calculations".format(total_num_score_errors))
+    else:
+        logger.info("All scores are consistent!")
 
     if labels_exist:
         try:

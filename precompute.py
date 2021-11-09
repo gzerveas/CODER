@@ -46,8 +46,8 @@ def create_embed_memmap(ids, memmap_dir, dim, file_prefix=''):
 
     embedding_path = os.path.join(memmap_dir, file_prefix + "embedding.memmap")
     id_path = os.path.join(memmap_dir, file_prefix + "ids.memmap")
-    embed_open_mode = "r+" if os.path.exists(embedding_path) else "w+"  # 'w+' will initialize with 0s
-    id_open_mode = "r+" if os.path.exists(id_path) else "w+"
+    embed_open_mode = "w+"  # "r+" if os.path.exists(embedding_path) else "w+"  # 'w+' will initialize with 0s
+    id_open_mode = "w+"  #"r+" if os.path.exists(id_path) else "w+"
     logger.warning(f"Open Mode: embeddings: {embed_open_mode}, ids: {id_open_mode}")
 
     embedding_memmap = np.memmap(embedding_path, dtype='float32', mode=embed_open_mode, shape=(len(ids), dim))
@@ -98,7 +98,7 @@ class MSMARCO_DocDataset(Dataset):
 
     def __init__(self, collection_memmap_dir, max_doc_length, tokenizer):
         self.max_doc_length = max_doc_length
-        self.collection = CollectionDataset(collection_memmap_dir)
+        self.collection = CollectionDataset(collection_memmap_dir, max_doc_length)
         self.pids = self.collection.pids
         self.cls_id = tokenizer.cls_token_id
         self.sep_id = tokenizer.sep_token_id
@@ -158,13 +158,15 @@ def generate_embeddings(args, model, dataset):
     # multi-gpu inference
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)  # automatically splits the batch into chunks for each process/GPU
+    model.eval()
+
     # Inference
     logger.info("Num examples: %d", len(dataset))
     logger.info("Batch size: %d", batch_size)
 
     start = timer()
     for batch, ids in tqdm(dataloader, desc="Computing embeddings"):
-        model.eval()
+
         with torch.no_grad():
             batch = {k: v.to(args.device) for k, v in batch.items()}
             output = model(**batch)
@@ -187,7 +189,8 @@ if __name__ == "__main__":
     parser.add_argument("--load_model", type=str, required=True,
                         help="Either path of a pre-trained model directory, "
                              "or string corresponding to a HuggingFace built-in model.")
-    parser.add_argument("--output_dir", type=str, default=".")
+    parser.add_argument("--output_dir", type=str, default=".",
+                        help="Directory where embedding memmaps will be created.")
     parser.add_argument("--collection_memmap_dir", type=str, default=None,
                         help="""Contains memmap files of tokenized/numerized collection of documents. If specified, will 
                         generate corresponding document embeddings.""")
@@ -231,6 +234,7 @@ if __name__ == "__main__":
         logger.info("Loading model from '{}' ...".format(args.load_model))
         model = AutoModel.from_pretrained(args.load_model)
         model.to(args.device)
+        model.eval()
         builtin_model = True
 
     if args.tokenized_queries:
@@ -246,6 +250,7 @@ if __name__ == "__main__":
         args.memmap_dir = os.path.join(args.output_dir, queries_dir)
         logger.info("Generating embeddings in {} ...".format(args.memmap_dir))
         generate_embeddings(args, model, dataset)
+
     if args.collection_memmap_dir:
         if not builtin_model:
             config.encode_type = "doc"
