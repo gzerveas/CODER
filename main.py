@@ -77,6 +77,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
         model, start_step, optim_state, sched_state = utils.load_model(model, args.load_model_path, args.device, args.resume)
 
     # Prepare optimizer and schedule
+    sstr = ['non-encoder', 'encoder']
     nonencoder_optimizer, encoder_optimizer = get_optimizers(args, model)
     logger.debug("args.learning_rate: {}".format(args.learning_rate))
     logger.debug('nonencoder_optimizer.defaults["lr"]: {}'.format(nonencoder_optimizer.defaults["lr"]))
@@ -140,12 +141,14 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                 train_batch_size * args.grad_accum_steps)
     logger.info("Gradient Accumulation steps: %d", args.grad_accum_steps)
     logger.info("Total optimization steps: %d", total_training_steps)
+    for i, s in enumerate(scheduler.get_last_lr()):
+        logger.debug('Learning rate ({}): {}'.format(sstr[i], s))
 
     train_loss = 0  # this is the training loss accumulated from the beginning of training
     logging_loss = 0  # this is synchronized with `train_loss` every args.logging_steps
     model.zero_grad()
     model.train()
-    # TODO: DEBUG
+    # model.encoder.requires_grad_(False)  # TODO: DEBUG. REMOVE!!!!
     score_params = [(name, p) for name, p in model.named_parameters() if name.startswith('score')]
     epoch_iterator = trange(start_epoch, int(args.num_epochs), desc="Epochs")
 
@@ -196,9 +199,9 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
 
                     if args.debug:
                         logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
-                        logger.debug("Learning rate(s): {}".format(scheduler.get_last_lr()))
-                        logger.debug(
-                            "Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
+                        for i, s in enumerate(scheduler.get_last_lr()):
+                            logger.debug('Learning rate ({}): {}'.format(sstr[i], s))
+                        logger.debug("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
                                                                           np.round(utils.get_current_memory_usage2())))
                         logger.debug("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
@@ -207,8 +210,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                         logger.debug("Average prep. docids time: {} s /samp".format(prep_docids_times.get_average()))
                         logger.debug("Average sample fetching time: {} s /samp".format(sample_fetching_times.get_average()))
                         logger.debug("Average collation time: {} s /batch".format(collation_times.get_average()))
-                        logger.debug(
-                            "Average total batch processing time: {} s /batch".format(batch_times.get_average()))
+                        logger.debug("Average total batch processing time: {} s /batch".format(batch_times.get_average()))
 
                         logger.debug("Score parameters: {}".format(score_params))  # TODO: DEBUG
 
@@ -329,8 +331,6 @@ def evaluate(args, model, dataloader, fairrmetric=None):
     query_time = 0  # average time for the model to score candidates for a single query
     total_loss = 0  # total loss over dataset
 
-    # rankfile = open(os.path.join(args.pred_dir, "debug_ranking.tsv"), 'w')  # TODO: REMOVE
-
     with torch.no_grad():
         for batch_data, qids, docids in tqdm(dataloader, desc="Evaluating"):
             batch_data = {k: v.to(args.device) for k, v in batch_data.items()}
@@ -369,12 +369,6 @@ def evaluate(args, model, dataloader, fairrmetric=None):
                                                 "rank": list(range(1, len(docids[i]) + 1)),
                                                 "score": sorted_scores[i]},
                                           index=[qids[i]] * len(docids[i])) for i in range(len(qids)))
-
-            # for qid, docid_list, score_list in zip(qids, ranksorted_docs, sorted_scores):  # TODO: REMOVE
-            #     rank = 1
-            #     for docid, score in zip(docid_list, score_list):
-            #         rankfile.write("{}\t{}\t{}\t{}\n".format(qid, docid, rank, score))
-            #         rank += 1
 
             if labels_exist:
                 relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
@@ -876,8 +870,10 @@ def main(config):
         model = get_model(args, eval_dataset.emb_collection.embedding_vectors.shape[1])
 
     logger.debug("Model:\n{}".format(model))
-    logger.info("Total number of parameters: {}".format(utils.count_parameters(model)))
-    logger.info("Trainable parameters: {}".format(utils.count_parameters(model, trainable=True)))
+    logger.info("Total number of model parameters: {}".format(utils.count_parameters(model)))
+    logger.info("Total trainable parameters: {}".format(utils.count_parameters(model, trainable=True)))
+    logger.info("Number of encoder parameters: {}".format(utils.count_parameters(model.encoder)))
+    logger.info("Trainable encoder parameters: {}".format(utils.count_parameters(model.encoder, trainable=True)))
 
     model.to(args.device)  # will also print model architecture, besides moving to GPU
 
@@ -912,6 +908,9 @@ def main(config):
         for k, v in eval_metrics.items():
             print_str += '{}: {:8f} | '.format(k, v)
         logger.info(print_str)
+
+        if args.inject_ground_truth:
+            logger.warning("Ground truth documents were injected among candidates! This may cause inflated metrics!")
 
         filename = 'reranked_' + os.path.basename(args.eval_candidates_path)
         if not filename.endswith('.tsv'):

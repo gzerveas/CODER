@@ -356,7 +356,7 @@ class MYMARCO_Dataset(Dataset):
             if self.mode == 'dev':
                 logger.warning("Will include ground truth document(s) in candidates for each query during evaluation!")
             elif self.mode == 'eval':
-                raise ValueError("It is not possible to use args.inject_ground_truth in 'eval' mode")
+                raise ValueError("It is not possible to use args.inject_ground_truth in 'eval' mode (no labels exist)")
         if emb_collection is not None:
             self.emb_collection = emb_collection
         else:

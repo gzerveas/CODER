@@ -32,7 +32,7 @@ def get_optimizers(args, model):
     nonencoder_no_decay_pgroup = []  # parameter group for non-encoder part, contains biases and LayerNorm params
     nonencoder_decay_pgroup = []  # parameter group for non-encoder part. L2 regularization will be applied
     for name, param in model.named_parameters():
-        if name in model.encoder._parameters.keys():
+        if name.startswith('encoder'):
             if any(st in name for st in no_decay_str):
                 encoder_no_decay_pgroup.append(param)
             else:

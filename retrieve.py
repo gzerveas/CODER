@@ -10,7 +10,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 from queue import PriorityQueue
-from collections import namedtuple, defaultdict
+from collections import namedtuple, defaultdict, OrderedDict
 from transformers import BertTokenizer, BertConfig
 from torch.utils.data import DataLoader, Dataset
 from dataset import CollectionDataset, pack_tensor_2D, MSMARCODataset
@@ -34,11 +34,11 @@ def get_embed_memmap(memmap_dir, dim):
 
 def print_memory_info(memmap, docs_per_chunk, device):
     doc_chunk_size = sys.getsizeof(np.array(memmap[:docs_per_chunk]))/1024**2
-    logger.info("{} chunks of {} documents, each of approx. size {} MB, "
-                "will be loaded to the following device:".format(math.ceil(memmap.shape[0]/docs_per_chunk),
+    logger.info("{} chunks of {} documents (total of {}), each of approx. size {} MB, "
+                "will be loaded to the following device:".format(math.ceil(memmap.shape[0]/docs_per_chunk), docs_per_chunk,
                                                                  memmap.shape[0], math.ceil(doc_chunk_size)))
 
-    if device == 'cuda':
+    if device.type == 'cuda':
         logger.info("Device: {}".format(torch.cuda.get_device_name(0)))
         total_mem = torch.cuda.get_device_properties(0).total_memory/1024**2
         logger.info("Total memory: {} MB".format(math.ceil(total_mem)))
@@ -66,16 +66,16 @@ def allrank(args):
     qid2pos = {identity: i for i, identity in enumerate(query_id_memmap)}
 
     if args.query_ids is None:
-        query_list = query_id_memmap
+        query_ids = query_id_memmap
     else:  # read subset of (integer) query IDs from file
         logger.info("Will use queries inside: {}".format(args.query_ids))
         with open(args.query_ids, 'r') as f:
-            query_list = [int(line.rstrip()) for line in f]
+            query_ids = OrderedDict.fromkeys(int(line.split()[0]) for line in f)  # acts as an ordered set
 
-    logger.info("{} queries found".format(len(query_list)))
+    logger.info("{} queries found".format(len(query_ids)))
 
     # PriorityQueue has a O(nlogn) insertion, and keeps elements sorted (in ascending order)
-    results_dict = {qid: PriorityQueue(maxsize=args.hit) for qid in query_list}
+    results_dict = {qid: PriorityQueue(maxsize=args.hit) for qid in query_ids}
 
     logger.info("Retrieving documents ...")
     for doc_begin_index in tqdm(range(0, len(doc_id_memmap), args.per_gpu_doc_num), desc="doc"):
@@ -83,7 +83,7 @@ def allrank(args):
         doc_ids = doc_id_memmap[doc_begin_index:doc_end_index]
         doc_embeddings = doc_embedding_memmap[doc_begin_index:doc_end_index]
         doc_embeddings = torch.from_numpy(doc_embeddings).to(args.device)
-        for qid in tqdm(query_list, desc="query"):
+        for qid in tqdm(query_ids, desc="query"):
             query_embedding = query_embedding_memmap[qid2pos[qid]]
             query_embedding = torch.from_numpy(query_embedding)
             query_embedding = query_embedding.to(args.device)
@@ -202,7 +202,7 @@ def rerank3(args):
     else:  # read subset of (integer) query IDs from file
         logger.info("Will use queries inside: {}".format(args.query_ids))
         with open(args.query_ids, 'r') as f:
-            query_ids = {int(line.rstrip()) for line in f}
+            query_ids = {int(line.split()[0]) for line in f}
         query_ids = qid_to_candidate_passages.keys() & query_ids
 
     logger.info("{} queries found".format(len(query_ids)))
@@ -299,8 +299,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Retrieval (for 1 GPU) based on precomputed query and document embeddings.")
 
     ## Required parameters
-    parser.add_argument("--per_gpu_doc_num", default=1800000, type=int,
-                        help="Number of documents to be loaded on the single GPU. Reduce number in case of insufficient GPU memory.")
+    parser.add_argument("--per_gpu_doc_num", default=4000000, type=int,
+                        help="Number of documents to be loaded on the single GPU. Set to 6e6 for 24GB GPU memory. "
+                             "Reduce number in case of insufficient GPU memory.")
     parser.add_argument("--hit", type=int, default=1000)
     parser.add_argument("--embedding_dim", type=int, default=768)
     parser.add_argument("--output_path", type=str,
@@ -310,8 +311,8 @@ if __name__ == "__main__":
     parser.add_argument("--query_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to query embeddings.")
     parser.add_argument("--query_ids", type=str, default=None,
-                        help="A text file containing query IDs, one per line. If provided, will limit retrieval to this"
-                             " subset.")
+                        help="A text file containing query IDs (and possibly other fields, separated by whitespace), "
+                             "one per line. If provided, will limit retrieval to this subset.")
     parser.add_argument("--candidates_path", type=str, default=None,
                         help="""If specified, will rerank candidate (retrieved) documents/passages given in a text a file. 
                         Assumes that retrieved documents per query are given one per line, in the order of rank 
