@@ -1,5 +1,7 @@
 import logging
 
+import options
+
 logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
 logger.info("Loading packages ...")
@@ -935,6 +937,7 @@ def setup(args):
     """
 
     config = utils.load_config(args)  # configuration dictionary
+    config = options.check_args(config)  # check validity of settings and make necessary conversions
 
     # Create output directory and subdirectories
     initial_timestamp = datetime.now()

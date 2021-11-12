@@ -36,10 +36,10 @@ def objective(trial):
     args.warmup_steps = int(trial.suggest_discrete_uniform('warmup_steps', 1000, 20000, 1000))
     # args.final_lr_ratio = trial.suggest_uniform('final_lr_ratio', 0.01, 0.1)
     args.adam_epsilon = trial.suggest_loguniform('adam_epsilon', 1e-8, 2e-6)
-    args.encoder_delay = int(trial.suggest_discrete_uniform('encoder_delay', 0, 20000, 5000))
-    args.encoder_learning_rate = trial.suggest_uniform('encoder_learning_rate', 0.1*args.learning_rate, 2*args.learning_rate) #trial.suggest_loguniform('encoder_learning_rate', 1e-6, 1e-4)
-    args.encoder_warmup_steps = int(trial.suggest_discrete_uniform('encoder_warmup_steps', 5000, 20000, 1000))
-    args.gt_factor = trial.suggest_uniform('gt_factor', 1, 10)
+    # args.encoder_delay = int(trial.suggest_discrete_uniform('encoder_delay', 0, 20000, 5000))
+    # args.encoder_learning_rate = trial.suggest_uniform('encoder_learning_rate', 0.1*args.learning_rate, 2*args.learning_rate) #trial.suggest_loguniform('encoder_learning_rate', 1e-6, 1e-4)
+    # args.encoder_warmup_steps = int(trial.suggest_discrete_uniform('encoder_warmup_steps', 5000, 20000, 1000))
+    # args.gt_factor = trial.suggest_uniform('gt_factor', 1, 10)
 
 
     # args.num_layers = trial.suggest_int('num_layers', 1, 6)
@@ -63,8 +63,8 @@ def objective(trial):
 
 if __name__ == '__main__':
 
-    storage = 'sqlite:////gpfs/data/ceickhof/dcohen_share/mdst_optuna.db'
-    study_name = 'mdst_study_no_decoder_multitier'  # This name is shared across jobs
+    storage = 'sqlite:////gpfs/data/ceickhof/dcohen_share/mdst_optuna2.db'
+    study_name = 'mdst_study_no_decoder_listnet_tasb'  # This name is shared across jobs/workers
     n_trials = 10
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())
     direction = 'minimize' if OPTIM_METRIC in NEG_METRICS else 'maximize'

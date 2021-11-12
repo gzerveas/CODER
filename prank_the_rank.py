@@ -1,3 +1,7 @@
+"""
+Used only for debugging
+"""
+
 import random
 from collections import defaultdict
 import sys

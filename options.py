@@ -9,6 +9,7 @@ POS_METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']  # metrics which are better when 
 POS_METRICS.extend(m + '@' for m in POS_METRICS[:])
 METRICS = NEG_METRICS + POS_METRICS
 
+
 def run_parse_args():
     parser = argparse.ArgumentParser(description='Run a complete training or evaluation. Optionally, a JSON configuration '
                                                  'file can be used, to overwrite command-line arguments.')
@@ -252,43 +253,50 @@ def run_parse_args():
 
     args = parser.parse_args()
 
-    if (args.task is None) and (args.config_filepath is None):
+    return args
+
+
+def check_args(config):
+    """Check validity of settings and make necessary conversions"""
+
+    if config['task'] is None:
         raise ValueError('Please specify task! (train, dev, eval, inspect)')
 
-    if args.task == 'inspect':
-        # args.inject_ground_truth = False
+    if config['task'] == 'inspect':
+        # config['inject_ground_truth'] = False
         # logger.info("Ground truth documents will not be injected among candidates, because `task == 'inspect'`")
-        if args.raw_queries_path is None:
+        if config['raw_queries_path'] is None:
             logger.warning("You must set `raw_queries_path` to inspect original queries.")
-        if args.raw_collection_path is None:
+        if config['raw_collection_path'] is None:
             logger.warning("You must set `raw_collection_path` to inspect original documents.")
 
     # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
-    components = args.key_metric.split('@')
+    components = config['key_metric'].split('@')
     if len(components) > 1:
-        args.key_metric = components[0] + "@{}".format(args.metrics_k)
+        config['key_metric'] = components[0] + "@{}".format(config['metrics_k'])
 
-    if args.resume and (args.load_model_path is None):
+    if config['resume'] and (config['load_model_path'] is None):
         raise ValueError("You can only use option '--resume' when also specifying a model to load!")
 
-    if args.encoder_learning_rate is None:
-        args.encoder_learning_rate = args.learning_rate
+    if config['encoder_learning_rate'] is None:
+        config['encoder_learning_rate'] = config['learning_rate']
 
-    if args.encoder_warmup_steps is None:
-        args.encoder_warmup_steps = args.warmup_steps
+    if config['encoder_warmup_steps'] is None:
+        config['encoder_warmup_steps'] = config['warmup_steps']
 
-    if args.scoring_mode.endswith('softmax') ^ (args.loss_type == 'crossentropy'):
+    if config['scoring_mode'].endswith('softmax') ^ (config['loss_type'] == 'crossentropy'):
         raise ValueError('Cross-entropy loss should be used iff softmax is used for scoring')
 
-    if args.ROP_patience < args.validation_steps:
+    if config['ROP_patience'] < config['validation_steps']:
         raise ValueError('If the patience for "reduce on plataeu" is lower than the validation interval, the learning '
                          'rate will often be decreased erroneously (performance changes are only registered every `validation_steps`).')
 
-    if args.reduce_on_plateau and (args.final_lr_ratio > args.ROP_factor):
+    if config['reduce_on_plateau'] and (config['final_lr_ratio'] > config['ROP_factor']):
         raise ValueError('You have set the final learning rate to be {} of the maximum learning rate, but the ROP_factor'
-                         ' used to reduce the learning rate is {}.'.format(args.final_lr_ratio, args.ROP_factor))
+                         ' used to reduce the learning rate is {}.'.format(config['final_lr_ratio'], config['ROP_factor']))
 
-    args.cuda_ids = [int(x) for x in args.cuda_ids.split(',')]
-    args.n_gpu = len(args.cuda_ids)
+    if type(config['cuda_ids']) is not list:
+        config['cuda_ids'] = [int(x) for x in config['cuda_ids'].split(',')]
+    config['n_gpu'] = len(config['cuda_ids'])
 
-    return args
+    return config
