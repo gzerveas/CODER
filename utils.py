@@ -138,6 +138,31 @@ def load_model(model, model_path, device='cpu', resume=False, change_output=Fals
     return model, global_step, optimizer_state, scheduler_state
 
 
+def load_encoder(model, checkpoint_path, device='cpu'):
+    """
+    Loads query encoder weights from a MDSTransformer model checkpoint
+    :param model: an initialized encoder model object (typically HuggingFace), already on its intended device
+    :param checkpoint_path: MDSTransfomer checkpoint file from which to load encoder weights.
+    :param device: Where to initially load the tensors. The device of 'model' will determine the final destination,
+        but by explicitly setting this to the same device as where `model` resides, intermediate memory allocation may be avoided.
+
+    :return: model: the model object, with weights loaded from a checkpoint
+    """
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)  # Load all tensors onto the CPU
+    for key, val in list(checkpoint['state_dict'].items()):
+        if not(key.startswith('encoder')):  # discard parameter
+            checkpoint['state_dict'].pop(key)
+        else:  # keep parameter after trimming name
+            new_key_name = key[len('encoder.'):]
+            checkpoint['state_dict'][new_key_name] = checkpoint['state_dict'].pop(key)
+    model.load_state_dict(checkpoint['state_dict'], strict=True)
+    logger.info('Loaded model from {}. Global step: {}'.format(checkpoint_path, checkpoint['global_step']))
+
+    return model
+
+
 def move_to_device(obj, device):
 
     state = obj.state if hasattr(obj, 'state') else obj

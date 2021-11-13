@@ -18,6 +18,8 @@ from tqdm import tqdm
 from timeit import default_timer as timer
 from transformers import BertTokenizer, BertConfig, AutoTokenizer, AutoModel
 from torch.utils.data import DataLoader, Dataset
+
+import utils
 from dataset import CollectionDataset, pack_tensor_2D
 from modeling import RepBERT, _select_first_embedding, _average_sequence_embeddings, get_aggregation_function
 from utils import readable_time
@@ -147,12 +149,9 @@ def generate_embeddings(args, model, dataset):
 
     batch_size = args.per_gpu_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly  # TODO: So what?
-    if isinstance(model, RepBERT):
-        model_type = 'repbert'
-    else:  # This will be used for all HuggingFace models
-        model_type = 'huggingface'
+    if args.model_type != 'repbert':  # this will be used for all HuggingFace models
         aggregation_func = get_aggregation_function(args.aggregation)
-    collate_fn = get_collate_function(model_type)
+    collate_fn = get_collate_function(args.model_type)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)  # TODO: Why not more workers?
 
     # multi-gpu inference
@@ -170,7 +169,7 @@ def generate_embeddings(args, model, dataset):
         with torch.no_grad():
             batch = {k: v.to(args.device) for k, v in batch.items()}
             output = model(**batch)
-            if model_type == 'huggingface':
+            if args.model_type != 'repbert':
                 sequence_embeddings = aggregation_func(output[0]).detach().cpu().numpy()
             else:
                 # RepBERT already aggregates (averages) the embeddings, and only returns tensor
@@ -186,9 +185,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Creates memmap files containing embedding vectors of a document "
                                                  "collection and/or queries.")
     ## Required parameters
-    parser.add_argument("--load_model", type=str, required=True,
-                        help="Either path of a pre-trained model directory, "
-                             "or string corresponding to a HuggingFace built-in model.")
+    parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer', 'huggingface'], default='mdstransformer',
+                        help="""Type of the entire (end-to-end) information retrieval model""")
+    parser.add_argument("--encoder_from", type=str,
+                        choices=["bert-base-uncased", "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"],
+                        default="sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco",
+                        help="""Name of built-in Huggingface encoder, or for `model_type` 'huggingface' it can also be 
+                        a directory. 'repbert' always uses 'bert-base-uncased'.""")
+    parser.add_argument("--load_checkpoint", type=str,
+                        help="A path of a pre-trained model directory, `model_type` OTHER THAN 'huggingface'.")
     parser.add_argument("--output_dir", type=str, default=".",
                         help="Directory where embedding memmaps will be created.")
     parser.add_argument("--collection_memmap_dir", type=str, default=None,
@@ -197,8 +202,6 @@ if __name__ == "__main__":
     parser.add_argument("--tokenized_queries", type=str, default=None,
                         help="""JSON file of tokenized/numerized queries. If specified, will generate corresponding
                          query embeddings""")
-    # parser.add_argument("--tokenizer_type", type=str, choices=['bert', 'roberta'], default='bert',
-    #                     help="""Type of tokenizer for the model component used for encoding queries (and passages)""")
     # parser.add_argument("--tokenizer_from", type=str, default=None,
     #                     help="""When used together with `tokenizer_type`, it is an optional path of a directory
     #                     containing a saved custom tokenizer (vocabulary and added tokens). When `tokenizer_type` is not
@@ -209,7 +212,7 @@ if __name__ == "__main__":
                         help="How to aggregate individual token embeddings")
     parser.add_argument("--per_gpu_batch_size", default=100, type=int)
     args = parser.parse_args()
-
+    
     logger.info(args)
 
     # Setup CUDA, GPU 
@@ -222,26 +225,33 @@ if __name__ == "__main__":
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
 
     # Get tokenizer and model
-    if os.path.exists(args.load_model):
+    if args.model_type == 'repbert':
+        if not(os.path.exists(args.load_checkpoint)):
+            raise IOError("For 'repbert', `load_model` should point to a directory with a checkpoint.")
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         logger.info("Loaded tokenizer: {}".format(tokenizer))
-        config = BertConfig.from_pretrained(args.load_model)
+        config = BertConfig.from_pretrained(args.load_checkpoint)
         model = None
-        builtin_model = False
-    else:  # for example, "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"
-        tokenizer = AutoTokenizer.from_pretrained(args.load_model)
+    else:
+        tokenizer_from = args.encoder_from  # for example, "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_from)
         logger.info("Loaded tokenizer: {}".format(tokenizer))
-        logger.info("Loading model from '{}' ...".format(args.load_model))
-        model = AutoModel.from_pretrained(args.load_model)
+
+        logger.info("Loading encoder from: '{}' ...".format(args.encoder_from))
+        model = AutoModel.from_pretrained(args.encoder_from)
         model.to(args.device)
+
+        if args.model_type == 'mdstransformer':  # parameter loading for MDSTransformer checkpoint
+            logger.info("Loading encoder weights from: '{}' ...".format(args.load_checkpoint))
+            model = utils.load_encoder(model, args.load_checkpoint, device)
+            
         model.eval()
-        builtin_model = True
 
     if args.tokenized_queries:
-        if not builtin_model:
+        if args.model_type == 'repbert':
             config.encode_type = "query"
-            logger.info("Loading model from '{}' ...".format(args.load_model))
-            model = RepBERT.from_pretrained(args.load_model, config=config)
+            logger.info("Loading model from '{}' ...".format(args.load_checkpoint))
+            model = RepBERT.from_pretrained(args.load_checkpoint, config=config)
             model.to(args.device)
 
         logger.info("Loading dataset ...")
@@ -252,10 +262,10 @@ if __name__ == "__main__":
         generate_embeddings(args, model, dataset)
 
     if args.collection_memmap_dir:
-        if not builtin_model:
+        if args.model_type == 'repbert':
             config.encode_type = "doc"
-            logger.info("Loading model from '{}' ...".format(args.load_model))
-            model = RepBERT.from_pretrained(args.load_model, config=config)
+            logger.info("Loading model from '{}' ...".format(args.load_checkpoint))
+            model = RepBERT.from_pretrained(args.load_checkpoint, config=config)
             model.to(args.device)
 
         logger.info("Loading dataset ...")

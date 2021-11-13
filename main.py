@@ -983,15 +983,15 @@ def get_dataset(args, eval_mode, tokenizer):
                                inject_ground_truth=args.inject_ground_truth)
 
 
-def get_query_encoder(args):
+def get_query_encoder(query_encoder_from, query_encoder_config):
     """Initialize and return query encoder model object based on args"""
 
-    if os.path.exists(args.query_encoder_from):
-        logger.info("Will load pre-trained query encoder from: {}".format(args.query_encoder_from))
+    if os.path.exists(query_encoder_from):
+        logger.info("Will load pre-trained query encoder from: {}".format(query_encoder_from))
     else:
-        logger.warning("Will initialize standard HuggingFace '{}' as a query encoder!".format(args.query_encoder_from))
+        logger.warning("Will initialize standard HuggingFace '{}' as a query encoder!".format(query_encoder_from))
     start_time = time.time()
-    encoder = AutoModel.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
+    encoder = AutoModel.from_pretrained(query_encoder_from, config=query_encoder_config)
     logger.info("Query encoder loaded in {} s".format(time.time() - start_time))
     return encoder
 
@@ -999,7 +999,7 @@ def get_query_encoder(args):
 def get_model(args, doc_emb_dim=None):
     """Initialize and return end-to-end model object based on args"""
 
-    query_encoder = get_query_encoder(args)
+    query_encoder = get_query_encoder(args.query_encoder_from, args.query_encoder_config)
 
     # TODO: REMOVE! DEBUGGING!
     # query_encoder.apply(lambda x: (torch.nn.init.xavier_uniform_ if hasattr(x, 'dim') else lambda y: y))
