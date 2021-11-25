@@ -207,7 +207,7 @@ def dcg_at_k(relevance, k, method=0):
     return 0.
 
 
-def ndcg_at_k(r, k, method=0):
+def ndcg_at_k(r, k=None, method=0):
     """Score is normalized discounted cumulative gain (ndcg)
     Relevance is positive real values.  Can use binary
     as the previous methods.
@@ -234,6 +234,8 @@ def ndcg_at_k(r, k, method=0):
     Returns:
         Normalized discounted cumulative gain
     """
+    if k is None:
+        k = len(r)
     dcg_max = dcg_at_k(sorted(r, reverse=True), k, method)
     if not dcg_max:
         return 0.

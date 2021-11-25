@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import utils
 from dataset import CollectionDataset, pack_tensor_2D
-from modeling import RepBERT, _select_first_embedding, _average_sequence_embeddings, get_aggregation_function
+from modeling import RepBERT, get_aggregation_function
 from utils import readable_time
 
 logger = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ def generate_embeddings(args, model, dataset):
             batch = {k: v.to(args.device) for k, v in batch.items()}
             output = model(**batch)
             if args.model_type != 'repbert':
-                sequence_embeddings = aggregation_func(output[0]).detach().cpu().numpy()
+                sequence_embeddings = aggregation_func(output[0], batch['attention_mask']).detach().cpu().numpy()
             else:
                 # RepBERT already aggregates (averages) the embeddings, and only returns tensor
                 sequence_embeddings = output.detach().cpu().numpy()
@@ -225,7 +225,7 @@ if __name__ == "__main__":
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
 
     # Get tokenizer and model
-    if args.model_type == 'repbert':
+    if args.model_type == 'repbert':  # for 'RepBERT' model class
         if not(os.path.exists(args.load_checkpoint)):
             raise IOError("For 'repbert', `load_model` should point to a directory with a checkpoint.")
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
@@ -241,7 +241,7 @@ if __name__ == "__main__":
         model = AutoModel.from_pretrained(args.encoder_from)
         model.to(args.device)
 
-        if args.model_type == 'mdstransformer':  # parameter loading for MDSTransformer checkpoint
+        if args.model_type == 'mdstransformer':  # parameter loading for 'MDSTransformer' checkpoint
             logger.info("Loading encoder weights from: '{}' ...".format(args.load_checkpoint))
             model = utils.load_encoder(model, args.load_checkpoint, device)
             

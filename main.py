@@ -458,7 +458,7 @@ def calculate_metrics(relevances, num_relevant, k):
 
                                 ('MRR', metrics.mean_reciprocal_rank(relevances)),
                                 ('MAP', metrics.mean_average_precision(relevances)),
-                                ('nDCG', np.mean([metrics.ndcg_at_k(rel, k) for rel in relevances]))])
+                                ('nDCG', np.mean([metrics.ndcg_at_k(rel) for rel in relevances]))])
     return eval_metrics
 
 

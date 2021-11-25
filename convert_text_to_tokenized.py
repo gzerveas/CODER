@@ -68,9 +68,9 @@ if __name__ == "__main__":
                         using `tokenizer_from`.
                         If not set, then `tokenizer_from` should be used to initialize one of the built-in HuggingFace tokenizers.""")
     parser.add_argument("--tokenizer_from", type=str, default=None,
-                        help="""When used together with `tokenizer_type`, it is an optional path of a directory 
-                        containing a saved custom tokenizer (vocabulary and added tokens). When `tokenizer_type` is not
-                        set, it is a string used to initialize one of the built-in HuggingFace tokenizers.""")
+                        help="""When `tokenizer_type` is not set, it is a string used to initialize one of the built-in HuggingFace tokenizers.
+                        When used together with `tokenizer_type`, it is an optional path of a directory 
+                        containing a saved custom tokenizer (vocabulary and added tokens). """)
     args = parser.parse_args()
 
     if not os.path.exists(args.output_dir):
