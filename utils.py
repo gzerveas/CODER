@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import xlrd
 import xlwt
-from xlutils.copy import copy
+import xlutils.copy
 import psutil
 
 import logging
@@ -236,7 +236,7 @@ def load_config(args):
     will be used to override specified options.
     """
 
-    config = args.__dict__  # configuration dictionary
+    config = deepcopy(args.__dict__)  # configuration dictionary
 
     if args.config_filepath is not None:
         logger.info("Reading configuration ...")
@@ -318,7 +318,7 @@ def export_record(filepath, values):
     read_sheet = read_book.sheet_by_index(0)
     last_row = read_sheet.nrows
 
-    work_book = copy(read_book)
+    work_book = xlutils.copy.copy(read_book)
     sheet = work_book.get_sheet(0)
     write_row(sheet, last_row, values)
     work_book.save(filepath)

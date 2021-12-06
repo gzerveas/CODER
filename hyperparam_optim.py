@@ -28,29 +28,31 @@ def objective(trial):
     ## Optuna overrides
     args.no_timestamp = False  # otherwise all results will be overwriting the same directory
     # args.scoring_mode = trial.suggest_categorical('scoring_mode', ['dot_product',  'dot_product_gelu']) #, 'dot_product', 'raw'])
-    args.optimizer = trial.suggest_categorical('optimizer', ['AdamW', 'RAdam'])
-    args.weight_decay = trial.suggest_loguniform('weight_decay', 1e-6, 5e-2)
+    # args.optimizer = trial.suggest_categorical('optimizer', ['AdamW', 'RAdam'])
+    # args.weight_decay = trial.suggest_loguniform('weight_decay', 1e-6, 5e-2)
     # args.num_candidates = trial.suggest_int('num_candidates', 10, 400)
     # args.num_inbatch_neg = trial.suggest_int('num_inbatch_neg', 10, 400)
-    args.learning_rate = trial.suggest_loguniform('learning_rate', 1e-7, 1e-4)
+    args.learning_rate = trial.suggest_uniform('learning_rate', 0.5*args.encoder_learning_rate, 5*args.encoder_learning_rate) #trial.suggest_loguniform('learning_rate', 1e-7, 1e-4)
     args.warmup_steps = int(trial.suggest_discrete_uniform('warmup_steps', 1000, 20000, 1000))
     # args.final_lr_ratio = trial.suggest_uniform('final_lr_ratio', 0.01, 0.1)
-    args.adam_epsilon = trial.suggest_loguniform('adam_epsilon', 1e-8, 2e-6)
-    # args.encoder_delay = int(trial.suggest_discrete_uniform('encoder_delay', 0, 20000, 5000))
-    # args.encoder_learning_rate = trial.suggest_uniform('encoder_learning_rate', 0.1*args.learning_rate, 2*args.learning_rate) #trial.suggest_loguniform('encoder_learning_rate', 1e-6, 1e-4)
+    # args.adam_epsilon = trial.suggest_loguniform('adam_epsilon', 1e-8, 2e-6)
+    args.encoder_delay = int(trial.suggest_discrete_uniform('encoder_delay', 10000, 20000, 5000))
+    # args.encoder_learning_rate = trial.suggest_uniform('encoder_learning_rate', 0.1*args.learning_rate, 2*args.learning_rate) #trial.suggest_loguniform('encoder_learning_rate', 1e-7, 1e-5)
     # args.encoder_warmup_steps = int(trial.suggest_discrete_uniform('encoder_warmup_steps', 5000, 20000, 1000))
     # args.gt_factor = trial.suggest_uniform('gt_factor', 1, 10)
 
 
-    # args.num_layers = trial.suggest_int('num_layers', 1, 6)
-    # max_lognumheads = 4 if args.num_layers > 4 else 5
-    # args.num_heads = 2 ** trial.suggest_int('log2_num_heads', 3, max_lognumheads)
+    args.num_layers = trial.suggest_int('num_layers', 1, 4)
+    max_lognumheads = 3 if args.num_layers > 3 else 4
+    args.num_heads = 2 ** trial.suggest_int('log2_num_heads', 3, max_lognumheads)
     # max_dmodel = 768 if args.num_layers > 4 else 1024
     # args.d_model = trial.suggest_int('d_model', 768//2, 1024)  # int(trial.suggest_discrete_uniform('d_model', 768//2, max_dmodel, args.num_heads))  # divisible by num_heads
     # if args.d_model % args.num_heads != 0:
     #     raise ValueError("'d_model' must be divisible by 'num_heads'")
-    # max_dimFF = min(2*args.d_model, 1500)
-    # args.dim_feedforward = trial.suggest_int('dim_feedforward', int(0.5*args.d_model), max_dimFF)
+    if args.d_model is None:
+        args.d_model = 768
+    max_dimFF = min(2*args.d_model, 1500)
+    args.dim_feedforward = trial.suggest_int('dim_feedforward', int(1.5*args.d_model), max_dimFF)
 
     config = setup(args)  # configuration dictionary containing the arguments as specified in main.py and overriden above
     best_values = main(config)  # best metrics found during evaluation
@@ -64,7 +66,7 @@ def objective(trial):
 if __name__ == '__main__':
 
     storage = 'sqlite:////gpfs/data/ceickhof/dcohen_share/mdst_optuna2.db'
-    study_name = 'mdst_study_no_decoder_listnet_tasb'  # This name is shared across jobs/workers
+    study_name = 'mdst_study_decoder_listnet_tasb'  # This name is shared across jobs/workers
     n_trials = 10
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())
     direction = 'minimize' if OPTIM_METRIC in NEG_METRICS else 'maximize'

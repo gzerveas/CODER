@@ -353,7 +353,9 @@ class RelevanceListnetLoss(nn.Module):
 
 class MultiTierLoss(nn.Module):
     """
-    Multiple tiers of relevance for negative documents.
+    Uses multiple tiers of relevance for candidate documents, determined by their ranking from the candidate retrieval method.
+    Encourages that the similarity score between the query and all documents in each tier is higher than the similarity
+    between the query and all documents from lower tiers.
     """
     def __init__(self, num_tiers=3, tier_size=50, tier_distance=None, diff_function='maxmargin', gt_function=None, gt_factor=2, reduction='mean'):
         """
@@ -365,7 +367,7 @@ class MultiTierLoss(nn.Module):
         :param gt_function: special loss function to be applied for calculating the extra contribution of the ground truth
                             relevant documents. If None, no special treatment will be given to ground truth relevant
                             documents in the loss calculation, besides including them in the top tier
-        :param gt_factor: scaling factor of special ground truth component
+        :param gt_factor: scaling factor (coefficient) of special ground truth component computed by `gt_function`
         :param reduction: if 'none', a loss for each batch item (query) will be computed, otherwise the 'mean' or 'sum'
                         over queries in the batch
         """
@@ -386,7 +388,7 @@ class MultiTierLoss(nn.Module):
             self.gt_function = self.compute_gt_diffs
         elif gt_function == 'multilabelmargin':  # this is equivalent to 'same' with `diff_function`=='maxmargin', but much faster (avoids Python loop over batch_size)
             self.gt_function = nn.MultiLabelMarginLoss(reduction='none')
-        else:  # if None, no special treatment for ground truth relevant documents
+        else:  # if None, no special treatment for ground truth relevant documents.
             self.gt_function = gt_function
         self.gt_factor = gt_factor
 
@@ -491,15 +493,15 @@ class MultiTierLoss(nn.Module):
         return loss
 
 
-def get_loss_module(args):
+def get_loss_module(loss_type, args):
 
-    if args.loss_type == 'multilabelmargin':
+    if loss_type == 'multilabelmargin':
         return nn.MultiLabelMarginLoss()
-    elif args.loss_type == 'crossentropy':
+    elif loss_type == 'crossentropy':
         return RelevanceCrossEntropyLoss()
-    elif args.loss_type == 'listnet':
+    elif loss_type == 'listnet':
         return RelevanceListnetLoss()
-    elif args.loss_type == 'multitier':
+    elif loss_type == 'multitier':
         return MultiTierLoss(num_tiers=args.num_tiers, tier_size=args.tier_size, tier_distance=args.tier_distance,
                              diff_function=args.diff_function,
                              gt_function=args.gt_function,
@@ -730,7 +732,8 @@ class MDSTransformer(nn.Module):
                  activation: str = "relu", normalization: str = "LayerNorm", positional_encoding=None,
                  doc_emb_dim: int = None,
                  scoring_mode='cross_attention', query_emb_aggregation='mean',
-                 loss_module=None, selfatten_mode=0, no_decoder=False, no_dec_crossatten=False, transform_doc_emb=False,
+                 loss_module=None, aux_loss_module=None, aux_loss_coeff=0,
+                 selfatten_mode=0, no_decoder=False, no_dec_crossatten=False, transform_doc_emb=False,
                  bias_regul_coeff=0.0, bias_regul_cutoff=100) -> None:
         super(MDSTransformer, self).__init__()
 
@@ -796,6 +799,8 @@ class MDSTransformer(nn.Module):
         self.score_docs = self.get_scoring_module(scoring_mode, query_emb_aggregation)
 
         self.loss_module = loss_module
+        self.aux_loss_module = aux_loss_module
+        self.aux_loss_coeff = aux_loss_coeff
         
         self.bias_regul_coeff = bias_regul_coeff
         self.bias_regul_cutoff = bias_regul_cutoff
@@ -911,7 +916,8 @@ class MDSTransformer(nn.Module):
         ## final loss
         if labels is not None:
             loss = self.loss_module(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
-            
+            if self.aux_loss_module is not None and (self.aux_loss_coeff > 0):  # add auxiliary loss, if specified
+                loss += self.aux_loss_coeff * self.aux_loss_module(rel_scores, labels.to(torch.int64))
             if bias_regul_term is not None:
                 if self.bias_regul_coeff < 0:
                     loss = rel_scores.new([0])[0]

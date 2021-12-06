@@ -66,7 +66,9 @@ def run_parse_args():
     parser.add_argument("--collection_memmap_dir", type=str,
                         help="Optional: Memmap dir containing token IDs for each collection document. RepBERT or 'inspect' mode only!")  # RepBERT/inspect only
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
-    parser.add_argument('--load_model', dest='load_model_path', type=str, help='Path to pre-trained model.')
+    parser.add_argument('--load_model', dest='load_model_path', type=str,
+                        help='Path to pre-trained model checkpoint. If specified, the model weights will be loaded, BUT NOT the state'
+                             'of the optimizer/scheduler. To resume training, additionally set the flag `--resume`.')
     # The following are currently used only if `model_type` is NOT 'repbert'
     parser.add_argument("--query_encoder_from", type=str, default="bert-base-uncased",
                         help="""A string used to initialize the query encoder weights and config object: 
@@ -220,8 +222,15 @@ def run_parse_args():
                         default='raw', help='Scoring function to map the final embeddings to scores')
     parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier'},
                         default='multilabelmargin', help='Loss applied to document scores')
+    parser.add_argument('--aux_loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier', None},
+                        default=None,
+                        help='Auxiliary loss (optional). If specified, it will be multiplied by `aux_loss_coeff` and '
+                             'added to the main loss.')
+    parser.add_argument('--aux_loss_coeff', type=float, default=0,
+                        help="Coefficient of auxiliary loss term specified by `aux_loss_type`.")
     parser.add_argument('--num_tiers', type=int, default=4,
-                        help="Number of relevance tiers for `loss_type` 'multitier'")
+                        help="Number of relevance tiers for `loss_type` 'multitier'. "
+                             "Ground truth documents are not considered a separate tier.")
     parser.add_argument('--tier_size', type=int, default=50,
                         help="Number of candidates within each tier of relevance for `loss_type` 'multitier'")
     parser.add_argument('--tier_distance', type=int, default=None,
@@ -278,6 +287,10 @@ def check_args(config):
     if config['resume'] and (config['load_model_path'] is None):
         raise ValueError("You can only use option '--resume' when also specifying a model to load!")
 
+    if (config['load_model_path'] is not None) and not config['resume']:
+        logger.warning("Only model weights will be loaded from '{}'. "
+                       "Set option `--resume` if you wish to restore optimizer/scheduler.".format(config['load_model_path']))
+
     if config['encoder_learning_rate'] is None:
         config['encoder_learning_rate'] = config['learning_rate']
 
@@ -297,6 +310,8 @@ def check_args(config):
 
     if type(config['cuda_ids']) is not list:
         config['cuda_ids'] = [int(x) for x in config['cuda_ids'].split(',')]
-    config['n_gpu'] = len(config['cuda_ids'])
+
+    if config['aux_loss_type'] is not None and (config['aux_loss_coeff'] <= 0):
+        raise ValueError('You have specified an auxiliary loss, but not a positive `aux_loss_coeff`')
 
     return config

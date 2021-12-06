@@ -798,7 +798,8 @@ def main(config):
 
     logger.info('Running:\n{}\n'.format(' '.join(sys.argv)))  # command used to run
 
-    # Setup CUDA, GPU 
+    # Setup CUDA, GPU
+    args.n_gpu = len(args.cuda_ids)
     if torch.cuda.is_available():
         if args.n_gpu > 1:
             args.device = torch.device("cuda")
@@ -809,6 +810,11 @@ def main(config):
 
     # Log current hardware setup
     logger.info("Device: %s, n_gpu: %s", args.device, args.n_gpu)
+    if args.device.type == 'cuda':
+        logger.info("Device: {}".format(torch.cuda.get_device_name(0)))
+        total_mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
+        logger.info("Total memory: {} MB".format(np.ceil(total_mem)))
+
 
     # ##### TODO: HACK TO DEBUG hyperparam_optim
     #
@@ -949,21 +955,27 @@ def setup(args):
     output_dir = os.path.join(output_dir, config['experiment_name'])
 
     formatted_timestamp = initial_timestamp.strftime("%Y-%m-%d_%H-%M-%S")
-    config['initial_timestamp'] = formatted_timestamp
     if (not config['no_timestamp']) or (len(config['experiment_name']) == 0):
         rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
         output_dir += "_" + formatted_timestamp + "_" + rand_suffix
     config['output_dir'] = output_dir
-    config['save_dir'] = os.path.join(output_dir, 'checkpoints')
-    config['pred_dir'] = os.path.join(output_dir, 'predictions')
-    config['tensorboard_dir'] = os.path.join(output_dir, 'tb_summaries')
-    utils.create_dirs([config['save_dir'], config['pred_dir'], config['tensorboard_dir']])
+    os.makedirs(output_dir, exist_ok=True)
 
     # Save configuration as a (pretty) json file
     with open(os.path.join(output_dir, 'configuration.json'), 'w') as fp:
         json.dump(config, fp, indent=4, sort_keys=True)
-
     logger.info("Stored configuration file in '{}'".format(output_dir))
+
+    # Create subdirectories and store additional configuration info
+    info_dict = {'initial_timestamp': formatted_timestamp,
+                 'save_dir': os.path.join(output_dir, 'checkpoints'),
+                 'pred_dir': os.path.join(output_dir, 'predictions'),
+                 'tensorboard_dir': os.path.join(output_dir, 'tb_summaries')}
+    utils.create_dirs([info_dict['save_dir'], info_dict['pred_dir'], info_dict['tensorboard_dir']])
+    with open(os.path.join(output_dir, 'info.txt'), 'w') as fp:
+        for item in info_dict.items():
+            json.dump(item, fp)
+    config.update(info_dict)
 
     return config
 
@@ -1001,13 +1013,12 @@ def get_model(args, doc_emb_dim=None):
 
     query_encoder = get_query_encoder(args.query_encoder_from, args.query_encoder_config)
 
-    # TODO: REMOVE! DEBUGGING!
-    # query_encoder.apply(lambda x: (torch.nn.init.xavier_uniform_ if hasattr(x, 'dim') else lambda y: y))
-    # query_encoder.init_weights()
-
     if args.model_type == 'mdstransformer':
 
-        loss_module = get_loss_module(args)
+        loss_module = get_loss_module(args.loss_type, args)
+        aux_loss_module = None
+        if args.aux_loss_type is not None:
+            aux_loss_module = get_loss_module(args.aux_loss_type, args)  # instantiate auxiliary loss module
 
         return MDSTransformer(custom_encoder=query_encoder,
                               d_model=args.d_model,
@@ -1019,11 +1030,13 @@ def get_model(args, doc_emb_dim=None):
                               normalization=args.normalization_layer,
                               doc_emb_dim=doc_emb_dim,
                               scoring_mode=args.scoring_mode,
+                              query_emb_aggregation=args.query_aggregation,
                               loss_module=loss_module,
+                              aux_loss_module=aux_loss_module,
+                              aux_loss_coeff=args.aux_loss_coeff,
                               selfatten_mode=args.selfatten_mode,
                               no_decoder=args.no_decoder,
                               no_dec_crossatten=args.no_dec_crossatten,
-                              query_emb_aggregation=args.query_aggregation,
                               bias_regul_coeff=args.bias_regul_coeff,
                               bias_regul_cutoff=args.bias_regul_cutoff)
     else:
