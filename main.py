@@ -820,7 +820,7 @@ def main(config):
     # ##### TODO: HACK TO DEBUG hyperparam_optim
     #
     # def fitness_func(args):
-    #     fitness = - 1e-3*np.abs(args.warmup_steps - 5000) - 1e5*args.weight_decay + 1e-4*args.num_candidates*args.num_inbatch_neg \
+    #     fitness = - 1e-3*np.abs(args.warmup_steps - 5000) - 1e5*args.weight_decay + 1e-4*args.num_candidates*args.num_random_neg \
     #               - 2e-3*(args.num_candidates - 200)**2 + 1e-2*max(512, args.d_model) - (args.dim_feedforward - 1.5*args.d_model)**2
     #     return fitness
     #

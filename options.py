@@ -111,7 +111,7 @@ def run_parse_args():
                              " in `candidates_path` file. If None, all found document IDs will be used. "
                              "If no `candidates_path` is provided, negatives will be sampled from the entire collection"
                              " at random, and therefore `num_candidates` in this case CANNOT be None.")
-    parser.add_argument('--num_inbatch_neg', type=int, default=0,
+    parser.add_argument('--num_random_neg', type=int, default=0,
                         help="Number of negatives to randomly sample from other queries in the batch for training. "
                              "If 0, only documents in `candidates_path` will be used as negatives.")
 

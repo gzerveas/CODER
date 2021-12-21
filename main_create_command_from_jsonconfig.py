@@ -70,5 +70,5 @@ for k, v in params_loaded.items():
 
 run_command(command)
 
-#--data_num_workers 0  --gpu-id 0 --train_limit_size 256 --logging_steps 2 --num_candidates 30 --num_inbatch_neg 30 --load_collection_to_memory"
+#--data_num_workers 0  --gpu-id 0 --train_limit_size 256 --logging_steps 2 --num_candidates 30 --num_random_neg 30 --load_collection_to_memory"
 

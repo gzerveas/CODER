@@ -10,13 +10,13 @@ python ~/Code/multidocscoring_transformer/main.py --help
 ### Train (in debug mode)
 
 ```bash
-python ~/Code/multidocscoring_transformer/main.py --debug --name DEBUG --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --train_limit_size 256 --logging_steps 2 --num_candidates 30 --num_inbatch_neg 30 --load_collection_to_memory
+python ~/Code/multidocscoring_transformer/main.py --debug --name DEBUG --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --train_limit_size 256 --logging_steps 2 --num_candidates 30 --num_random_neg 30 --load_collection_to_memory
 ```
 
 ### Train
 
 ```bash
-python ~/Code/multidocscoring_transformer/main.py --name Informative_ParamValue3 --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --num_candidates 30 --num_inbatch_neg 30 --load_collection_to_memory
+python ~/Code/multidocscoring_transformer/main.py --name Informative_ParamValue3 --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --num_candidates 30 --num_random_neg 30 --load_collection_to_memory
 ```
 
 ### Evaluate

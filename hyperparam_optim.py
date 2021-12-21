@@ -31,7 +31,7 @@ def objective(trial):
     # args.optimizer = trial.suggest_categorical('optimizer', ['AdamW', 'RAdam'])
     # args.weight_decay = trial.suggest_loguniform('weight_decay', 1e-6, 5e-2)
     # args.num_candidates = trial.suggest_int('num_candidates', 10, 400)
-    # args.num_inbatch_neg = trial.suggest_int('num_inbatch_neg', 10, 400)
+    # args.num_random_neg = trial.suggest_int('num_random_neg', 10, 400)
     args.learning_rate = trial.suggest_uniform('learning_rate', 0.5*args.encoder_learning_rate, 5*args.encoder_learning_rate) #trial.suggest_loguniform('learning_rate', 1e-7, 1e-4)
     args.warmup_steps = int(trial.suggest_discrete_uniform('warmup_steps', 1000, 20000, 1000))
     # args.final_lr_ratio = trial.suggest_uniform('final_lr_ratio', 0.01, 0.1)
