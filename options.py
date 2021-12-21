@@ -48,9 +48,11 @@ def run_parse_args():
     parser.add_argument("--qrels_path", type=str,
                         help="Path of the text file or directory with the ground truth relevance labels, qrels")
     parser.add_argument("--train_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv",
-                        help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini")
+                        help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini."
+                             " If not provided, candidates will be sampled at random from the entire collection.")
     parser.add_argument("--eval_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.dev.tsv",
-                        help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini")
+                        help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini."
+                             " If not provided, candidates will be sampled at random from the entire collection.")
     parser.add_argument("--embedding_memmap_dir", type=str, default="repbert/representations/doc_embedding",
                         help="Directory containing (num_docs_in_collection, doc_emb_dim) memmap array of document "
                              "embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs")
@@ -65,6 +67,12 @@ def run_parse_args():
                         help=".tsv file which contains raw text documents (ID <tab> text). Used only for 'inspect' mode.")
     parser.add_argument("--collection_memmap_dir", type=str,
                         help="Optional: Memmap dir containing token IDs for each collection document. RepBERT or 'inspect' mode only!")  # RepBERT/inspect only
+    parser.add_argument('--train_query_ids', type=str,
+                        help="Optional: Path to a file containing the query IDs to be used for training, 1 in each line. "
+                             "When not specified, the IDs in `train_candidates_path` are used.")
+    parser.add_argument('--eval_query_ids', type=str,
+                        help="Optional: Path to a file containing the query IDs to be used for evaluation, 1 in each line. "
+                             "When not specified, the IDs in `eval_candidates_path` are used.")
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
     parser.add_argument('--load_model', dest='load_model_path', type=str,
                         help='Path to pre-trained model checkpoint. If specified, the model weights will be loaded, BUT NOT the state'
@@ -100,7 +108,9 @@ def run_parse_args():
                         help="Optional: Number of tokens to keep from each document. Used for RepBERT or 'inspect' mode only")
     parser.add_argument('--num_candidates', type=int, default=None,
                         help="Number of document IDs to sample from all document IDs corresponding to a query and found"
-                             " in `candidates_path` file. If None, all found document IDs will be used.")
+                             " in `candidates_path` file. If None, all found document IDs will be used. "
+                             "If no `candidates_path` is provided, negatives will be sampled from the entire collection"
+                             " at random, and therefore `num_candidates` in this case CANNOT be None.")
     parser.add_argument('--num_inbatch_neg', type=int, default=0,
                         help="Number of negatives to randomly sample from other queries in the batch for training. "
                              "If 0, only documents in `candidates_path` will be used as negatives.")

@@ -6,22 +6,20 @@ from functools import partial
 from itertools import chain
 import time
 import sys
-import re
-import ipdb
 
 import numpy as np
 from tqdm import tqdm
 from transformers import BertTokenizer
 import torch
 from torch.utils.data import Dataset
-import pandas as pd
 
 import utils
 
 logger = logging.getLogger(__name__)
 
 BERT_BASE_DIM = 768
-MAX_DOCS = 1000
+# NOTE: MAX_DOCS should depend on the GPU memory, but maybe it's better to crush rather than silently scoring fewer documents than the user specified
+MAX_DOCS = int(1e12)  # 1000
 
 lookup_times = utils.Timer()  # stores measured times
 sample_fetching_times = utils.Timer()
@@ -97,13 +95,13 @@ class EmbeddedSequences:
         else:
             id_filename = 'ids.memmap'
             sorted_nat_ids = False  # even in MSMARCO, query IDs are NOT the sequence 0, 1, 2 ...
-        ids = np.memmap(os.path.join(embedding_memmap_dir, id_filename), mode='r', dtype='int32')
+        self.ids = np.memmap(os.path.join(embedding_memmap_dir, id_filename), mode='r', dtype='int32')
 
         self.sorted_nat_ids = sorted_nat_ids  # whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1
         self.id2ind = None  # no mapping dictionary in case sorted == True
-        self.map_id_to_ind = self.get_id_to_ind_mapping(ids)  # ID-to-matrix_index mapping function
+        self.map_id_to_ind = self.get_id_to_ind_mapping(self.ids)  # ID-to-matrix_index mapping function
 
-        self.num_sequences = len(ids)  # number of rows of embedding matrix (i.e. number of sequences)
+        self.num_sequences = len(self.ids)  # number of rows of embedding matrix (i.e. number of sequences)
         # shape is necessary input argument; this information is not stored and a 1D array is loaded by default
         self.embedding_vectors = np.memmap(os.path.join(embedding_memmap_dir, "embedding.memmap"), mode='r', dtype='float32')
         self.embedding_vectors = self.embedding_vectors.reshape((self.num_sequences, -1))
@@ -137,7 +135,7 @@ class EmbeddedSequences:
 
 class CandidatesDataset:
     """The result of a retrieval stage: rank-sorted document / passages per query, in the form of doc/passage IDs
-    memmap array"""
+    memmap array of shape (num_queries, num_candidates)"""
 
     def __init__(self, memmap_dir, max_docs=None, load_to_memory=False):
         """
@@ -147,7 +145,7 @@ class CandidatesDataset:
             memmap file on disk.
         :param load_to_memory: If true, will load entire candidates array as np.array to memory, instead of memmap!
             Needs ~2GB for MSMARCO training set (212MB for dev set) with 1000 candidates per query
-            (~XGB prigram total), but is faster.
+            (~XGB program total), but is faster.
         """
         # if max_docs is None:
         #     try:
@@ -302,6 +300,16 @@ def load_qrels(filepath):
 #     return candidates_df.iloc[:, 0]  # select only 1st column (pIDs), ignoring ranking and scores
 
 
+def load_query_ids(filepath):
+    """Loads query IDs from a file which contains 1 ID per line (and possibly more fields on its right, separated by whitespace)"""
+    query_ids = []
+    with open(filepath, 'r') as f:
+        for line in f:
+            qid, *_ = line.strip().split()  # read first field, ignore the rest, if any exist
+            query_ids.append(int(qid))
+    return query_ids
+
+
 class MYMARCO_Dataset(Dataset):
     """
     Used for passages (the terms passage/document used interchangeably in the documentation).
@@ -318,7 +326,7 @@ class MYMARCO_Dataset(Dataset):
                  embedding_memmap_dir, queries_tokenids_path, candidates_path, qrels_path=None,
                  tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
                  limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False,
-                 collection_neutrality_path=None):
+                 collection_neutrality_path=None, query_ids_path=None):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
@@ -341,6 +349,10 @@ class MYMARCO_Dataset(Dataset):
             reading matrix from `embedding_memmap_dir`
         :param inject_ground_truth: if True, during evaluation the ground truth relevant documents will be always included in the
             candidate documents, even if they weren't part of the original candidates. (Helps isolate effect of first-stage recall)
+        :param collection_neutrality_path: path to file containing neutrality scores, in the format: docID \t score\n
+        :param query_ids_path: Path to a file containing the query IDs to be used for this dataset, 1 in each line.
+            If not provided, the IDs in the memmap inside `candidates_path` will be used.
+            If that is also not provided, the IDs inside `queries_tokenids_path` will be used.
         """
         self.mode = mode  # "train", "dev", "eval"
         self.documents_neutrality = None
@@ -348,8 +360,8 @@ class MYMARCO_Dataset(Dataset):
             logger.info("Loading document neutrality scores ...")
             # TODO: put this into separate function
             self.documents_neutrality = {}
-            for l in open(collection_neutrality_path):
-                vals = l.strip().split('\t')
+            for line in open(collection_neutrality_path):
+                vals = line.strip().split('\t')
                 self.documents_neutrality[int(vals[0])] = float(vals[1])    
         self.inject_ground_truth = inject_ground_truth  # if True, during evaluation the ground truth relevant documents will be always part of the candidate documents
         if self.inject_ground_truth:
@@ -372,19 +384,44 @@ class MYMARCO_Dataset(Dataset):
         self.queries = load_query_tokenids(queries_tokenids_path)  # dict: {qID : list of token IDs}
         logger.info("Done in {:.3f} sec".format(time.time() - start_time))
 
-        start_time = time.time()
-        logger.info("Opening retrieved candidates for queries memmap in '{}' ...".format(candidates_path))
-        self.candidates = CandidatesDataset(candidates_path, load_to_memory=True)
-        logger.info("Done in {:.3f} sec".format(time.time() - start_time))
-        logger.info("Size of candidates: {} MB".format(round(sys.getsizeof(self.candidates.doc_ids)/1024**2)))
-        self.qids = self.candidates.qids  # memmap array of qIDs as found in retrieved candidates file
-        self.limit_dataset_size(limit_size)  # Potentially changes candidates, qids
+        if query_ids_path is None:  # typical case
+            self.qids = None  # query IDs used for this dataset
+        else:
+            self.qids = load_query_ids(query_ids_path)  # query IDs used for this dataset
+            logger.info("Loaded {} query IDs from: '{}'".format(len(self.qids), query_ids_path))
+
+        if candidates_path is not None:  # this is the typical case
+            start_time = time.time()
+            logger.info("Opening retrieved candidates for queries memmap in '{}' ...".format(candidates_path))
+            self.candidates = CandidatesDataset(candidates_path, load_to_memory=True)
+            logger.info("Done in {:.3f} sec".format(time.time() - start_time))
+            logger.info("Size of candidates: {} MB".format(round(sys.getsizeof(self.candidates.doc_ids)/1024**2)))
+
+            if self.qids is None:  # this is the typical case
+                self.qids = self.candidates.qids  # assign memmap array of qIDs as found in retrieved candidates file
+            else:
+                # NOTE: the following is done for efficiency, but is probably unnecessary
+                self.update_candidates(self.qids)
+
+        else:  # if no candidate documents are provided, they will be randomly sampled from the collection
+            logger.warning("Will randomly sample all documents for this dataset!")
+            self.candidates = None
+            if self.qids is None:  # Since no candidates file is provided, unless query IDs are explicitly given,
+                self.qids = list(self.queries.keys())  # the IDs from the tokenized queries file will be used
+
+        self.limit_dataset_size(limit_size)  # Potentially trims self.qids, self.candidates
 
         if mode != 'eval':
             if os.path.isdir(qrels_path):
                 qrels_path = os.path.join(qrels_path, "qrels.{}.tsv".format(mode))
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
             self.qrels = load_qrels(qrels_path)  # dict{qID: dict{pID: relevance}}
+            extra_qids = set(self.qids) - set(self.qrels.keys())
+            if len(extra_qids) > 0:  # fail early if there are missing labels
+                err_str = "{} query IDs in the specified '{}' dataset do not exist in '{}'!".format(len(extra_qids), mode, qrels_path)
+                logger.critical(err_str)
+                logger.info("Extra query IDs: {}".format(extra_qids))
+                raise ValueError(err_str)
         else:
             self.qrels = None
 
@@ -409,9 +446,23 @@ class MYMARCO_Dataset(Dataset):
                 limit_size = int(limit_size * len(self.qids))
             if limit_size < len(self.qids):
                 self.qids = self.qids[:limit_size]
-                self.candidates.doc_ids = self.candidates.doc_ids[:limit_size, :]
-                # self.candidates.lengths = self.candidates.lengths[:limit_size]
-                # self.candidates.get_qid_to_ind_mapping(self.qids)
+                # NOTE: the following is done for efficiency, but is probably unnecessary
+                if self.candidates is not None:
+                    self.update_candidates(self.qids)
+        return
+
+    def update_candidates(self, qids):
+        """
+        NOTE: This may require less memory, but is probably unnecessary and definitely completely optional.
+        Redefines the query IDs to be the specified iterable, instead of the original memmap array.
+        When qids change, it trims the self.candidates memmap accordingly.  To accommodate this change, it also
+        updates the qid2ind dictionary and corresponding map_qid_to_ind function inside self.candidates
+        """
+        self.candidates.qids = qids
+        query_inds = self.candidates.map_qid_to_ind(qids)  # current indices of qIDs corresponding to memmap arrays
+        self.candidates.doc_ids = self.candidates.doc_ids[query_inds, :]  # trims the candidates memmap
+        self.candidates.lengths = self.candidates.lengths[query_inds]
+        self.candidates.get_qid_to_ind_mapping(qids)  # updates candidates.qid2ind dict and map_qid_to_ind
         return
 
     def __len__(self):
@@ -437,7 +488,11 @@ class MYMARCO_Dataset(Dataset):
         query_token_ids = [self.cls_id] + query_token_ids + [self.sep_id]
 
         tic = time.perf_counter()
-        doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of relevance
+        if self.candidates is not None:  # typical case
+            doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of relevance
+        else:  # if no candidates are provided, randomly samples from entire collection
+            # NOTE: For MSMARCO, self.emb_collection.ids can be replaced with len(self.emb_collection)
+            doc_ids = np.random.choice(self.emb_collection.ids, size=self.num_candidates, replace=False)
         retrieve_candidates_times.update(time.perf_counter() - tic)
         doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
@@ -489,15 +544,43 @@ class MYMARCO_Dataset(Dataset):
                        max_candidates=max_candidates, n_gpu=n_gpu, inject_ground_truth=self.inject_ground_truth,
                        documents_neutrality=self.documents_neutrality)
 
+# TODO: UNDER CONSTRUCTION!
+# TODO: the `collate_function` needs document embeddings for all random negatives. Can't work without passing a memmap of doc_embeddings
+def get_random_negatives(batch_candidates, query_candidates, collection_documents, num_negatives):
+    """
+    :param batch_candidates: set-like object of all docIDs in batch
+    :param query_candidates: set-like object of candidate docIDs for a specific query, referred to as `qID`
+    :param collection_documents: iterable of all docIDs in the collection
+    :param num_negatives: total number or negatives to be returned for query `qID`
+    :return:
+    """
 
-# TODO: can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
+    other_inbatch_negatives = batch_candidates - query_candidates  # candidates corresponding to queries other than `qID`
+    num_remaining = num_negatives - len(other_inbatch_negatives)
+    if num_remaining > num_negatives/2:
+        inbatch_negatives = list(other_inbatch_negatives)
+        # This guarantees that even in the extremely unlikely event of `other_inbatch_negatives` being a full subset, we have enough extra documents
+        new_random = np.random.choice(collection_documents, size=num_negatives, replace=False)
+        for doc in new_random:
+            if len(inbatch_negatives) == num_negatives:
+                break
+            if doc not in other_inbatch_negatives:
+                inbatch_negatives.append(doc)
+        inbatch_negatives = list(np.random.choice(list(other_inbatch_negatives), size=num_inbatch_neg, replace=False))
+    inbatch_negatives = list(np.random.choice(list(other_inbatch_negatives), size=num_inbatch_neg, replace=False))
+    return
+
+
+
+# TODO: Can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
+# TODO: It would also eliminate the need for a separate `collection_doc_ids` argument
 def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_candidates=MAX_DOCS, n_gpu=1,
                      inject_ground_truth=False, documents_neutrality=None):
     """
     :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, rel_docs)
     :param mode: 'train', 'dev', or 'eval'
     :param pad_token_id: ID of token used for padding queries
-    :param num_inbatch_neg: number of negatives to randomly sample from other queries in the batch.
+    :param num_inbatch_neg: number of negatives to randomly sample from candidates of other queries in the batch.
         Can only be > 0 if mode == 'train'
     :param max_candidates: maximum number of candidates per query to be scored by the model (capacity of model)
     :return:
@@ -553,7 +636,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
                    for cands in doc_ids]
 
         # local doc embedding matrix. It is only slightly (if at all) smaller than `assembled_emb_mat`, because the chance of
-        # duplicate docIDs in the original (unaugmented) `doc_ids` is very small #TODO: so its creation can be omitted
+        # duplicate docIDs in the original (unaugmented) `doc_ids` is very small - unless queries (and thus candidates) in the same batch are related
         local_emb_mat = torch.zeros(len(unique_candidates) + 1,  # we make 1 extra row at the end, for padding!
                                     doc_embeddings[0].shape[-1])  # (num_unique_docs, emb_dim)
         for i, docid in enumerate(unique_candidates):
@@ -577,6 +660,7 @@ def collate_function(batch_samples, mode, pad_token_id, num_inbatch_neg=0, max_c
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
+    # TODO: move this to separate function?
     if documents_neutrality is not None:
         doc_neutscores = []
         for doc_ids_batch in doc_ids:

@@ -53,7 +53,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                                     limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
                                     emb_collection=val_dataloader.dataset.emb_collection,
-                                    collection_neutrality_path=args.collection_neutrality_path)
+                                    collection_neutrality_path=args.collection_neutrality_path,
+                                    query_ids_path=args.train_query_ids)
     collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg, n_gpu=args.n_gpu)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
@@ -973,8 +974,7 @@ def setup(args):
                  'tensorboard_dir': os.path.join(output_dir, 'tb_summaries')}
     utils.create_dirs([info_dict['save_dir'], info_dict['pred_dir'], info_dict['tensorboard_dir']])
     with open(os.path.join(output_dir, 'info.txt'), 'w') as fp:
-        for item in info_dict.items():
-            json.dump(item, fp)
+        json.dump(info_dict, fp)
     config.update(info_dict)
 
     return config
@@ -989,10 +989,11 @@ def get_dataset(args, eval_mode, tokenizer):
     else:
         return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_path, args.eval_candidates_path,
                                qrels_path=args.qrels_path, tokenizer=tokenizer,
-                               max_query_length=args.max_query_length, num_candidates=None,
+                               max_query_length=args.max_query_length, num_candidates=args.num_candidates,
                                limit_size=args.eval_limit_size,
                                load_collection_to_memory=args.load_collection_to_memory,
-                               inject_ground_truth=args.inject_ground_truth)
+                               inject_ground_truth=args.inject_ground_truth,
+                               query_ids_path=args.eval_query_ids)
 
 
 def get_query_encoder(query_encoder_from, query_encoder_config):
