@@ -1,7 +1,6 @@
 import math
 import logging
 from typing import Optional, Any, Dict
-import ipdb
 
 import torch
 import numpy as np
@@ -916,6 +915,7 @@ class MDSTransformer(nn.Module):
         ## final loss
         if labels is not None:
             loss = self.loss_module(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
+
             if self.aux_loss_module is not None and (self.aux_loss_coeff > 0):  # add auxiliary loss, if specified
                 loss += self.aux_loss_coeff * self.aux_loss_module(rel_scores, labels.to(torch.int64))
             if bias_regul_term is not None:

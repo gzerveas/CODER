@@ -22,7 +22,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, SequentialSampler
 # from transformers.modeling_bert import BERT_PRETRAINED_MODEL_ARCHIVE_MAP
-from transformers import BertConfig, BertTokenizer, RobertaTokenizer, BertModel, RobertaModel, AutoTokenizer, AutoModel
+from transformers import BertConfig, AutoTokenizer, AutoModel
 
 # Package modules
 from options import *
@@ -55,7 +55,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                                     emb_collection=val_dataloader.dataset.emb_collection,
                                     collection_neutrality_path=args.collection_neutrality_path,
                                     query_ids_path=args.train_query_ids)
-    collate_fn = train_dataset.get_collate_func(num_inbatch_neg=args.num_inbatch_neg, n_gpu=args.n_gpu)
+    collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
     utils.write_list(os.path.join(args.output_dir, "train_IDs.txt"), train_dataset.qids)
@@ -89,9 +89,6 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
         optimizer.add_optimizer(encoder_optimizer)
     if optim_state is not None:
         optimizer.load_state_dict(optim_state)
-        # TODO: Moving doesn't seem necessary
-        # utils.move_to_device(nonencoder_optimizer, args.device)
-        # utils.move_to_device(encoder_optimizer, args.device)
         logger.info('Loaded optimizer(s) state')
         logger.debug('optimizer.defaults["lr"]: {}'.format(optimizer.optimizers[0].defaults["lr"]))
 
@@ -981,7 +978,7 @@ def setup(args):
 
 
 def get_dataset(args, eval_mode, tokenizer):
-    """Initialize and return dataset object based on args"""
+    """Initialize and return evaluation dataset object based on args"""
 
     if args.model_type == 'repbert':
         return MSMARCODataset(eval_mode, args.msmarco_dir, args.collection_memmap_dir, args.tokenized_path,
@@ -989,7 +986,8 @@ def get_dataset(args, eval_mode, tokenizer):
     else:
         return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_path, args.eval_candidates_path,
                                qrels_path=args.qrels_path, tokenizer=tokenizer,
-                               max_query_length=args.max_query_length, num_candidates=args.num_candidates,
+                               max_query_length=args.max_query_length,
+                               num_candidates=None,  # Always use ALL candidates for evaluation
                                limit_size=args.eval_limit_size,
                                load_collection_to_memory=args.load_collection_to_memory,
                                inject_ground_truth=args.inject_ground_truth,

@@ -492,4 +492,7 @@ class Timer(object):
         return
 
     def get_average(self):
-        return self.total_time / self.count
+        if self.count:
+            return self.total_time / self.count
+        else:
+            return None

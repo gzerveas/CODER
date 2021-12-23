@@ -490,8 +490,14 @@ class MYMARCO_Dataset(Dataset):
         if self.candidates is not None:  # typical case
             doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of relevance
         else:  # if no candidates are provided, randomly samples from entire collection
-            # NOTE: For MSMARCO, self.emb_collection.ids can be replaced with len(self.emb_collection)
-            doc_ids = np.random.choice(self.emb_collection.ids, size=self.num_candidates, replace=False)
+            # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
+            # Sampling time does not depend on the number of sampled values; only on the size of the sample set!
+            num_safety_docs = 100  # to account for non-unique randomly sampled documents
+            # For MSMARCO, self.emb_collection.ids can be replaced with len(self.emb_collection) -- when replace=True, x10000 faster!???
+            if self.emb_collection.id2ind is None:  # if document IDs are ordinal numbers:
+                doc_ids = list(set(np.random.choice(len(self.emb_collection), size=(self.num_candidates+num_safety_docs), replace=True)))
+            else:  # x2 faster than if replace=False
+                doc_ids = list(set(np.random.choice(self.emb_collection.ids, size=(self.num_candidates+num_safety_docs), replace=True)))
         retrieve_candidates_times.update(time.perf_counter() - tic)
         doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
@@ -508,10 +514,6 @@ class MYMARCO_Dataset(Dataset):
                 doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
             prep_docids_times.update(time.perf_counter() - tic)
 
-
-        tic = time.perf_counter()
-        #doc_embeddings = torch.tensor(self.emb_collection[doc_ids])  # (num_doc_ids, emb_dim) tensor of doc. embeddings
-        lookup_times.update(time.perf_counter() - tic)
         sample_fetching_times.update(time.perf_counter() - sample_fetching_start)
         return qid, query_token_ids, doc_ids, rel_docs
 
@@ -528,52 +530,37 @@ class MYMARCO_Dataset(Dataset):
         else:
             return candidates
 
-    def get_collate_func(self, num_inbatch_neg=0, max_candidates=MAX_DOCS, n_gpu=1):
+    def get_collate_func(self, num_random_neg=0, max_candidates=MAX_DOCS, n_gpu=1):
         """
-        :param num_inbatch_neg: number of negatives to randomly sample from other queries in the batch.
+        :param num_random_neg: number of negatives to randomly sample from other queries in the batch.
             Can only be > 0 if mode == 'train'
         :param max_candidates: maximum number of candidates per query to be scored by the model (capacity of model)
             `num_candidates` will be reduced accordingly, if necessary.
+        :param n_gpu: number of GPUs used for data parallelism
         :return: function with a single argument, which corresponds to a list of individual sample data. Used by DataLoader
         """
         if self.mode != 'train':
-            num_inbatch_neg = 0
+            num_random_neg = 0
 
         return partial(collate_function, emb_collection=self.emb_collection, mode=self.mode, pad_token_id=self.pad_id,
-                       num_inbatch_neg=num_inbatch_neg, max_candidates=max_candidates, n_gpu=n_gpu,
+                       num_random_neg=num_random_neg, max_candidates=max_candidates, n_gpu=n_gpu,
                        inject_ground_truth=self.inject_ground_truth,
                        documents_neutrality=self.documents_neutrality)
 
-# TODO: UNDER CONSTRUCTION!
-# TODO: the `collate_function` needs document embeddings for all random negatives. Can't work without passing a memmap of doc_embeddings
-def get_random_negatives(batch_candidates, query_candidates, collection_documents, num_negatives):
+
+def get_docID_to_localind_mapping(doc_ids):
+    """Maps unique docIDs to rows of local embedding matrix
+    :param doc_ids: (batch_size) list of lists of candidate (retrieved) document IDs corresponding to a query in `qids`.
     """
-    :param batch_candidates: set-like object of all docIDs in batch
-    :param query_candidates: set-like object of candidate docIDs for a specific query, referred to as `qID`
-    :param collection_documents: iterable of all docIDs in the collection
-    :param num_negatives: total number or negatives to be returned for query `qID`
-    :return:
-    """
-
-    other_inbatch_negatives = batch_candidates - query_candidates  # candidates corresponding to queries other than `qID`
-    num_remaining = num_negatives - len(other_inbatch_negatives)
-    if num_remaining > num_negatives/2:
-        inbatch_negatives = list(other_inbatch_negatives)
-        # This guarantees that even in the extremely unlikely event of `other_inbatch_negatives` being a full subset, we have enough extra documents
-        new_random = np.random.choice(collection_documents, size=num_negatives, replace=False)
-        for doc in new_random:
-            if len(inbatch_negatives) == num_negatives:
-                break
-            if doc not in other_inbatch_negatives:
-                inbatch_negatives.append(doc)
-        inbatch_negatives = list(np.random.choice(list(other_inbatch_negatives), size=num_inbatch_neg, replace=False))
-    inbatch_negatives = list(np.random.choice(list(other_inbatch_negatives), size=num_inbatch_neg, replace=False))
-    return
+    docID_to_localind = OrderedDict()
+    localind = 0
+    for ID in chain.from_iterable(doc_ids):
+        if ID not in docID_to_localind:
+            docID_to_localind[ID] = localind
+            localind += 1
+    return docID_to_localind
 
 
-
-# TODO: Can I pass the np.memmap instead of a list of doc_emb arrays (inside batch)? This would replace `assembled_emb_mat` and `docID_to_localind`
-# TODO: It would also eliminate the need for a separate `collection_doc_ids` argument
 def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_random_neg=0, max_candidates=MAX_DOCS,
                      n_gpu=1, inject_ground_truth=False, documents_neutrality=None):
     """
@@ -585,16 +572,19 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
     :param num_random_neg: number of negatives to randomly sample from candidates of other queries in the batch.
         Can only be > 0 if mode == 'train'
     :param max_candidates: maximum number of candidates per query to be scored by the model (capacity of model)
+    :param n_gpu: number of GPUs used for data parallelism
+    :param inject_ground_truth: If true, the ground truth document(s) will always be included in the set of documents
+        to be reranked for each query, even if it was not present in the candidates inside `batch_samples`."
     :return:
         qids: (batch_size) list of query IDs
         doc_ids: (batch_size) list of lists of candidate (retrieved) document IDs corresponding to a query in `qids`.
-            If num_inbatch_neg > 0, it includes the docIDs of randomly sampled in-batch negatives
+            If num_random_neg > 0, it includes the docIDs of randomly sampled in-batch negatives
         data: dict to serve as input to the model. Contains:
             query_token_ids: (batch_size, max_query_len) int tensor of query token IDs
             query_mask: (batch_size, max_query_len) bool tensor of padding mask corresponding to query; 1 use, 0 ignore
             doc_padding_mask: (batch_size, max_docs_per_query) boolean tensor indicating padding (0) or valid (1) elements
                 in `doc_emb` or `docinds`
-            If num_inbatch_neg > 0, additionally contains:
+            If num_random_neg > 0, additionally contains:
             local_emb_mat: (num_unique_docIDs, emb_dim) tensor of local doc embedding matrix containing emb. vectors
                 of all unique documents in the batch.  Used to lookup document vectors in nn.Embedding on the GPU
                 This is done to avoid replicating embedding vectors of in-batch negatives, thus sparing GPU bandwidth.
@@ -625,24 +615,42 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
         # For this purpose, we pass a smaller local doc embedding matrix containing emb. vectors of all documents
         # in the batch and a dictionary mapping docID to local indices corresponding to this matrix
 
-        # assembled_emb_mat = torch.cat(doc_embeddings, dim=0)  # (batch_size*num_docs_per_query, emb_dim)
+        docID_to_localind = get_docID_to_localind_mapping(doc_ids)  # maps unique docIDs to rows of local embedding matrix
+        unique_candidates = docID_to_localind.keys()  # all unique document IDs in the batch (akin to a set, but keeping the order)
 
-        # maps unique docIDs to rows of local embedding matrix
-        docID_to_localind = OrderedDict((ID, i) for i, ID in enumerate(chain.from_iterable(doc_ids)))
-        # get all unique document IDs in the batch. This is an object akin to a set, but keeping the order
-        unique_candidates = docID_to_localind.keys()  # all unique document IDs in the batch
+        try:
+            # augment doc_ids with randomly sampled document IDs from candidates retrieved for other qIDs in the batch
+            doc_ids = [(cands + list(
+                np.random.choice(list(unique_candidates - set(cands)), size=num_random_neg, replace=False)))[:max_candidates]
+                       for cands in doc_ids]
+        except ValueError:  # this happens when not enough in-batch documents exist to satisfy num_random_neg per query
+            # Sample additional random documents (on top of in-batch)
+            # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
+            # Sampling time does not depend on the number of sampled values; only on the size of the population set!
+            # However, we still want to use as few unique documents in the batch as possible (because it takes GPU memory, bandwidth and computation)
+            exp_shared = 3  # safety factor. Number of docs/query expected to be non-unique (shared with other queries) or missing
+            num_cand = len(doc_ids[0])  # number of retrieved candidates per query. exp_shared covers queries with fewer candidates
+            num_remaining = batch_size * (num_random_neg - len(unique_candidates) + num_cand + exp_shared)
 
-        num_remaining = num_random_neg*(batch_size - 1) - len(unique_candidates)  # how many additional (on top of in-batch) random documents to sample
+            # For MSMARCO, doc IDs can be replaced with ordinal numbers -- when replace=True, x10000 faster!??
+            if emb_collection.id2ind is None:  # if document IDs are ordinal numbers:
+                extra_docs = np.random.choice(len(emb_collection), size=num_remaining)
+            else:  # much slower
+                extra_docs = np.random.choice(emb_collection.ids, size=num_remaining)
+            negatives_pool = set(unique_candidates) | set(extra_docs)  # in-batch and randomly sampled documents
 
-        # augment doc_ids with randomly sampled document IDs from candidates retrieved for other qIDs in the batch
-        doc_ids = [(cands + list(
-            np.random.choice(list(unique_candidates - set(cands)), size=num_random_neg, replace=False)))[:max_candidates]
-                   for cands in doc_ids]
+            doc_ids = [(cands + list(
+                np.random.choice(list(negatives_pool - set(cands)), size=num_random_neg, replace=False)))[:max_candidates]
+                       for cands in doc_ids]  # replace=False doesn't hurt here, because the population is small
+            docID_to_localind = get_docID_to_localind_mapping(doc_ids)  # maps unique docIDs to rows of local embedding matrix
+            unique_candidates = docID_to_localind.keys()  # all unique document IDs in the batch (akin to a set, but keeping the order)
 
         # Assemble (num_unique_docs + 1, emb_dim) local doc embedding matrix: to add an emb. corresponding to padding,
         # we concatenate 1 extra row of 0s at the end of the (num_unique_docs, emb_dim) tensor of unique doc. embeddings
-        local_emb_mat = torch.cat((torch.tensor(emb_collection[unique_candidates]),
+        tic = time.perf_counter()
+        local_emb_mat = torch.cat((torch.tensor(emb_collection[list(unique_candidates)]),
                                    torch.zeros((1, emb_collection.embedding_vectors.shape[-1]))), dim=0)
+        lookup_times.update(time.perf_counter() - tic)
 
         data['docinds'], data['doc_padding_mask'] = prepare_docinds_and_mask(doc_ids, docID_to_localind,
                                                                              padding_idx=local_emb_mat.shape[0]-1)
@@ -656,7 +664,9 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
         doc_emb_mask = torch.zeros(doc_emb_tensor.shape[:2], dtype=torch.bool)  # (batch_size, padded_length)
         for i, docids in enumerate(doc_ids):
             end = min(len(docids), max_docs_per_query)
-            doc_emb_tensor[i, :end, :] = emb_collection[docids[:end]]
+            tic = time.perf_counter()
+            doc_emb_tensor[i, :end, :] = torch.tensor(emb_collection[docids[:end]])
+            lookup_times.update(time.perf_counter() - tic)
             doc_emb_mask[i, :end] = 1
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
