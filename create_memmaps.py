@@ -45,13 +45,13 @@ def convert_collection_to_memmap(tokenized_file, memmap_dir, max_length, file_pr
     pids = np.memmap(pids_memmap_path, dtype='int32', mode='w+', shape=(collection_size,))
     lengths = np.memmap(lengths_memmap_path, dtype='int32', mode='w+', shape=(collection_size,))
 
-    for idx, line in enumerate(tqdm(open(tokenized_file), desc="Documents", total=collection_size)):
+    for i, line in enumerate(tqdm(open(tokenized_file), desc="Documents", total=collection_size)):
         data = json.loads(line)
-        assert int(data['id']) == idx
-        pids[idx] = idx
+        # assert int(data['id']) == idx  # This holds for MSMARCO, but not generally
+        pids[i] = int(data['id'])
         ids = data['ids'][:max_length]
-        lengths[idx] = len(data['ids'])
-        token_ids[idx, :lengths[idx]] = ids
+        lengths[i] = len(data['ids'])
+        token_ids[i, :lengths[i]] = ids
     return
 
 

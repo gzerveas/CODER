@@ -303,7 +303,7 @@ class RelevanceCrossEntropyLoss(nn.Module):
                 indicating non-relevance.
         :return: loss: scalar tensor. Mean loss per document
         """
-        # WARNING: works only because relevant documents are always prepended at the beginning, and thus labels are e.g. [0, 1, 2, -1, ..., -1]
+        # WARNING: works assuming that `labels` aren't scores but integer indices of relevant documents padded with -1, e.g. [0, 1, 2, -1, ..., -1]
 
         # For the entire batch, calculate one loss component from positive documents and one from negatives, normalizing by their numbers.
         # Here, queries with more positive (and negative) documents contribute more to the loss calculation than queries
@@ -333,7 +333,7 @@ class RelevanceListnetLoss(nn.Module):
                 indicating non-relevance.
         :return: loss: scalar tensor. Mean loss per query
         """
-        # WARNING: works only because relevant documents are always prepended at the beginning, and thus labels are e.g. [0, 1, 2, -1, ..., -1]
+        # WARNING: works assuming that `labels` aren't scores but integer indices of relevant documents padded with -1, e.g. [0, 1, 2, -1, ..., -1]
 
         _labels_values = labels.new_zeros(labels.shape, dtype=torch.float32)
         is_relevant = (labels > -1)
@@ -471,8 +471,7 @@ class MultiTierLoss(nn.Module):
         # Treating as "positives" the documents within each tier, the loss compares
         # their scores to the scores of documents in all lower tiers (and the ones in-between lower tiers)
         # complexity O(num_tiers)
-        loss = torch.zeros(scores.shape[0], dtype=torch.float32,
-                           device=scores.device)  # (batch_size,) loss for each query
+        loss = torch.zeros(scores.shape[0], dtype=torch.float32, device=scores.device)  # (batch_size,) loss for each query
         for t in range(self.num_tiers - 1):
             # variant to compare with immediately lower tier: inds2 = range(start_inds[t+1], start_inds[t+1] + self.tier_size)
             loss += self.compute_diffs(scores, range(start_inds[t], start_inds[t] + self.tier_size),
@@ -628,8 +627,7 @@ class LinearTransformerDecoderLayer(nn.TransformerDecoderLayer):
         tgt2 = self.act1(self.linear_attn_substitute(tgt))
         tgt = self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask, key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
@@ -687,8 +685,7 @@ class ReducedTransformerDecoderLayer(nn.TransformerDecoderLayer):
         """
 
         tgt = self.norm1(tgt)
-        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask, key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
@@ -789,7 +786,7 @@ class MDSTransformer(nn.Module):
 
         # project document representation vectors to match dimensionality of d_model
         self.project_documents = None
-        if (self.doc_emb_dim != self.d_model) or (transform_doc_emb):
+        if (self.doc_emb_dim != self.d_model) or transform_doc_emb:
             self.project_documents = nn.Linear(self.doc_emb_dim, self.d_model)
             logger.warning("Using {} dim. for transformer model dimension; will project document embeddings "
                            "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
@@ -894,25 +891,25 @@ class MDSTransformer(nn.Module):
         else:
             rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores
             
-        ## fairness regularization term  # TODO: put in a separate function
+        # Fairness regularization term  # TODO: wrap in a separate function
         bias_regul_term = None
         if doc_neutscore is not None:
 
             _cutoff = np.min([self.bias_regul_cutoff, doc_neutscore.shape[1]])
 
             _indices_sorted = torch.argsort(rel_scores, dim=1, descending=True)
-            _indices_sorted[_indices_sorted<_cutoff] = -1
-            _indices_sorted[_indices_sorted!=-1] = 0
-            _indices_sorted[_indices_sorted==-1] = 1
+            _indices_sorted[_indices_sorted < _cutoff] = -1
+            _indices_sorted[_indices_sorted != -1] = 0
+            _indices_sorted[_indices_sorted == -1] = 1
             _indices_mask = doc_neutscore.new_zeros(doc_neutscore.shape)    
-            _indices_mask[_indices_sorted==0] = float("-Inf")
+            _indices_mask[_indices_sorted == 0] = float("-Inf")
 
             doc_neutscore_probs = torch.nn.Softmax(dim=1)(doc_neutscore + _indices_mask)
             rel_scores_logprobs = torch.nn.LogSoftmax(dim=1)(rel_scores + _indices_mask)
 
             bias_regul_term = torch.nn.KLDivLoss(reduction='batchmean')(rel_scores_logprobs, doc_neutscore_probs)
 
-        ## final loss
+        # Compute loss
         if labels is not None:
             loss = self.loss_module(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
 
@@ -928,7 +925,8 @@ class MDSTransformer(nn.Module):
             return {'loss': loss, 'rel_scores': rel_scores}
         return {'rel_scores': rel_scores}
 
-    def lookup_doc_emb(self, docinds, local_emb_mat):
+    @staticmethod
+    def lookup_doc_emb(docinds, local_emb_mat):
         """
         Lookup document vectors in `local_emb_mat` corresponding to rows given in `docinds`.
         This is done to avoid replicating embedding vectors of in-batch negatives, thus sparing GPU bandwidth.
@@ -937,7 +935,8 @@ class MDSTransformer(nn.Module):
         embedding = torch.nn.Embedding.from_pretrained(local_emb_mat, freeze=True, padding_idx=local_emb_mat.shape[0]-1)
         return embedding(docinds.to(torch.int64))
 
-    def generate_square_subsequent_mask(self, sz: int) -> Tensor:
+    @staticmethod
+    def generate_square_subsequent_mask(sz: int) -> Tensor:
         r"""Generate a square mask for the sequence. The masked positions are filled with float('-inf').
             Unmasked positions are filled with 0.
         """

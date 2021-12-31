@@ -56,7 +56,7 @@ def run_parse_args():
     parser.add_argument("--embedding_memmap_dir", type=str, default="repbert/representations/doc_embedding",
                         help="Directory containing (num_docs_in_collection, doc_emb_dim) memmap array of document "
                              "embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs")
-    parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",  # TODO: rename "queries_path"
+    parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",  # TODO: rename "tokenized_queries_path"
                         help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file.")
     parser.add_argument("--raw_queries_path", type=str,
                         help="Optional: .tsv file which contains raw text queries (ID <tab> text). Used only for 'inspect' mode.")
@@ -114,6 +114,13 @@ def run_parse_args():
     parser.add_argument('--num_random_neg', type=int, default=0,
                         help="Number of negatives to randomly sample from other queries in the batch for training. "
                              "If 0, only documents in `candidates_path` will be used as negatives.")
+    parser.add_argument('--include_zero_labels', action='store_true',
+                        help="If set, it will include documents with a zero relevance score from "
+                             " `qrels_path` in the set of candidate documents (as negatives). "
+                             "Typically set if one expects these to be 'good quality' negatives.")
+    parser.add_argument("--relevance_labels_mapping", type=str, default=None,
+                        help="Optional: A string used to define a dictionary used to override/map relevance scores as "
+                             "given in `qrels_path` to a new value, e.g. {1: 0.333}")
 
     ## System
     parser.add_argument('--debug', action='store_true', help="Activate debug mode (displays more information)")
@@ -259,7 +266,7 @@ def run_parse_args():
                         help="Scaling factor of ground truth component for `loss_type` 'multitier'")
 
 
-    ## Fairness
+    ## Debiasing (bias/neutrality regularization)
     parser.add_argument("--collection_neutrality_path", type=str,
                         help="path to the file containing neutrality values of documents in tsv format (docid [tab] score)")
     parser.add_argument("--background_set_runfile_path", type=str, 
@@ -323,5 +330,8 @@ def check_args(config):
 
     if config['aux_loss_type'] is not None and (config['aux_loss_coeff'] <= 0):
         raise ValueError('You have specified an auxiliary loss, but not a positive `aux_loss_coeff`')
+
+    if config['relevance_labels_mapping'] is not None:
+        config['relevance_labels_mapping'] = eval(config['relevance_labels_mapping'])  # convert string to dict
 
     return config

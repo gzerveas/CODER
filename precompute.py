@@ -112,7 +112,7 @@ class MSMARCO_DocDataset(Dataset):
     def __getitem__(self, item):
         pid = self.pids[item]
         doc_input_ids = self.collection[pid]
-        doc_input_ids = doc_input_ids[:self.max_doc_length]
+        doc_input_ids = doc_input_ids[:self.max_doc_length - 2]  # -2 to account for START/END tokens
         doc_input_ids = [self.cls_id] + doc_input_ids + [self.sep_id]
 
         ret_val = {
@@ -188,10 +188,12 @@ if __name__ == "__main__":
     parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer', 'huggingface'], default='mdstransformer',
                         help="""Type of the entire (end-to-end) information retrieval model""")
     parser.add_argument("--encoder_from", type=str,
-                        choices=["bert-base-uncased", "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"],
                         default="sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco",
                         help="""Name of built-in Huggingface encoder, or for `model_type` 'huggingface' it can also be 
                         a directory. 'repbert' always uses 'bert-base-uncased'.""")
+    parser.add_argument("--tokenizer_from", type=str, default=None,
+                        help="""Optional: name of built-in Huggingface tokenizer, or for `model_type` 'huggingface' it can also be 
+                        a directory. If not specified, it will be the same as `encoder_from`.""")
     parser.add_argument("--load_checkpoint", type=str,
                         help="A path of a pre-trained model directory, `model_type` OTHER THAN 'huggingface'.")
     parser.add_argument("--output_dir", type=str, default=".",
@@ -233,8 +235,9 @@ if __name__ == "__main__":
         config = BertConfig.from_pretrained(args.load_checkpoint)
         model = None
     else:
-        tokenizer_from = args.encoder_from  # for example, "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_from)
+        if args.tokenizer_from is None:
+            args.tokenizer_from = args.encoder_from  # for example, "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_from)
         logger.info("Loaded tokenizer: {}".format(tokenizer))
 
         logger.info("Loading encoder from: '{}' ...".format(args.encoder_from))

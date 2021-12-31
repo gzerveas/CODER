@@ -1,8 +1,8 @@
-# Multiple Document Scoring Transformer
+# CODER: COntextualized Document Embedding Reranking
 
 ## Example commands
 
-### Show and explain all options
+### Show and explain all options for training, evaluation, inspection
 ```bash
 python ~/Code/multidocscoring_transformer/main.py --help
 ```

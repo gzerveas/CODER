@@ -18,7 +18,8 @@ import utils
 logger = logging.getLogger(__name__)
 
 BERT_BASE_DIM = 768
-# NOTE: MAX_DOCS should depend on the GPU memory, but maybe it's better to crush rather than silently scoring fewer documents than the user specified
+# NOTE: MAX_DOCS should depend on the GPU memory, but maybe it's better to crush
+# rather than silently scoring fewer documents than the user specified
 MAX_DOCS = int(1e12)  # 1000
 
 lookup_times = utils.Timer()  # stores measured times
@@ -49,27 +50,33 @@ class CollectionDataset:
             self.token_ids = self.token_ids.reshape((self.collection_size, -1))
         logger.info("Tokenized doc collection memmap array shape: {}, type: {}".format(self.token_ids.shape, type(self.token_ids)))
 
+        self.sorted_nat_ids = np.array_equal(self.pids, np.array(range(self.collection_size), dtype=int))  # check whether IDs are the sequence 0, 1, ...
+        if self.sorted_nat_ids:  # this is True for MSMARCO
+            self.id2ind = None
+            self.map_id_to_ind = lambda x: x
+        else:
+            self.id2ind = OrderedDict((ID, i) for i, ID in enumerate(self.pids))
+            self.map_id_to_ind = self.id2ind.get  # ID-to-matrix_index mapping function
+
     def __len__(self):
         return self.collection_size
 
-    def __getitem__(self, ind):
+    def __getitem__(self, item):
         """
-        :param ind: integer index of passage/doc in collection
+        :param item: integer index of passage/doc in collection
         :return: list (unpadded) of token IDs corresponding to ind
         """
-        assert self.pids[ind] == ind  # NOTE: pids happen to be stored as 0, 1, 2, ... in collection.tsv of MSMARCO
+        ind = self.map_id_to_ind(item)  # convert ID/index to ordinal index
         return self.token_ids[ind, :self.lengths[ind]].tolist()
 
 
 class EmbeddedSequences:
     """Document / passage collection or queries in the form of embeddings memmap"""
 
-    def __init__(self, embedding_memmap_dir, sorted_nat_ids=False, load_to_memory=False, seq_type='document'):
+    def __init__(self, embedding_memmap_dir, load_to_memory=False, seq_type='document'):
         """
         :param embedding_memmap_dir: directory containing memmap file of precomputed document/query embeddings, and the
             corresponding passage/doc/queries IDs in another memmpap file
-        :param sorted_nat_ids: whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1, and
-            doc embeddings are stored exactly in that order (is True for MSMARCO passage collection). A bit more efficient.
         :param load_to_memory: If true, will load entire embedding array as np.array to memory, instead of memmap!
             Needs ~26GB for MSMARCO document collection (~50GB project total), but is faster.
         :param seq_type: 'document' or 'query'. What type of sequences are contained in specified memmap
@@ -94,11 +101,12 @@ class EmbeddedSequences:
             id_filename = "pids.memmap"
         else:
             id_filename = 'ids.memmap'
-            sorted_nat_ids = False  # even in MSMARCO, query IDs are NOT the sequence 0, 1, 2 ...
         self.ids = np.memmap(os.path.join(embedding_memmap_dir, id_filename), mode='r', dtype='int32')
 
-        self.sorted_nat_ids = sorted_nat_ids  # whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1
-        self.id2ind = None  # no mapping dictionary in case sorted == True
+        # Check whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1, and
+        # doc embeddings are stored exactly in that order (is True for MSMARCO passage collection, but not for queries).
+        # If so, overall a bit more efficient, but a lot more efficient when sampling (non-in-batch) random negative documents
+        self.sorted_nat_ids = np.array_equal(self.ids, np.array(range(len(self.ids)), dtype=int))  # sorted natural integers as IDs
         self.map_id_to_ind = self.get_id_to_ind_mapping(self.ids)  # ID-to-matrix_index mapping function
 
         self.num_sequences = len(self.ids)  # number of rows of embedding matrix (i.e. number of sequences)
@@ -115,7 +123,7 @@ class EmbeddedSequences:
     def get_id_to_ind_mapping(self, ids):
         """Returns function used to map a list of IDs to the corresponding integer indices of the embedding matrix"""
         if self.sorted_nat_ids:
-            assert np.array_equal(ids, np.array(range(len(ids)), dtype=int))  # check that indeed IDs are the sequence 0, 1, ...
+            self.id2ind = None  # no mapping dictionary in case of sorted natural integers as IDs
             return lambda x: x
         else:
             self.id2ind = OrderedDict((ID, i) for i, ID in enumerate(ids))
@@ -229,7 +237,7 @@ def load_querydoc_pairs(msmarco_dir, mode):
     Has 2 separate modes with very different behavior
     :param msmarco_dir: dir containing qidpidtriples.train.small.tsv, qrels.train.tsv, top1000.{mode}
     :param mode:
-        if "train", reads train triples file, then qrels.train file (TODO: why here?),
+        if "train", reads train triples file, then qrels.train file (GEO: why here?),
         and returns a qrels dict: {qID : set of relevant pIDs}, and aligned lists of qids, pids, labels (0 or 1).
         Within these 3 lists, each triple is broken into 2  successive elements:
         qids = [..., qid1, qid1, ...], pids = [..., pid1_pos, pid1_neg, ...], labels = [..., 1, 0, ...]
@@ -237,10 +245,8 @@ def load_querydoc_pairs(msmarco_dir, mode):
     """
     qrels = defaultdict(set)  # dict: {qID : set of relevant pIDs}
     qids, pids, labels = [], [], []
-    if mode == "train":
-        for line in tqdm(open(f"{msmarco_dir}/qidpidtriples.train.small.tsv"),
-                         # TODO: this file does not exist. RepBERT team made it
-                         desc="load train triples"):
+    if mode == "train":  # GEO: this triples file does not exist. RepBERT team made it
+        for line in tqdm(open(f"{msmarco_dir}/qidpidtriples.train.small.tsv"), desc="load train triples"):
             qid, pos_pid, neg_pid = line.split("\t")
             qid, pos_pid, neg_pid = int(qid), int(pos_pid), int(neg_pid)
             qids.append(qid)
@@ -257,18 +263,22 @@ def load_querydoc_pairs(msmarco_dir, mode):
             qid, pid, _, _ = line.split("\t")  # the _ account for query and passage text (not used)
             qids.append(int(qid))
             pids.append(int(pid))
-    qrels = dict(qrels)  # TODO: why need to convert to simple dict?! especially here and not within previous `if` !?
+    qrels = dict(qrels)  # GEO: why need to convert to simple dict?! especially here and not within previous `if` !?
     if not mode == "train":
         labels, qrels = None, None  # qrels and labels NOT loaded for either "dev" or "eval"
     # each query ID is contained 2 consecutive times in qids, once corresponding to the positive and once to the negative pid
     return qids, pids, labels, qrels
 
 
-def load_qrels(filepath):
+def load_qrels(filepath, include_zeros=False, score_mapping=None):
     """Load ground truth relevant passages from file. Can handle several levels of relevance.
     Assumes that if a passage is not listed for a query, it is non-relevant.
     :param filepath: path to file of ground truth relevant passages in the following format:
-        "qID1 \t Q0 \t pID1 \t 2\n qID1 \t Q0 \t pID2 \t 0\n qID1 \t Q0 \t pID3 \t 1\n..."
+        "qID1 \t Q0 \t pID1 \t 2\n
+         qID1 \t Q0 \t pID2 \t 0\n
+         qID1 \t Q0 \t pID3 \t 1\n..."
+    :param include_zeros: whether to include passages which have explicitly a relevance score of 0
+    :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 1 -> 0.03)
     :return:
         qid2relevance (dict): dictionary mapping from query_id (int) to relevant passages (dict {passageid : relevance})
     """
@@ -277,7 +287,9 @@ def load_qrels(filepath):
         for line in f:
             try:
                 qid, _, pid, relevance = line.strip().split()
-                if relevance:  # only if label is not zero
+                if (score_mapping is not None) and (relevance in score_mapping):
+                    relevance = score_mapping[float(relevance)]  # map score to new value
+                if include_zeros or (relevance > 0):  # include only if relevance is not 0, unless explicitly allowed
                     qid2relevance[int(qid)][int(pid)] = float(relevance)
             except Exception as x:
                 print(x)
@@ -323,10 +335,10 @@ class MYMARCO_Dataset(Dataset):
         4. qrels file of ground truth relevant passages (if used for training or validation)
     """
     def __init__(self, mode,
-                 embedding_memmap_dir, queries_tokenids_path, candidates_path, qrels_path=None,
+                 embedding_memmap_dir, queries_tokenids_path, candidates_path=None, qrels_path=None,
                  tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
                  limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False,
-                 collection_neutrality_path=None, query_ids_path=None):
+                 include_zero_labels=True, relevance_labels_mapping=None, collection_neutrality_path=None, query_ids_path=None):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
@@ -349,6 +361,10 @@ class MYMARCO_Dataset(Dataset):
             reading matrix from `embedding_memmap_dir`
         :param inject_ground_truth: if True, during evaluation the ground truth relevant documents will be always included in the
             candidate documents, even if they weren't part of the original candidates. (Helps isolate effect of first-stage recall)
+        :param include_zero_labels: whether to include documents with a zero relevance score
+            inside the file specified by `qrels_path` in the set of candidate documents (as negatives). Typically set
+            to True if one expects these to be "good quality" negatives.
+        :param relevance_labels_mapping: dict mapping from relevance scores inside `qrels_path` to new (overriding) values
         :param collection_neutrality_path: path to file containing neutrality scores, in the format: docID \t score\n
         :param query_ids_path: Path to a file containing the query IDs to be used for this dataset, 1 in each line.
             If not provided, the IDs in the memmap inside `candidates_path` will be used.
@@ -358,7 +374,7 @@ class MYMARCO_Dataset(Dataset):
         self.documents_neutrality = None
         if collection_neutrality_path is not None:
             logger.info("Loading document neutrality scores ...")
-            # TODO: put this into separate function
+            # TODO: wrap this in separate function
             self.documents_neutrality = {}
             for line in open(collection_neutrality_path):
                 vals = line.strip().split('\t')
@@ -373,8 +389,7 @@ class MYMARCO_Dataset(Dataset):
             self.emb_collection = emb_collection
         else:
             logger.info("Opening collection document embeddings memmap in '{}' ...".format(embedding_memmap_dir))
-            self.emb_collection = EmbeddedSequences(embedding_memmap_dir, sorted_nat_ids=True,
-                                                    load_to_memory=load_collection_to_memory)
+            self.emb_collection = EmbeddedSequences(embedding_memmap_dir, load_to_memory=load_collection_to_memory)
         logger.info("Size of emb. collection:"
                     " {} MB".format(round(sys.getsizeof(self.emb_collection.embedding_vectors) / 1024**2)))
         if os.path.isdir(queries_tokenids_path):
@@ -415,7 +430,8 @@ class MYMARCO_Dataset(Dataset):
             if os.path.isdir(qrels_path):
                 qrels_path = os.path.join(qrels_path, "qrels.{}.tsv".format(mode))
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
-            self.qrels = load_qrels(qrels_path)  # dict{qID: dict{pID: relevance}}
+            self.include_zero_labels = include_zero_labels
+            self.qrels = load_qrels(qrels_path, include_zeros=include_zero_labels, score_mapping=relevance_labels_mapping)  # dict{qID: dict{pID: relevance}}
             extra_qids = set(self.qids) - set(self.qrels.keys())
             if len(extra_qids) > 0:  # fail early if there are missing labels
                 err_str = "{} query IDs in the specified '{}' dataset do not exist in '{}'!".format(len(extra_qids), mode, qrels_path)
@@ -488,10 +504,10 @@ class MYMARCO_Dataset(Dataset):
 
         tic = time.perf_counter()
         if self.candidates is not None:  # typical case
-            doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of relevance
+            doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of estimated relevance
         else:  # if no candidates are provided, randomly samples from entire collection
             # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
-            # Sampling time does not depend on the number of sampled values; only on the size of the sample set!
+            # Sampling time does not depend on the number of sampled values; only on the size of the population set!
             num_safety_docs = 100  # to account for non-unique randomly sampled documents
             # For MSMARCO, self.emb_collection.ids can be replaced with len(self.emb_collection) -- when replace=True, x10000 faster!???
             if self.emb_collection.id2ind is None:  # if document IDs are ordinal numbers:
@@ -505,14 +521,19 @@ class MYMARCO_Dataset(Dataset):
             rel_docs = None
         else:
             tic = time.perf_counter()
-            rel_docs = self.qrels[qid].keys()
+            docs_from_qrels = self.qrels[qid].keys()  # can contain docs with 0 relevance
+
             if self.mode == "train" or self.inject_ground_truth:
                 # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
                 # while ensuring that they are only included once
                 num_candidates = len(doc_ids)
-                new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:num_candidates]
+                new_doc_ids = (list(docs_from_qrels) + [docid for docid in doc_ids if docid not in docs_from_qrels])[:num_candidates]
                 doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
             prep_docids_times.update(time.perf_counter() - tic)
+            if self.include_zero_labels:
+                rel_docs = {docid for docid in docs_from_qrels if self.qrels[qid][docid] > 0}
+            else:
+                rel_docs = docs_from_qrels
 
         sample_fetching_times.update(time.perf_counter() - sample_fetching_start)
         return qid, query_token_ids, doc_ids, rel_docs
@@ -561,12 +582,31 @@ def get_docID_to_localind_mapping(doc_ids):
     return docID_to_localind
 
 
+def pack_tensor_2D(lstlst, default, dtype, length=None):
+    """
+    Padds and/or truncates each sequence in the input list of sequences to the specified `length` or the max. sequence
+    length in the list. Padded values are filled with `default`.
+    :param lstlst: list of sequences to be packed into a tensor (batch)
+    :param default: constant value to be used as padding
+    :param dtype: type of tensor
+    :param length: constant output length of all sequences in the batch;
+        if None, the max. sequence length in `lstlst` will be used
+    :return: (len(lstlst), length) tensor of type dtype
+    """
+    batch_size = len(lstlst)
+    length = length if length is not None else max(len(l) for l in lstlst)
+    tensor = torch.full((batch_size, length), default, dtype=dtype)
+    for i, l in enumerate(lstlst):
+        tensor[i, :len(l)] = torch.tensor(l, dtype=dtype)  # casting to tensor required for assignment
+    return tensor
+
+
 def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_random_neg=0, max_candidates=MAX_DOCS,
                      n_gpu=1, inject_ground_truth=False, documents_neutrality=None):
     """
-    :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, doc_embeddings, rel_docs)
+    :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, rel_docs)
     :param emb_collection: (collection_size, emb_dim) numpy.memmap of document collection embedding vectors.
-        Used to look up embedding vectors from doc_id
+        Used to look up embedding vectors by doc_id
     :param mode: 'train', 'dev', or 'eval'
     :param pad_token_id: ID of token used for padding queries
     :param num_random_neg: number of negatives to randomly sample from candidates of other queries in the batch.
@@ -627,7 +667,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
             # Sample additional random documents (on top of in-batch)
             # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
             # Sampling time does not depend on the number of sampled values; only on the size of the population set!
-            # However, we still want to use as few unique documents in the batch as possible (because it takes GPU memory, bandwidth and computation)
+            # However, we still want to use as few unique documents in the batch as possible (because it takes GPU memory, bandwidth)
             exp_shared = 3  # safety factor. Number of docs/query expected to be non-unique (shared with other queries) or missing
             num_cand = len(doc_ids[0])  # number of retrieved candidates per query. exp_shared covers queries with fewer candidates
             num_remaining = batch_size * (num_random_neg - len(unique_candidates) + num_cand + exp_shared)
@@ -671,7 +711,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
         data['doc_emb'] = doc_emb_tensor
         data['doc_padding_mask'] = doc_emb_mask
 
-    # TODO: move this to separate function?
+    # TODO: wrap this in separate function?
     if documents_neutrality is not None:
         doc_neutscores = []
         for doc_ids_batch in doc_ids:
@@ -696,18 +736,18 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
             # In this case, it is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
             # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
             # that 1 or more positives (rel. docs) will be at the beginning of the list (and only there)
-            labels = [list(range(len(rd))) for rd in rel_docs]
+            labels = [list(range(len(rd))) for rd in rel_docs]  # NOTE: rel_docs contains only non-0 scores
         else:  # this is when 'dev', but not inject_ground_truth
             labels = []
             for i in range(batch_size):
                 query_labels = []
                 for ind in range(len(doc_ids[i])):
-                    if doc_ids[i][ind] in rel_docs[i]:
+                    if doc_ids[i][ind] in rel_docs[i]:  # NOTE: rel_docs contains only non-0 scores
                         query_labels.append(ind)
                 labels.append(query_labels)
 
         # must be padded with -1 to have same dimensions as the transformer decoder output: (batch_size, max_docs_per_query)
-        data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)  # no more than a couple of rel. documents per query exist, so even int8 could be used
+        data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)  # no more than a couple of rel. documents per query exist, so even uint8 could be used
 
     global collation_times
     collation_times.update(time.perf_counter() - start_collation_time)
@@ -819,7 +859,7 @@ class MSMARCODataset(Dataset):
                 "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
                 "position_ids": pack_tensor_2D(position_ids_lst, default=0, dtype=torch.int64),
             }
-            qid_lst = [x['qid'] for x in batch]  # TODO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
+            qid_lst = [x['qid'] for x in batch]  # GEO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
             docid_lst = [x['docid'] for x in batch]
             if self.mode == "train":
                 # labels holds the in-batch indices of the relevant doc IDs for each query
@@ -849,22 +889,3 @@ class MSMARCODataset(Dataset):
         if self.mode == "train":
             ret_val["rel_docs"] = self.qrels[qid]
         return ret_val
-
-
-def pack_tensor_2D(lstlst, default, dtype, length=None):
-    """
-    Padds and/or truncates each sequence in the input list of sequences to the specified `length` or the max. sequence
-    length in the list. Padded values are filled with `default`.
-    :param lstlst: list of sequences to be packed into a tensor (batch)
-    :param default: constant value to be used as padding
-    :param dtype: type of tensor
-    :param length: constant output length of all sequences in the batch;
-        if None, the max. sequence length in `lstlst` will be used
-    :return: (len(lstlst), length) tensor of type dtype
-    """
-    batch_size = len(lstlst)
-    length = length if length is not None else max(len(l) for l in lstlst)
-    tensor = torch.full((batch_size, length), default, dtype=dtype)
-    for i, l in enumerate(lstlst):
-        tensor[i, :len(l)] = torch.tensor(l, dtype=dtype)  # casting to tensor required for assignment
-    return tensor

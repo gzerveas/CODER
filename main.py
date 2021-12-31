@@ -53,6 +53,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                                     limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
                                     emb_collection=val_dataloader.dataset.emb_collection,
+                                    include_zero_labels=args.include_zero_labels,
+                                    relevance_labels_mapping=args.relevance_labels_mapping,
                                     collection_neutrality_path=args.collection_neutrality_path,
                                     query_ids_path=args.train_query_ids)
     collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu)
@@ -372,7 +374,7 @@ def evaluate(args, model, dataloader, fairrmetric=None):
 
             if labels_exist:
                 relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
-                num_relevant.extend(len(qrels[qid]) for qid in qids)
+                num_relevant.extend(len([docid for docid in qrels[qid] if qrels[qid][docid] > 0]) for qid in qids)
 
     if labels_exist:
         try:
@@ -435,7 +437,7 @@ def rank_docs(docids, scores, shuffle=True):
 
 
 def get_relevances(gt_relevant, candidates, max_docs=None):
-    """Can handle multiple levels of relevance.
+    """Can handle multiple levels of relevance, including explicitly or implicitly 0 scores.
     Args:
         gt_relevant: for a given query, it's a dict mapping from ground-truth relevant passage ID to level of relevance
         candidates: list of candidate pids
@@ -591,7 +593,7 @@ def inspect(args, model, dataloader):
 
             if labels_exist:
                 relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
-                num_relevant.extend(len(qrels[qid]) for qid in qids)
+                num_relevant.extend(len([docid for docid in qrels[qid] if qrels[qid][docid] > 0]) for qid in qids)
 
             # Display input and output information for retrieval on each query
             for i in range(len(qids)):  # iterate over batch_size
@@ -655,7 +657,7 @@ def inspect(args, model, dataloader):
                 docs_to_check_ids = []  # list of candidate doc IDs to be checked
 
                 if labels_exist:
-                    gt_docids = list(qrels[qids[i]].keys())
+                    gt_docids = [docid for docid in qrels[qids[i]] if qrels[qids[i]][docid] > 0]
                     gt_doc_text = []
                     logger.info("Ground truth relevant document(s): ")
                     for d, did in enumerate(gt_docids):
@@ -991,6 +993,8 @@ def get_dataset(args, eval_mode, tokenizer):
                                limit_size=args.eval_limit_size,
                                load_collection_to_memory=args.load_collection_to_memory,
                                inject_ground_truth=args.inject_ground_truth,
+                               include_zero_labels=args.include_zero_labels,
+                               relevance_labels_mapping=args.relevance_labels_mapping,
                                query_ids_path=args.eval_query_ids)
 
 
