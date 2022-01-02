@@ -56,8 +56,13 @@ def run_parse_args():
     parser.add_argument("--embedding_memmap_dir", type=str, default="repbert/representations/doc_embedding",
                         help="Directory containing (num_docs_in_collection, doc_emb_dim) memmap array of document "
                              "embeddings and an accompanying (num_docs_in_collection,) memmap array of doc/passage IDs")
-    parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",  # TODO: rename "tokenized_queries_path"
-                        help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file.")
+    parser.add_argument("--tokenized_path", type=str, default="repbert/preprocessed",  # TODO: rename "train_query_tokens_path"
+                        help="Contains pre-tokenized/numerized queries in JSON format. Can be dir or file. "
+                             "If dir, it should contain: queries.train.json. Otherwise (i.e. if a file), "
+                             "it will be used for training and `eval_query_tokens_path` should also be set.")
+    parser.add_argument("--eval_query_tokens_path", type=str, default=None,
+                        help="Contains pre-tokenized/numerized eval queries in JSON format. When not used, "
+                             "`tokenized_path` should be a *directory* containing: queries.{train,dev,eval}.json")
     parser.add_argument("--raw_queries_path", type=str,
                         help="Optional: .tsv file which contains raw text queries (ID <tab> text). Used only for 'inspect' mode.")
     parser.add_argument("--query_emb_memmap_dir", type=str, default="repbert/representations/doc_embedding",
@@ -295,6 +300,9 @@ def check_args(config):
             logger.warning("You must set `raw_queries_path` to inspect original queries.")
         if config['raw_collection_path'] is None:
             logger.warning("You must set `raw_collection_path` to inspect original documents.")
+
+    if config['eval_query_tokens_path'] is None:
+        config['eval_query_tokens_path'] = config['tokenized_path']
 
     # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
     components = config['key_metric'].split('@')

@@ -4,9 +4,11 @@ import logging
 from collections import defaultdict, OrderedDict
 from functools import partial
 from itertools import chain
+from operator import itemgetter
 import time
 import sys
 
+import ipdb
 import numpy as np
 from tqdm import tqdm
 from transformers import BertTokenizer
@@ -287,10 +289,11 @@ def load_qrels(filepath, include_zeros=False, score_mapping=None):
         for line in f:
             try:
                 qid, _, pid, relevance = line.strip().split()
+                relevance = float(relevance)
                 if (score_mapping is not None) and (relevance in score_mapping):
-                    relevance = score_mapping[float(relevance)]  # map score to new value
+                    relevance = score_mapping[relevance]  # map score to new value
                 if include_zeros or (relevance > 0):  # include only if relevance is not 0, unless explicitly allowed
-                    qid2relevance[int(qid)][int(pid)] = float(relevance)
+                    qid2relevance[int(qid)][int(pid)] = relevance
             except Exception as x:
                 print(x)
                 raise IOError("'{}' is not valid format".format(line))
@@ -505,6 +508,7 @@ class MYMARCO_Dataset(Dataset):
         tic = time.perf_counter()
         if self.candidates is not None:  # typical case
             doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of estimated relevance
+            doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
         else:  # if no candidates are provided, randomly samples from entire collection
             # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
             # Sampling time does not depend on the number of sampled values; only on the size of the population set!
@@ -515,25 +519,25 @@ class MYMARCO_Dataset(Dataset):
             else:  # x2 faster than if replace=False
                 doc_ids = list(set(np.random.choice(self.emb_collection.ids, size=(self.num_candidates+num_safety_docs), replace=True)))
         retrieve_candidates_times.update(time.perf_counter() - tic)
-        doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
 
         if self.mode == "eval":
             rel_docs = None
         else:
             tic = time.perf_counter()
-            docs_from_qrels = self.qrels[qid].keys()  # can contain docs with 0 relevance
+            if self.include_zero_labels:  # otherwise this step is unnecessary, as qrels would only contain rel. > 0
+                docs_from_qrels = [docid for docid, score in sorted(self.qrels[qid].items(), key=itemgetter(1), reverse=True)]  # can contain docs with 0 relevance
+                rel_docs = {docid for docid in docs_from_qrels if self.qrels[qid][docid] > 0}  # only relevance > 0
+            else:
+                rel_docs = self.qrels[qid].keys()  # only relevance > 0
+                docs_from_qrels = rel_docs
 
             if self.mode == "train" or self.inject_ground_truth:
                 # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
                 # while ensuring that they are only included once
-                num_candidates = len(doc_ids)
-                new_doc_ids = (list(docs_from_qrels) + [docid for docid in doc_ids if docid not in docs_from_qrels])[:num_candidates]
+                # num_candidates = len(doc_ids)
+                new_doc_ids = (list(docs_from_qrels) + [docid for docid in doc_ids if docid not in rel_docs])#[:num_candidates]
                 doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
             prep_docids_times.update(time.perf_counter() - tic)
-            if self.include_zero_labels:
-                rel_docs = {docid for docid in docs_from_qrels if self.qrels[qid][docid] > 0}
-            else:
-                rel_docs = docs_from_qrels
 
         sample_fetching_times.update(time.perf_counter() - sample_fetching_start)
         return qid, query_token_ids, doc_ids, rel_docs

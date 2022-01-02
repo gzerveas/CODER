@@ -14,9 +14,6 @@ import numpy as np
 from tqdm import tqdm
 import logging
 import time
-import csv
-
-import pandas as pd
 
 import utils
 
@@ -65,6 +62,7 @@ def parse_line(line):
 
 
 # TODO: REALLY SLOW because of slow access of pandas multi-row indexing
+# import pandas as pd
 def pandas_create_candidates_memmap(candidates_filepath, memmap_dir, max_docs, file_prefix=''):
     """
     Load candidate (retrieved) documents/passages for each query from a file, and store them as a memmaped files.

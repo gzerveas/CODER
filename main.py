@@ -986,8 +986,8 @@ def get_dataset(args, eval_mode, tokenizer):
         return MSMARCODataset(eval_mode, args.msmarco_dir, args.collection_memmap_dir, args.tokenized_path,
                               args.max_query_length, args.max_doc_length, limit_size=args.eval_limit_size)
     else:
-        return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.tokenized_path, args.eval_candidates_path,
-                               qrels_path=args.qrels_path, tokenizer=tokenizer,
+        return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.eval_query_tokens_path,
+                               args.eval_candidates_path, qrels_path=args.qrels_path, tokenizer=tokenizer,
                                max_query_length=args.max_query_length,
                                num_candidates=None,  # Always use ALL candidates for evaluation
                                limit_size=args.eval_limit_size,
