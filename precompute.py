@@ -100,7 +100,7 @@ class MSMARCO_DocDataset(Dataset):
 
     def __init__(self, collection_memmap_dir, max_doc_length, tokenizer):
         self.max_doc_length = max_doc_length
-        self.collection = CollectionDataset(collection_memmap_dir, max_doc_length)
+        self.collection = CollectionDataset(collection_memmap_dir)
         self.pids = self.collection.pids
         self.cls_id = tokenizer.cls_token_id
         self.sep_id = tokenizer.sep_token_id
@@ -122,7 +122,7 @@ class MSMARCO_DocDataset(Dataset):
         return ret_val
 
 
-def get_collate_function(model_type='repbert'):
+def get_collate_function(model_type='repbert', token_type_id=None):
 
     if model_type == 'repbert':
         mask_key_string = "valid_mask"
@@ -136,6 +136,8 @@ def get_collate_function(model_type='repbert'):
             "input_ids": pack_tensor_2D(input_ids_lst, default=0, dtype=torch.int64),
             mask_key_string: pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
         }
+        if token_type_id is not None:
+            data['token_type_ids'] = torch.full_like(data['input_ids'], token_type_id, dtype=torch.int64)
         id_lst = [x['id'] for x in batch]
         return data, id_lst
 
@@ -148,10 +150,13 @@ def generate_embeddings(args, model, dataset):
     id2pos = {identity: i for i, identity in enumerate(ids_memmap)}
 
     batch_size = args.per_gpu_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly  # TODO: So what?
+
+    token_type_id = None
     if args.model_type != 'repbert':  # this will be used for all HuggingFace models
         aggregation_func = get_aggregation_function(args.aggregation)
-    collate_fn = get_collate_function(args.model_type)
+        if args.token_type_ids:
+            token_type_id = 0 if isinstance(dataset, MSMARCO_QueryDataset) else 1
+    collate_fn = get_collate_function(args.model_type, token_type_id)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)  # TODO: Why not more workers?
 
     # multi-gpu inference
@@ -212,6 +217,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_doc_length", type=int, default=256)
     parser.add_argument("--aggregation", type=str, choices=['first', 'mean'], default='first',
                         help="How to aggregate individual token embeddings")
+    parser.add_argument("--token_type_ids", action='store_true',
+                        help="If set, it will include a tensor of 'token_type_ids' when 'model_type' is not 'repbert', "
+                             "to be used as input in a huggingface encoder. 0s denote a query sequence, "
+                             "and 1s a document sequence.")
     parser.add_argument("--per_gpu_batch_size", default=100, type=int)
     args = parser.parse_args()
     

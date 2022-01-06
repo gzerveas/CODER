@@ -98,13 +98,11 @@ class EmbeddedSequences:
         #         emb_dim = BERT_BASE_DIM
         #         logger.warning("Using default document embedding dimensionality: {}".format(emb_dim))
 
-        if seq_type == 'document':
-            # unfortunately, for no reason, names differ between queries and documents
-            id_filename = "pids.memmap"
-        else:
-            id_filename = 'ids.memmap'
-        self.ids = np.memmap(os.path.join(embedding_memmap_dir, id_filename), mode='r', dtype='int32')
-
+        try:
+            self.ids = np.memmap(os.path.join(embedding_memmap_dir, 'ids.memmap'), mode='r', dtype='int32')
+        except FileNotFoundError:
+            # due to legacy reasons, sometimes document memmaps have the name 'pids.memmap'
+            self.ids = np.memmap(os.path.join(embedding_memmap_dir, 'pids.memmap'), mode='r', dtype='int32')
         # Check whether passage/doc IDs in the collection happen to exactly be 0, 1, ..., num_docs-1, and
         # doc embeddings are stored exactly in that order (is True for MSMARCO passage collection, but not for queries).
         # If so, overall a bit more efficient, but a lot more efficient when sampling (non-in-batch) random negative documents

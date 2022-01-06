@@ -27,7 +27,11 @@ def get_embed_memmap(memmap_dir, dim):
     id_path = os.path.join(memmap_dir, "ids.memmap")
     # Tensor doesn't support non-writeable numpy array
     # Thus we use copy-on-write mode 
-    id_memmap = np.memmap(id_path, dtype='int32', mode="c")
+    try:
+        id_memmap = np.memmap(id_path, dtype='int32', mode="c")
+    except FileNotFoundError:
+        id_path = os.path.join(memmap_dir, "pids.memmap")
+        id_memmap = np.memmap(id_path, dtype='int32', mode="c")
     embedding_memmap = np.memmap(embedding_path, dtype='float32', mode="c", shape=(len(id_memmap), dim))
     return embedding_memmap, id_memmap
 
@@ -57,7 +61,7 @@ def print_memory_info(memmap, docs_per_chunk, device):
 def allrank(args):
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
-    assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))  # NOTE: valid only for MSMARCO
+    # assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))  # NOTE: valid only for MSMARCO
 
     print_memory_info(doc_embedding_memmap, args.per_gpu_doc_num, args.device)
 
@@ -300,7 +304,7 @@ if __name__ == "__main__":
 
     ## Required parameters
     parser.add_argument("--per_gpu_doc_num", default=4000000, type=int,
-                        help="Number of documents to be loaded on the single GPU. Set to 6e6 for 24GB GPU memory. "
+                        help="Number of documents to be loaded on the single GPU. Set to 4e6 for ~12GB GPU memory. "
                              "Reduce number in case of insufficient GPU memory.")
     parser.add_argument("--hit", type=int, default=1000)
     parser.add_argument("--embedding_dim", type=int, default=768)
@@ -338,6 +342,8 @@ if __name__ == "__main__":
 
     if not os.path.exists(os.path.dirname(args.output_path)):
         os.makedirs(os.path.dirname(args.output_path))
+    if os.path.isdir(args.output_path):
+        raise IOError("Option `output_path` should be a file path, not directory path")
 
     with torch.no_grad():
         if args.candidates_path:

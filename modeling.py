@@ -700,23 +700,6 @@ class MDSTransformer(nn.Module):
     the query term representations in the  encoder output.
     Computes a relevance score for each (transformed) document representation and can be thus used for reranking.
 
-    Args:
-        encoder_config: huggingface transformers configuration object (could be string, dir, ...)
-            to instantiate a query encoder.  Used instead of `custom_encoder`.
-        custom_encoder: custom encoder object initialized externally (default=None)
-            Used instead of `encoder_config`.
-        custom_decoder: custom decoder object initialized externally (default=None).
-            If not specified, then the following are used:
-
-        d_model: the "decoder" representation (hidden) dimension. Is also the doc embedding dimension
-        num_heads: the number of heads in the multiheadattention decoder layers.
-        num_decoder_layers: the number of sub-decoder-layers in the decoder.
-        dim_feedforward: the dimension of the decoder feedforward network module.
-        dropout: the decoder dropout value.
-        activation: the activation function of the decoder intermediate layer, "relu" or "gelu".
-        positional_encoding: if None, no positional encoding is used for the "decoder", and thus the output is permutation
-            equivariant with respect to the document embedding sequence
-
     Examples::
         >>> model = MDSTransformer(enc_config, num_heads=16, num_decoder_layers=4)
         >>> model = MDSTransformer(custom_encoder=my_HF_encoder, num_heads=16, num_decoder_layers=4)
@@ -731,6 +714,40 @@ class MDSTransformer(nn.Module):
                  loss_module=None, aux_loss_module=None, aux_loss_coeff=0,
                  selfatten_mode=0, no_decoder=False, no_dec_crossatten=False, transform_doc_emb=False,
                  bias_regul_coeff=0.0, bias_regul_cutoff=100) -> None:
+        """
+        :param encoder_config: huggingface transformers configuration object (could be string, dir, ...)
+            to instantiate a query encoder.  Used instead of `custom_encoder`.
+        :param custom_encoder: custom query encoder object initialized externally (default=None)
+            Used instead of `encoder_config`.
+        :param custom_decoder: custom document "decoder" object initialized externally (default=None).
+            If not specified, then the following are used:
+        :param d_model: the document "decoder" representation (hidden) dimension. Is also the doc embedding dimension
+        :param num_heads: the number of heads in the multiheadattention decoder layers
+        :param num_decoder_layers: the number of sub-decoder-layers in the decoder
+        :param dim_feedforward: the dimension of the doc. scorer ("decoder") feedforward network module
+        :param dropout: the decoder dropout value
+        :param activation: the activation function of the decoder intermediate layer, "relu" or "gelu"
+        :param normalization: normalization layer to be used internally in the transformer decoder
+        :param positional_encoding: if None, no positional encoding is used for the "decoder", and thus the output is permutation
+            equivariant with respect to the document embedding sequence
+        :param doc_emb_dim: the expected document vector dimension. If None, it will be assumed to be d_model
+        :param scoring_mode: Scoring function to map the final embeddings to scores: 'dot_product', 'sigmoid', 'cross_attention', ...
+        :param query_emb_aggregation: how to aggregate individual token embeddings into a query embedding: 'first' or 'mean'
+        :param loss_module: nn.Module to be used to compute the loss, when given a tensor of scores and a tensor of labels
+        :param aux_loss_module: loss module to be used for the optional auxiliary loss component
+        :param aux_loss_coeff: coefficient to weigh the contribution of the auxiliary loss to the total loss
+        :param selfatten_mode: Self-attention (SA) mode for contextualizing documents. Choices:
+                                 0: regular SA
+                                 1: turn off SA by using diagonal SA matrix (no interactions between documents)
+                                 2: linear layer + non-linearity instead of SA
+                                 3: SA layer has simply been removed
+        :param no_decoder: if set, no transformer decoder will be used to transform document embeddings
+        :param no_dec_crossatten: if set, the transformer decoder will not have cross-attention
+            over the sequence of query term embeddings in the output of the query encoder
+        :param transform_doc_emb: if set, document embeddings will be linearly projected to match `d_model`
+        :param bias_regul_coeff: coefficient for bias regularization term in the total loss
+        :param bias_regul_cutoff:
+        """
         super(MDSTransformer, self).__init__()
 
         if custom_encoder is not None:

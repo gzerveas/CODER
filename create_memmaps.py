@@ -203,7 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--auto_name_dir", action='store_true',
                         help="If set, will use `candidates` path to create the output directory name. "
                              "In this case, `output_candidates_dir` will specify the root.")
-    parser.add_argument("--max_seq_length", type=int, default=256,
+    parser.add_argument("--max_doc_length", type=int, default=256,
                         help="The maximum length of each document in tokens. Affects memory footprint of memmap. "
                              "It is typically reduced later in the dataloader.")
     parser.add_argument("--max_candidates", type=int, default=1000,

@@ -184,6 +184,32 @@ def write_list(filepath, alist):
             f.write('{}\n'.format(item))
 
 
+def stats_from_counts(counts, threshold=None, logger=None):
+    """
+    :param counts: iterable of counts (e.g. number of tokens per sequence)
+    :param threshold: shows how many sequences exceed the specified number in length
+    :param logger: a logger object to log output, otherwise "print" will be used
+    """
+
+    print_func = builtins.print if logger is None else logger.info
+
+    mean = np.mean(counts)
+    print_func("Mean: {}".format(mean))
+    median = np.median(counts)
+    print_func("Median: {}".format(median))
+
+    if threshold is not None:
+        num_above = np.sum(np.array(counts) > threshold)
+        print_func("Above {}: {} ({:.3f}%)\n".format(threshold, num_above, 100*num_above/len(counts)))
+
+    freqs, bin_edges = np.histogram(counts, bins=30)
+    bin_labels = ["[{:7.2f}, {:7.2f})".format(bin_edges[i], bin_edges[i + 1])
+                  for i in range(len(bin_edges)-1)]
+    logger.info('Histogram of frequencies:\n')
+    ascii_bar_plot(bin_labels, freqs, width=50, logger=logger)
+
+    return
+
 # from: https://alexwlchan.net/2018/05/ascii-bar-charts/
 def ascii_bar_plot(labels, values, width=30, logger=None):
 

@@ -388,7 +388,7 @@ def evaluate(args, model, dataloader, fairrmetric=None):
     eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
     ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
 
-    ## evaluate fairness  # TODO: split into separate function
+    # Evaluate fairness  # TODO: split into separate function
     if fairrmetric is not None:
         try:
             _retrievalresults = {}

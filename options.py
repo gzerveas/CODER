@@ -206,6 +206,9 @@ def run_parse_args():
     parser.add_argument("--query_aggregation", type=str, choices=['mean', 'first'], default='mean',
                         help="""How to aggregate the individual final encoder embeddings corresponding to query tokens into 
                         a single vector.""")
+    # parser.add_argument('--token_type_ids', action='store_true',
+    #                     help="If set, a tensor of 0s will be passed to the HuggingFace query encoder as an input "
+    #                          "for 'token_type_ids'. However, this is the HuggingFace default for BERT, so it is unnecessary.")
 
     # The following refer to the transformer "decoder" (which processes an input sequence of document embeddings)
     parser.add_argument('--d_model', type=int, default=None,
@@ -269,7 +272,6 @@ def run_parse_args():
                              "in the top tier.")
     parser.add_argument('--gt_factor', type=float, default=2.0,
                         help="Scaling factor of ground truth component for `loss_type` 'multitier'")
-
 
     ## Debiasing (bias/neutrality regularization)
     parser.add_argument("--collection_neutrality_path", type=str,
