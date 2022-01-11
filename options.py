@@ -112,13 +112,14 @@ def run_parse_args():
     parser.add_argument("--max_doc_length", type=int, default=256,  # RepBERT/inspect only
                         help="Optional: Number of tokens to keep from each document. Used for RepBERT or 'inspect' mode only")
     parser.add_argument('--num_candidates', type=int, default=None,
-                        help="Number of document IDs to sample from all document IDs corresponding to a query and found"
-                             " in `candidates_path` file. If None, all found document IDs will be used. "
-                             "If no `candidates_path` is provided, negatives will be sampled from the entire collection"
-                             " at random, and therefore `num_candidates` in this case CANNOT be None.")
+                        help="When training, the number of document IDs to sample from all document IDs corresponding to a query and found"
+                             " in `train_candidates_path` file. If None, all found document IDs will be used. "
+                             "If no `train_candidates_path` is provided, negatives will be sampled from the entire collection"
+                             " at random, and therefore `num_candidates` in this case CANNOT be None. When evaluating, "
+                             "this is always None (i.e. all candidates in `eval_candidates_path` are used).")
     parser.add_argument('--num_random_neg', type=int, default=0,
                         help="Number of negatives to randomly sample from other queries in the batch for training. "
-                             "If 0, only documents in `candidates_path` will be used as negatives.")
+                             "If 0, only documents in `train_candidates_path` will be used as negatives.")
     parser.add_argument('--include_zero_labels', action='store_true',
                         help="If set, it will include documents with a zero relevance score from "
                              " `qrels_path` in the set of candidate documents (as negatives). "

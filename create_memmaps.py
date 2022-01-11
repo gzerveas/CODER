@@ -128,7 +128,7 @@ def create_candidates_memmap(candidates_filepath, memmap_dir, max_docs, num_qids
         candidate_memmap: (num_queries, max_docs) numpy memmap array containing `max_docs` retrieved passage IDs (in
             order of decreasing relevance for query); the order of rows corresponds to qid_memmap
     """
-
+    logger.info("Counting lines ...")
     total_candidates = sum(1 for _ in open(candidates_filepath))
     if num_qids is None:
         num_qids = int(1.5*(total_candidates / max_docs))  # estimate (prob. overestimate) number of queries

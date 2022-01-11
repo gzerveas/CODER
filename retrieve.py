@@ -189,8 +189,8 @@ def allrank(args):
 def rerank3(args):
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
-    assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))
-    # did2pos = {identity: i for i, identity in enumerate(doc_id_memmap)}  # unnecessary, according to previous line
+    # assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))  # only for MSMARCO
+    did2pos = {identity: i for i, identity in enumerate(doc_id_memmap)}  # un/necessary, depending on previous line
     doc_embedding_memmap = np.array(doc_embedding_memmap)
 
     logger.info("Loading query embeddings memmap ...")
@@ -235,7 +235,7 @@ def rerank3(args):
 
             doc_ids = np.array(doc_ids, dtype=int)
 
-            doc_embeddings = doc_embedding_memmap[doc_ids]  # doc_ids are at the same time integer positions for doc_embedding_memmap
+            doc_embeddings = doc_embedding_memmap[[did2pos[docid] for docid in doc_ids]]
             doc_embeddings = torch.from_numpy(doc_embeddings)  # (num_cands, emb_dim)
             logger.debug("get embeddings: {:.3f} s".format(time.time() - start_time))
 
