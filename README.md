@@ -1,163 +1,177 @@
-# CODER: COntextualized Document Embedding Reranking
+# CODER: An efficient framework for improving retrieval through COntextualized Document Embedding Reranking
 
-## Example commands
+This codebase implements CODER, a framework that improves the performance of existing retrieval models by training them through efficient, contextual reranking.
 
-### Show and explain all options for training, evaluation, inspection
-```bash
-python ~/Code/multidocscoring_transformer/main.py --help
-```
+As a starting point, this code was initially forked from: https://github.com/jingtaozhan/RepBERT-Index.
 
-### Train (in debug mode)
+In the following, we will show how to train and evaluate a CODER model using [TAS-B](https://dl.acm.org/doi/10.1145/3404835.3462891)  as a base method.
 
-```bash
-python ~/Code/multidocscoring_transformer/main.py --debug --name DEBUG --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --train_limit_size 256 --logging_steps 2 --num_candidates 30 --num_random_neg 30 --load_collection_to_memory
-```
+## Setup
 
-### Train
+_Instructions refer to Unix-based systems (e.g. Linux, MacOS)._
 
-```bash
-python ~/Code/multidocscoring_transformer/main.py --name Informative_ParamValue3 --task train --output_dir path/to/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file MDST_records.xls --data_num_workers 0 --num_candidates 30 --num_random_neg 30 --load_collection_to_memory
-```
+In the following, let's assume that you have cloned the code inside a directory called `coder`.
 
-### Evaluate
+You need to create/choose a directory as root, e.g. `~/Experiments`. Inside this root directory, each experiment will create a time-stamped output directory, which contains
+model checkpoints, performance metrics per epoch, the experiment configuration, log files, predictions per query, etc.
 
-```bash
-python ~/Code/multidocscoring_transformer/main.py --name eval_Alpha0_100bm100rnd_lr1e-5w10000fr0.9  --no_timestamp --task dev --output_dir ~/data/gzerveas/MultidocScoringTr/Experiments --embedding_memmap_dir ~/data/MS_MARCO/repbert/representations/doc_embedding --tokenized_path ~/data/MS_MARCO/repbert/preprocessed --msmarco_dir ~/data/MS_MARCO --train_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.train_memmap --eval_candidates_path ~/data/MS_MARCO/repbert/preprocessed/BM25_top1000.in_qrels.dev_memmap --records_file ~/data/gzerveas/MultidocScoringTr/MDST_records.xls --data_num_workers 0  --load_collection_to_memory --load_model ~/data/gzerveas/MultidocScoringTr/Experiments/Alpha0_100bm100rnd_lr1e-5w10000fr1_2021-02-14_21-10-45_wD9/checkpoints/model_best.pth
-```
+[We recommend creating and activating a `conda` or other Python virtual environment (e.g. `virtualenv`) to 
+install packages and avoid conficting package requirements; otherwise, to run `pip`, the flag `--user` or `sudo` privileges will be necessary.]
 
-## Data and Trained Models
-
-- Root MS MARCO dataset directory: `~/data/MS_MARCO`
-Relative paths refer to this root directory.
-  
-### Candidate documents per query
-#### (retrieved from 1st stage system, to be reranked)
-In raw text:
-
-`BM25_top1000.in_qrels.{dev,train}.tsv`
-
-Preprocessed:
-
-_(contains a bundle of related memmap arrays)_
-
-`repbert/preprocessed/BM25_top1000.in_qrels.{train,dev}_memmap/`
-
-### Pre-tokenized/numerized queries
-
-`repbert/preprocessed/queries.{train,dev}.json`
-
-### Pre-computed document embeddings (from RepBERT)
-_(contains a bundle of related memmap arrays)_
-
-`repbert/preprocessed/doc_embedding/`
-
-### Trained RepBERT model
-#### (checkpoint and configuration)
-
-`repbert/ckpt-350000/`
+`pip install -r coder/requirements.txt`
 
 
-# STOP READING HERE
-## Data and Trained Models
+## Downloading data
 
-We make the following data available for download:
-
-+ `repbert.dev.small.top1k.tsv`: 6,980,000 pairs of dev set queries and retrieved passages. In this tsv file, the first column is the query id, the second column is the passage id, and the third column is the rank of the passage. There are 1000 passages per query in this file.
-+ `repbert.eval.small.top1k.tsv`: 6,837,000 pairs of eval set queries and retrieved passages. In this tsv file, the first column is the query id, the second column is the passage id, and the third column is the rank of the passage. There are 1000 passages per query in this file.
-+ `repbert.ckpt-350000.zip`: Trained BERT base model to represent queries and passages. It contains two files, namely `config.json` and `pytorch_model.bin`.
-
-Download and verify the above files from the below table:
-
-File | Size | MD5 | Download
-:----|-----:|:----|:-----
-`repbert.dev.small.top1k.tsv` | 127 MB | `0d08617b62a777c3c8b2d42ca5e89a8e` | [[Google Drive](https://drive.google.com/file/d/1MrrwDmTZOiFx3qjfPxi4lDSdQk1tR5C6/view?usp=sharing)]
-`repbert.eval.small.top1k.tsv` | 125 MB | `b56a79138f215292d674f58c694d5206` | [[Google Drive](https://drive.google.com/file/d/1twRGEJZFZc4zYa75q8UFEz9ZS2oh0oyE/view?usp=sharing)]
-`repbert.ckpt-350000.zip` | 386 MB| `b59a574f53c92de6a4ddd4b3fbef784a` | [[Google Drive](https://drive.google.com/file/d/1xhwy_nvRWSNyJ2V7uP3FC5zVwj1Xmylv/view?usp=sharing)] 
-
-
-## Replicating Results with Provided Trained Model
-
-We provide instructions on how to replicate RepBERT retrieval results using provided trained model.
-
-First, make sure you already installed [🤗 Transformers](https://github.com/huggingface/transformers):
-
-```bash
-pip install transformers
-git clone https://github.com/jingtaozhan/RepBERT-Index
-cd RepBERT-Index
-```
-
-Next, download `collectionandqueries.tar.gz` from [MSMARCO-Passage-Ranking](https://github.com/microsoft/MSMARCO-Passage-Ranking). It contains passages, queries, and qrels.
+Download `collectionandqueries.tar.gz` from [MSMARCO-Passage-Ranking](https://github.com/microsoft/MSMARCO-Passage-Ranking). It contains passages, queries, and qrels.
 
 ```bash
 mkdir data
 cd data
 wget https://msmarco.blob.core.windows.net/msmarcoranking/collectionandqueries.tar.gz
-mkdir msmarco-passage
-tar xvfz collectionandqueries.tar.gz -C msmarco-passage
+tar xvfz collectionandqueries.tar.gz
 ```
 
-To confirm, `collectionandqueries.tar.gz` should have MD5 checksum of `31644046b18952c1386cd4564ba2ae69`.
+`collectionandqueries.tar.gz` should have MD5 checksum of `31644046b18952c1386cd4564ba2ae69`.
 
-To reduce duplication of effort in training and testing, we tokenize queries and passages in advance. This should take some time (about 3-4 hours). Besides, we convert tokenized passages to numpy memmap array, which can greatly reduce the memory overhead at run time.
+## Pre-processing data
+
+#### - Filter queries:
+The MS MARCO `queries.train.tsv` and `queries.dev.tsv` files also contain queries for which relevance labels are not available.
+To eliminate unnecessary waiting times (e.g. for retrieval of candidates) or ID look-up errors when training, you can filter
+them in this way:
 
 ```bash
-python convert_text_to_tokenized.py --tokenize_queries --tokenize_collection
-python create_memmaps.py
+# Read IDs from first column of first file; for the second, only print a line if its first column (i.e. ID) is contained in the first file
+awk '(NR==FNR){a[$1];next} ($1 in a){print $0}' qrels.train.tsv queries.train.tsv > queries.in_qrels.train.tsv
 ```
 
-Please download the provided model `repbert.ckpt-350000.zip`, put it in `./data`, and unzip it. You should see two files in the directory `./data/ckpt-350000`, namely `pytorch_model.bin` and `config.json`.
-
-Next, you need to precompute the representations of passages and queries. 
+#### - Tokenize collection & queries:
+For efficiency, collection documents (i.e. passages) and queries are first kept pre-tokenized and numerized in JSON files.
 
 ```bash
-python precompute.py --load_model_path ./data/ckpt-350000 --task doc
-python precompute.py --load_model_path ./data/ckpt-350000 --task query_dev.small
-python precompute.py --load_model_path ./data/ckpt-350000 --task query_eval.small
+python ~/coder/convert_text_to_tokenized.py --output_dir . --collection collection.tsv --queries . --tokenizer_from "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco" 
 ```
 
-At last, you can retrieve the passages for the queries in the dev set (or eval set). `multi_retrieve.py` will use the gpus specified by `--gpus` argument and the representations of all passages are evenly distributed among all gpus. If your CUDA memory is limited, you can use `--per_gpu_doc_num` to specify the num of passages distributed to each gpu. 
+#### - Create memmap arrays for collection (mapping doc_ID -> doc_token_IDs) 
 
 ```bash
-python multi_retrieve.py  --query_embedding_dir ./data/precompute/query_dev.small_embedding --output_path ./data/retrieve/repbert.dev.small.top1k.tsv --hit 1000 --gpus 0,1,2,3,4
-python ms_marco_eval.py ./data/msmarco-passage/qrels.dev.small.tsv ./data/retrieve/repbert.dev.small.top1k.tsv
+python ~/coder/create_memmaps.py --tokenized_collection collection.tokenized.json --output_collection_dir collection_memmap --max_doc_length 256 
 ```
 
-You can also retrieve the passages with only one GPU.
+#### - Compute document representations:
+(~2h for 8.8M doc of MS MARCO)
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-python retrieve.py  --query_embedding_dir ./data/precompute/query_dev.small_embedding --output_path ./data/retrieve/repbert.dev.small.top1k.tsv --hit 1000 --per_gpu_doc_num 1800000
-python ms_marco_eval.py ./data/msmarco-passage/qrels.dev.small.tsv ./data/retrieve/repbert.dev.small.top1k.tsv
+python ~/coder/precompute.py --model_type huggingface --encoder_from "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco" --collection_memmap_dir  collection_memmap/ --output_dir . 
 ```
 
-The results should be:
+### Obtain candidate documents to be used as negatives for each query
 
-```
-#####################
-MRR @10: 0.3038783713103188
-QueriesRanked: 6980
-#####################
-```
+The following 2 steps are required in order to obtain the top TAS-B candidates per query. Some publicly available methods (e.g. RepBERT) make their predictions per query directly available for download, in which case the following 2 steps are not necessary.
 
-## Train RepBERT
-
-Next, download `qidpidtriples.train.full.tsv.gz` from [MSMARCO-Passage-Ranking](https://github.com/microsoft/MSMARCO-Passage-Ranking).
+#### - Compute query representations:
+(~186 q/sec - 5.4 ms/query)
 
 ```bash
-cd ./data/msmarco-passage
-wget https://msmarco.blob.core.windows.net/msmarcoranking/qidpidtriples.train.full.tsv.gz
+python ~/coder/precompute.py --model_type huggingface --encoder_from "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco" --output_dir . --tokenized_queries queries.$SET.json --per_gpu_batch_size 100
 ```
 
-Extract it and use `shuf` command to generate a smaller file (10%).
+The above should be run for `SET={in_qrels.train, in_qrels.dev, dev.small}` (or `in_qrels.train` and `in_qrels.dev`).
+
+#### - Retrieve 1000 candidates per query through dense retrieval:
+(4.15 queries/sec for searching through 8.8M docs)
+
+Running dense retrieval for all queries in the training set is the lengthiest step of the pipeline.
+We can parallelize it by splitting the queries set in a number of smaller parts, e.g. 5:
+```bash
+split -l $((`wc -l < queries.in_qrels.train.tsv`/5)) queries.in_qrels.train.tsv query_ids.in_qrels.train --additional-suffix=".tsv" -da 1
+```
+
+Now, we can start one retrieval job for each piece (each should take a few hours):
 
 ```bash
-shuf ./qidpidtriples.train.full.tsv -o ./qidpidtriples.train.small.tsv -n 26991900
+python ~/coder/retrieve.py --doc_embedding_dir doc_embeddings_memmap/ --query_embedding_dir queries.in_qrels.train_embeddings_memmap --query_ids query_ids.in_qrels.train$1.txt --output_path tasb_top1000.train.$1.tsv --hit 1000 --per_gpu_doc_num 3000000 
 ```
 
-Start training. Note that the evaluaton result is about reranking.
+and eventually concatenate the results: `cat tasb_top1000.train.*.tsv > tasb_top1000.train.tsv`.
+
+We also need to run retrieval for the validation (and testing) sets:
 
 ```bash
-python ./main.py --task train --evaluate_during_training
+python ~/coder/retrieve.py --doc_embedding_dir doc_embeddings_memmap/ --query_embedding_dir queries.in_qrels.dev_memmap --output_path tasb_top1000.dev.tsv --hit 1000 --per_gpu_doc_num 3000000 
 ```
 
+and
+
+```bash
+python ~/coder/retrieve.py --doc_embedding_dir doc_embeddings_memmap/ --query_embedding_dir queries.dev.small_memmap --output_path tasb_top1000.dev.small.tsv --hit 1000 --per_gpu_doc_num 3000000 
+```
+
+[The option `--query_ids queries.in_qrels.dev.txt` can be used if we haven't already filtered IDs when precomputing query representations.]
+
+#### - Create memmap arrays for query-candidates (mapping query_ID -> candidate_doc_IDs):
+
+```bash
+python ~/coder/create_memmaps.py --candidates tasb.top1000.train.tsv --output_candidates_dir tasb.top1000.train_memmap 
+```
+
+The above step should also be executed for `dev` and `dev.small`.
+
+## Training and Evaluating CODER
+
+Because of numerous options, CODER is best trained and evaluated using a configuration file, as follows:
+```bash
+python ~/coder/main.py --config ~/coder/configurations/coder_tasb_train_config.json
+```
+
+We include the configuration files for training and evaluating CODER(TAS-B) in `~coder\configurations`.
+
+However, it is also possible to use commandline options, either instead of a configuration file, 
+or to override some options with the option `--override`, e.g.: 
+```bash
+python ~/coder/main.py --config ~/coder/coder_tasb_train_config.json --override '{"learning_rate": 1e-6}'
+```
+
+A detailed documentation of all options can be found as follows (or inside `~/coder/options.py`):
+
+### Show and explain all options for training, evaluation, inspection
+```bash
+python ~/coder/main.py --help
+```
+
+### Computing evaluation metrics
+
+We can use CODER(TAS-B) for reranking TAS-B on `dev.small` by running:
+```bash
+python ~/coder/main.py --config ~/coder/configurations/coder_tasb_eval_config.json
+```
+
+This will output CODER's rankings for each query inside `~/Experiments/DEMO_NAME/predictions`, and also display several evaluation metrics.
+However, to obtain authoritative evaluation metrics (esp. for nDCG), please use [trec_eval](https://trec.nist.gov/trec_eval/).
+
+First, we need to convert the rankings file format to `.trec`:
+```bash
+awk '{print $1 " Q0 " $2 " " $3 " " $4 " coder"}' ~/Experiments/DEMO_NAME/predictions/*.tsv > coder_reranked_tasb_top1000.dev.small.trec
+```
+
+Finally, run the `trec_eval` executable:
+```bash
+trec_eval -m all_trec  qrels.dev.small.tsv reranked_tasb_top1000.dev.small.trec
+```
+
+## Using CODER for dense retrieval
+
+After we have trained CODER, we use the stored checkpoint inside `~/Experiments/DEMO_NAME/checkpoints` 
+to compute the query representations for the set of interest, e.g. `dev.small`:
+
+```bash
+mkdir CODER_rep
+python ~/coder/precompute.py --model_type mdst_transformer --encoder_from "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco" --load_checkpoint ~/Experiments/DEMO_NAME/checkpoints/model_best.pth --output_dir CODER_rep --tokenized_queries queries.dev.small.json --per_gpu_batch_size 256
+```
+
+Finally, we perform dense retrieval:
+
+```bash
+python ~/coder/retrieve.py --doc_embedding_dir doc_embeddings_memmap/ --query_embedding_dir Coder_rep/queries.dev.small_memmap --output_path coder_top1000.dev.tsv --hit 1000 --per_gpu_doc_num 3000000
+```
