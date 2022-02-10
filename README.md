@@ -4,7 +4,7 @@ This codebase implements CODER, a framework that improves the performance of exi
 
 As a starting point, this code was initially forked from: https://github.com/jingtaozhan/RepBERT-Index.
 
-In the following, we will show how to train and evaluate a CODER model using [TAS-B](https://dl.acm.org/doi/10.1145/3404835.3462891)  as a base method.
+In the following, we will show how to train and evaluate a CODER model using [TAS-B](https://dl.acm.org/doi/10.1145/3404835.3462891)  (Sebastian Hofstaetter et al., 2021) as a base method.
 
 ## Setup
 

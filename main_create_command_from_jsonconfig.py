@@ -30,7 +30,7 @@ args = parser.parse_args()
 command = "python main.py"
 
 params_init = {'task': 'train', 
-               'output_dir': '/share/home/navid/experiments/neuralir/msmarco-passage/multidocscoring',
+               'output_dir': '~/experiments/neuralir/msmarco-passage/multidocscoring',
                'embedding_memmap_dir': '/share/cp/datasets/ir/msmarco/passage/repbert/representations/doc_embedding',
                'tokenized_path': '/share/cp/datasets/ir/msmarco/passage/repbert/preprocessed',
                'qrels_path': '/share/cp/datasets/ir/msmarco/passage/qrels.dev.tsv',
