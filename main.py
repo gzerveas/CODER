@@ -14,6 +14,7 @@ import traceback
 from datetime import datetime
 import string
 from collections import OrderedDict
+import bisect
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,8 @@ from precompute import MSMARCO_DocDataset
 from fair_retrieval.metrics_FaiRR import FaiRRMetric, FaiRRMetricHelper
 
 val_times = utils.Timer()  # stores measured validation times
+
+STEP_THRESHOLD = 4000  # Used for fairness regularization; checkpoints corresponding to best performance before STEP_THRESHOLD steps will be ignored
 
 
 def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
@@ -124,12 +127,13 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
         model = torch.nn.DataParallel(model, device_ids=args.cuda_ids)
 
     # Initialize performance tracking and evaluate model before training
-    best_value = 1e16 if args.key_metric in NEG_METRICS else -1e16  # initialize with +inf or -inf depending on key metric
+    best_values = []  # sorted list of length args.num_keep_best, containing the top args.num_keep_best performance metrics
+    best_steps = []  # list containing the global step number corresponding to best_values
     running_metrics = []  # (for validation) list of lists: for every evaluation, stores metrics like loss, MRR, MAP, ...
-    best_metrics = {}
 
     logger.info("\n\n***** Initial evaluation on dev set *****".format(global_step))
-    val_metrics, best_metrics, best_value = validate(args, model, val_dataloader, tb_writer, best_metrics, best_value, global_step, fairrmetric=fairrmetric)
+    val_metrics, best_values, best_steps = validate(args, model, val_dataloader, tb_writer, best_values, best_steps, global_step, fairrmetric=fairrmetric)
+    best_metrics = val_metrics.copy()  # dict of all monitored metrics at the step with the best args.key_metric
     metrics_names, metrics_values = zip(*val_metrics.items())
     running_metrics.append(list(metrics_values))
 
@@ -222,9 +226,10 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
                 if (args.validation_steps and (global_step % args.validation_steps == 0)) or global_step == total_training_steps:
 
                     logger.info("\n\n***** Running evaluation of step {} on dev set *****".format(global_step))
-                    val_metrics, best_metrics, best_value = validate(args, model, val_dataloader, tb_writer,
-                                                                     best_metrics, best_value, global_step,
-                                                                     fairrmetric=fairrmetric)
+                    val_metrics, best_values, best_steps = validate(args, model, val_dataloader, tb_writer,
+                                                                    best_values, best_steps, global_step, fairrmetric=fairrmetric)
+                    if len(best_steps) and (best_steps[0] == global_step):
+                        best_metrics = val_metrics.copy()
                     metrics_names, metrics_values = zip(*val_metrics.items())
                     running_metrics.append(list(metrics_values))
 
@@ -253,7 +258,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
     logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec"
                 " ({:.6f}s per sample)".format(train_batch_size, avg_batch_time, avg_batch_time / train_batch_size))
     logger.info("Average time to train on 1 batch ({} samples): {:.6f} sec".format(train_batch_size, batch_times.get_average()))
-    logger.info('Best {} was {}. Other metrics: {}'.format(args.key_metric, best_value, best_metrics))
+    logger.info('Best {} was {}. Other metrics: {}'.format(args.key_metric, best_values[0], best_metrics))
 
     logger.debug("Average lookup time: {} s".format(lookup_times.get_average()))
     logger.debug("Average retr. candidates time: {} s".format(retrieve_candidates_times.get_average()))
@@ -267,7 +272,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
     return best_metrics
 
 
-def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best_value, global_step, fairrmetric=None):
+def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_steps, global_step, fairrmetric=None):
     """Run an evaluation on the validation set while logging metrics, and handle result"""
 
     model.eval()
@@ -293,15 +298,24 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best
     logger.info(print_str)
 
     val_metrics["global_step"] = global_step
-    if args.key_metric in NEG_METRICS:
-        condition = (val_metrics[args.key_metric] < best_value)
+    if args.key_metric == 'F1_fairness':
+        metric_value = 2 * val_metrics['MRR@10'] * val_metrics['NFaiRR_cutoff_10']/(val_metrics['MRR@10'] + val_metrics['NFaiRR_cutoff_10'])
     else:
-        condition = (val_metrics[args.key_metric] > best_value)
+        metric_value = val_metrics[args.key_metric]
+    if args.key_metric in NEG_METRICS:
+        ind = bisect.bisect_right(best_values, metric_value)  # index where to insert in sorted list in ascending order
+    else:
+        ind = utils.reverse_bisect_right(best_values, metric_value)  # index where to insert in sorted list in descending order
+    condition = (ind < args.num_keep_best) and (global_step > STEP_THRESHOLD)  # NOTE: the second condition is because fairness is always bad initially but performance at its best
     if condition:
-        best_value = val_metrics[args.key_metric]
+        best_values.insert(ind, metric_value)
+        best_steps.insert(ind, global_step)
         # to save space: optimizer, scheduler not saved! Only latest checkpoints can be used for resuming training perfectly
-        utils.save_model(os.path.join(args.save_dir, 'model_best.pth'), global_step, model)
-        best_metrics = val_metrics.copy()
+        utils.save_model(os.path.join(args.save_dir, 'model_best_{}.pth'.format(global_step)), global_step, model)
+        if len(best_values) > args.num_keep_best:
+            os.remove(os.path.join(args.save_dir, 'model_best_{}.pth'.format(best_steps[-1])))
+            best_values = best_values[:args.num_keep_best]
+            best_steps = best_steps[:args.num_keep_best]
 
         if not args.no_predictions:
             ranked_filepath = os.path.join(args.pred_dir, 'best.ranked.dev.tsv')
@@ -309,9 +323,9 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_metrics, best
 
         # Export metrics to a file accumulating best records from the current experiment
         rec_filepath = os.path.join(args.pred_dir, 'training_session_records.xls')
-        utils.register_record(rec_filepath, args.initial_timestamp, args.experiment_name, best_metrics)
+        utils.register_record(rec_filepath, args.initial_timestamp, args.experiment_name, val_metrics)
 
-    return val_metrics, best_metrics, best_value
+    return val_metrics, best_values, best_steps
 
 
 def evaluate(args, model, dataloader, fairrmetric=None):

@@ -5,7 +5,7 @@ logger = logging.getLogger()
 
 
 NEG_METRICS = ['loss']  # metrics which are better when smaller
-POS_METRICS = ['MRR', 'MAP', 'Recall', 'nDCG']  # metrics which are better when higher
+POS_METRICS = ['MRR', 'MAP', 'Recall', 'nDCG', 'F1_fairness']  # metrics which are better when higher
 POS_METRICS.extend(m + '@' for m in POS_METRICS[:])
 METRICS = NEG_METRICS + POS_METRICS
 
@@ -136,8 +136,11 @@ def run_parse_args():
     parser.add_argument("--data_num_workers", default=0, type=int,
                         help="Number of processes feeding data to model. Default: main process only.")
     parser.add_argument("--num_keep", default=1, type=int,
-                        help="How many (latest) checkpoints to keep, besides the best. Can be 0 or more"
-                             "The 'best' checkpoint takes ~500MB, each 'latest' checkpoint ~1.6GB.")
+                        help="How many (latest) checkpoints to keep, besides the best. Can be 0 or more. "
+                             "Each 'best' checkpoint takes ~500MB (BERT-base), each 'latest' checkpoint ~1.6GB.")
+    parser.add_argument("--num_keep_best", default=1, type=int,
+                        help="How many best checkpoints to keep. Can be 1 or more. "
+                             "Each 'best' checkpoint takes ~500MB (BERT-base), each 'latest' checkpoint ~1.6GB.")
     parser.add_argument("--load_collection_to_memory", action='store_true',
                         help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
                         "Needs ~26GB for MSMARCO (~50GB project total), but is faster.")
