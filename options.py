@@ -73,10 +73,10 @@ def run_parse_args():
     parser.add_argument("--collection_memmap_dir", type=str,
                         help="Optional: Memmap dir containing token IDs for each collection document. RepBERT or 'inspect' mode only!")  # RepBERT/inspect only
     parser.add_argument('--train_query_ids', type=str,
-                        help="Optional: Path to a file containing the query IDs to be used for training, 1 in each line. "
+                        help="Optional: Path to a file containing the query IDs to be used for training, each as the first field in each line. "
                              "When not specified, the IDs in `train_candidates_path` are used.")
     parser.add_argument('--eval_query_ids', type=str,
-                        help="Optional: Path to a file containing the query IDs to be used for evaluation, 1 in each line. "
+                        help="Optional: Path to a file containing the query IDs to be used for evaluation, each as the first field in each line.. "
                              "When not specified, the IDs in `eval_candidates_path` are used.")
     parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
     parser.add_argument('--load_model', dest='load_model_path', type=str,

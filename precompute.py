@@ -209,10 +209,6 @@ if __name__ == "__main__":
     parser.add_argument("--tokenized_queries", type=str, default=None,
                         help="""JSON file of tokenized/numerized queries. If specified, will generate corresponding
                          query embeddings""")
-    # parser.add_argument("--tokenizer_from", type=str, default=None,
-    #                     help="""When used together with `tokenizer_type`, it is an optional path of a directory
-    #                     containing a saved custom tokenizer (vocabulary and added tokens). When `tokenizer_type` is not
-    #                     set, it is a string used to initialize one of the built-in HuggingFace tokenizers.""")
     parser.add_argument("--max_query_length", type=int, default=32)
     parser.add_argument("--max_doc_length", type=int, default=256)
     parser.add_argument("--aggregation", type=str, choices=['first', 'mean'], default='first',

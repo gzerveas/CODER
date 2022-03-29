@@ -30,7 +30,7 @@ class FaiRRMetric:
                     _neutscore = self.documents_neutrality[_docid]
                 else:
                     _neutscore = 1.0
-                    print("WARNING: Document neutrality score of ID %d is not found (set to 1)" % _doc_id)
+                    print("WARNING: Document neutrality score of ID %d is not found (set to 1)" % _docid)
                 _retres_neut[_qryid].append(_neutscore)
         
         _bachgroundset_neut = {}
@@ -41,7 +41,7 @@ class FaiRRMetric:
                     _neutscore = self.documents_neutrality[_docid]
                 else:
                     _neutscore = 1.0
-                    print("WARNING: Document neutrality score of ID %d is not found (set to 1)" % _doc_id)
+                    print("WARNING: Document neutrality score of ID %d is not found (set to 1)" % _docid)
                 _bachgroundset_neut[_qryid].append(_neutscore)
         
         ## calculate FaiRR

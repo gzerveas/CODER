@@ -16,7 +16,7 @@ You need to create/choose a directory as root, e.g. `~/Experiments`. Inside this
 model checkpoints, performance metrics per epoch, the experiment configuration, log files, predictions per query, etc.
 
 [We recommend creating and activating a `conda` or other Python virtual environment (e.g. `virtualenv`) to 
-install packages and avoid conficting package requirements; otherwise, to run `pip`, the flag `--user` or `sudo` privileges will be necessary.]
+install packages and avoid conflicting package requirements; otherwise, to run `pip`, the flag `--user` or `sudo` privileges will be necessary.]
 
 `pip install -r coder/requirements.txt`
 
@@ -60,7 +60,7 @@ python ~/coder/create_memmaps.py --tokenized_collection collection.tokenized.jso
 ```
 
 #### - Compute document representations:
-(~2h for 8.8M doc of MS MARCO)
+(~2h for 8.8M doc of MS MARCO on a single GPU, faster if more GPUs are available)
 
 ```bash
 python ~/coder/precompute.py --model_type huggingface --encoder_from "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco" --collection_memmap_dir  collection_memmap/ --output_dir . 

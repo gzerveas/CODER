@@ -1,6 +1,6 @@
 import re
 import random
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import subprocess
 import json
 import os
@@ -18,10 +18,54 @@ import xlwt
 import xlutils.copy
 import psutil
 
+import metrics
+
 import logging
 
 logging.basicConfig(format='%(asctime)s | %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def rank_docs(docids, scores, shuffle=True):
+    """Given a list of document IDs and a (potentially longer due to padding) 1D array of their scores, sort both scores
+    and coresponding document IDs in the order of descending scores."""
+    actual_scores = scores[:len(docids)]
+
+    if shuffle:  # used to remove any possible bias in documents order
+        inds = np.random.permutation(len(docids))
+        actual_scores = actual_scores[inds]
+        docids = [docids[i] for i in inds]
+
+    inds = np.flip(np.argsort(actual_scores))
+    actual_scores = actual_scores[inds]
+    docids = [docids[i] for i in inds]
+    return docids, actual_scores
+
+
+def get_relevances(gt_relevant, candidates, max_docs=None):
+    """Can handle multiple levels of relevance, including explicitly or implicitly 0 scores.
+    Args:
+        gt_relevant: for a given query, it's a dict mapping from ground-truth relevant passage ID to level of relevance
+        candidates: list of candidate pids
+        max_docs: consider only the first this many documents
+    Returns: list of length min(max_docs, len(pred)) with non-zero relevance scores at the indices corresponding to passages in `gt_relevant`
+        e.g. [0 2 1 0 0 1 0]
+    """
+    if max_docs is None:
+        max_docs = len(candidates)
+    return [gt_relevant[pid] if pid in gt_relevant else 0 for pid in candidates[:max_docs]]
+
+
+def calculate_metrics(relevances, num_relevant, k):
+    eval_metrics = OrderedDict([('MRR@{}'.format(k), metrics.mean_reciprocal_rank(relevances, k)),
+                                ('MAP@{}'.format(k), metrics.mean_average_precision(relevances, k)),
+                                ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
+                                ('nDCG@{}'.format(k), np.mean([metrics.ndcg_at_k(rel, k) for rel in relevances])),
+
+                                ('MRR', metrics.mean_reciprocal_rank(relevances)),
+                                ('MAP', metrics.mean_average_precision(relevances)),
+                                ('nDCG', np.mean([metrics.ndcg_at_k(rel) for rel in relevances]))])
+    return eval_metrics
 
 
 def generate_rank(input_path, output_path):
@@ -216,8 +260,9 @@ def write_list(filepath, alist):
 
 def stats_from_counts(counts, threshold=None, logger=None):
     """
-    :param counts: iterable of counts (e.g. number of tokens per sequence)
-    :param threshold: shows how many sequences exceed the specified number in length
+    Given a list, iterable etc of numbers, will calculate statistics and plot histograms
+    :param counts: iterable of numbers (e.g. number of tokens per sequence)
+    :param threshold: shows how many numbers exceed threshold (e.g. sequences exceed the specified number in length)
     :param logger: a logger object to log output, otherwise "print" will be used
     """
 
