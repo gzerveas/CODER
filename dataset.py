@@ -747,7 +747,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
                         query_labels.append(ind)
                 labels.append(query_labels)
 
-        # must be padded with -1 to have same dimensions as the transformer decoder output: (batch_size, max_docs_per_query)
+        # must be padded with -1 to have same dimensions as the transformer "decoder" output: (batch_size, max_docs_per_query)
         data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)  # no more than a couple of rel. documents per query exist, so even uint8 could be used
 
     global collation_times

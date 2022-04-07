@@ -277,7 +277,8 @@ def stats_from_counts(counts, threshold=None, logger=None):
         num_above = np.sum(np.array(counts) > threshold)
         print_func("Above {}: {} ({:.3f}%)\n".format(threshold, num_above, 100*num_above/len(counts)))
 
-    freqs, bin_edges = np.histogram(counts, bins=30)
+    bin_edges = np.linspace(1, 2*threshold, num=30)
+    freqs, bin_edges = np.histogram(counts, bins=bin_edges)
     bin_labels = ["[{:7.2f}, {:7.2f})".format(bin_edges[i], bin_edges[i + 1])
                   for i in range(len(bin_edges)-1)]
     logger.info('Histogram of frequencies:\n')

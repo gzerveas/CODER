@@ -20,8 +20,6 @@ logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message
 logger = logging.getLogger()
 
 
-
-
 def get_tokenizer(args):
     """Initialize and return tokenizer object based on args"""
 
@@ -33,12 +31,13 @@ def get_tokenizer(args):
     return AutoTokenizer.from_pretrained(args.tokenizer_from)
 
 
-def tokenize_file(tokenizer, input_file, output_file):
+def tokenize_file(tokenizer, input_file, output_file, field_sep='\t'):
     total_size = sum(1 for _ in open(input_file))  # simply to get number of lines
     token_counts = []
     with open(output_file, 'w') as outFile:
         for line in tqdm(open(input_file), total=total_size, desc=f"Tokenize: {os.path.basename(input_file)}"):
-            seq_id, text = line.split("\t")
+            seq_id, *text = line.split(field_sep)  # accommodates the case of title or other fields
+            text = (" " + tokenizer.sep_token + " ").join(text)  # in case of more than 1 fields, joins with " [SEP] "
             tokens = tokenizer.tokenize(text)  # does NOT add special "BOS"/"EOS" tokens
             token_counts.append(len(tokens))
             ids = tokenizer.convert_tokens_to_ids(tokens)
@@ -59,7 +58,7 @@ def tokenize_queries(args, tokenizer):
         output_path = os.path.join(args.output_dir, os.path.basename(input_path)[:-4] + '.json')
         token_counts = tokenize_file(tokenizer, input_path, output_path)
         logger.info("Distribution of number of tokens for: {}".format(input_path))
-        utils.stats_from_counts(token_counts, 16, logger)
+        utils.stats_from_counts(token_counts, 256, logger)
 
 
 if __name__ == "__main__":
@@ -93,9 +92,11 @@ if __name__ == "__main__":
     if args.queries is not None:
         tokenize_queries(args, tokenizer)  
     if args.collection is not None:
-        token_counts = tokenize_file(tokenizer, args.collection, os.path.join(args.output_dir, 'collection.tokenized.json'))
+        out_path = os.path.splitext(os.path.basename(args.collection))[0]
+        out_path = os.path.join(args.output_dir, out_path + '.tokenized.json')
+        token_counts = tokenize_file(tokenizer, args.collection, out_path)
         logger.info("Distribution of number of tokens for: {}".format(args.collection))
-        utils.stats_from_counts(token_counts, 512, logger)
+        utils.stats_from_counts(token_counts, 256, logger)
 
     tokenizer_config_path = os.path.join(args.output_dir, "tokenizer_config")
     if tokenizer_config_path != args.tokenizer_from:

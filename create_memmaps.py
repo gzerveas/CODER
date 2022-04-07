@@ -129,7 +129,8 @@ def create_candidates_memmap(candidates_filepath, memmap_dir, max_docs, num_qids
             order of decreasing relevance for query); the order of rows corresponds to qid_memmap
     """
     logger.info("Counting lines ...")
-    total_candidates = sum(1 for _ in open(candidates_filepath))
+    with open(candidates_filepath, 'r') as f:
+        total_candidates = sum(1 for _ in f)
     if num_qids is None:
         num_qids = int(1.5*(total_candidates / max_docs))  # estimate (prob. overestimate) number of queries
 
@@ -216,7 +217,7 @@ if __name__ == "__main__":
             os.makedirs(args.collection_memmap_dir)
         logger.info("Creating memmaps for collection in: {} ...".format(args.collection_memmap_dir))
         start_time = time.time()
-        convert_collection_to_memmap(args.tokenized_collection, args.collection_memmap_dir, args.max_seq_length)
+        convert_collection_to_memmap(args.tokenized_collection, args.collection_memmap_dir, args.max_doc_length)
         runtime = time.time() - start_time
         logger.info("Runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(runtime)))
 

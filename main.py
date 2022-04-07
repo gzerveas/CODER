@@ -23,6 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, SequentialSampler
 # from transformers.modeling_bert import BERT_PRETRAINED_MODEL_ARCHIVE_MAP
 from transformers import BertConfig, AutoTokenizer, AutoModel
+import optuna
 
 # Package modules
 from options import *
@@ -33,7 +34,6 @@ from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiSche
 import utils
 from utils import calculate_metrics, get_relevances, rank_docs
 from inspect_pipeline import inspect
-
 from fair_retrieval.metrics_FaiRR import FaiRRMetric, FaiRRMetricHelper
 
 val_times = utils.Timer()  # stores measured validation times
@@ -41,8 +41,12 @@ val_times = utils.Timer()  # stores measured validation times
 STEP_THRESHOLD = 4000  # Used for fairness regularization; checkpoints corresponding to best performance before STEP_THRESHOLD steps will be ignored
 
 
-def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
-    """Prepare training dataset, train the model and handle results"""
+def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=None):
+    """
+    Prepare training dataset, train the model and handle results.
+    fairrmetric is an optional object for evaluating fairness/neutrality of ranked documents.
+    trial is an optional Optuna hyperparameter optimization object
+    """
 
     tb_writer = SummaryWriter(args.tensorboard_dir)
 
@@ -168,7 +172,10 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
 
             model_inp = {k: v.to(args.device) for k, v in model_inp.items()}
             start_time = time.perf_counter()
-            output = model(**model_inp)  # model output is a dictionary
+            try:
+                output = model(**model_inp)  # model output is a dictionary
+            except RuntimeError:
+                raise optuna.exceptions.TrialPruned()
             loss = output['loss']
 
             if args.n_gpu > 1:
@@ -234,6 +241,11 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None):
 
                     if args.reduce_on_plateau:
                         ROP_scheduler.step(val_metrics[args.reduce_on_plateau])
+
+                    if trial is not None:  # used for hyperparameter optimization
+                        trial.report(best_metrics[args.key_metric], global_step)
+                        if trial.should_prune():  # early stopping
+                            raise optuna.exceptions.TrialPruned()
 
                 if (args.save_steps and (global_step % args.save_steps == 0)) or global_step == total_training_steps:
                     # Save model checkpoint
@@ -350,7 +362,10 @@ def evaluate(args, model, dataloader, fairrmetric=None):
         for batch_data, qids, docids in tqdm(dataloader, desc="Evaluating"):
             batch_data = {k: v.to(args.device) for k, v in batch_data.items()}
             start_time = time.perf_counter()
-            out = model(**batch_data)
+            try:
+                out = model(**batch_data)
+            except RuntimeError:
+                raise optuna.exceptions.TrialPruned()
             query_time += time.perf_counter() - start_time
             rel_scores = out['rel_scores'].detach().cpu().numpy()  # (batch_size, num_docs) relevance scores in [0, 1]
             if 'loss' in out:
@@ -445,7 +460,10 @@ def evaluate_slow(args, model, dataloader, mode, prefix='model'):
         with torch.no_grad():
             for batch, qids, docids in tqdm(dataloader, desc="Evaluating"):
                 batch = {k: v.to(args.device) for k, v in batch.items()}
-                outputs = model(**batch)  # Tuple(similarities, query_embeddings, doc_embeddings)
+                try:
+                    outputs = model(**batch)  # Tuple(similarities, query_embeddings, doc_embeddings)
+                except RuntimeError:
+                    raise optuna.exceptions.TrialPruned()
                 # outputs[0] is a (batch_size, batch_size) tensor of similarities between each query in the batch and each document in the batch
                 scores = torch.diagonal(outputs['rel_scores']).detach().cpu().numpy()  # outputs[0]
                 assert len(qids) == len(docids) == len(scores)
@@ -460,7 +478,7 @@ def evaluate_slow(args, model, dataloader, mode, prefix='model'):
         return mrr
 
 
-def main(config):
+def main(config, trial=None):  # trial is an Optuna hyperparameter optimization object
     args = utils.dict2obj(config)  # Convert config dict to args object
 
     if args.debug:
@@ -559,7 +577,7 @@ def main(config):
     model.to(args.device)  # will also print model architecture, besides moving to GPU
 
     if args.task == "train":
-        return train(args, model, eval_dataloader, tokenizer, fairrmetric=fairrmetric)
+        return train(args, model, eval_dataloader, tokenizer, fairrmetric=fairrmetric, trial=trial)
     else:
         # Just evaluate trained model on some dataset (needs ~27GB for MS MARCO dev set)
 
