@@ -38,7 +38,7 @@ from fair_retrieval.metrics_FaiRR import FaiRRMetric, FaiRRMetricHelper
 
 val_times = utils.Timer()  # stores measured validation times
 
-STEP_THRESHOLD = 4000  # Used for fairness regularization; checkpoints corresponding to best performance before STEP_THRESHOLD steps will be ignored
+STEP_THRESHOLD = 0  #4000 # Used for fairness regularization; checkpoints corresponding to best performance before STEP_THRESHOLD steps will be ignored
 
 
 def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=None):
@@ -244,8 +244,14 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
 
                     if trial is not None:  # used for hyperparameter optimization
                         trial.report(best_metrics[args.key_metric], global_step)
-                        if trial.should_prune():  # early stopping
-                            raise optuna.exceptions.TrialPruned()
+                        HARD_PATIENCE = 60000
+                        HARD_TOLERANCE = 0.001
+                        if len(best_steps) and ((global_step - best_steps[-1]) > HARD_PATIENCE):  # countdown
+                        #if (global_step > HARD_PATIENCE) and (running_metrics[0][metric2ind[args.key_metric]] - best_metrics[args.key_metric]) < HARD_TOLERANCE):
+                            return best_metrics
+
+                        # if trial.should_prune():  # early stopping
+                        #     raise optuna.exceptions.TrialPruned()
 
                 if (args.save_steps and (global_step % args.save_steps == 0)) or global_step == total_training_steps:
                     # Save model checkpoint
