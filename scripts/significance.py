@@ -274,11 +274,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Run significance tests")
 
     parser.add_argument("--trec_eval_binary", type=str,
-                        help="File path of trec_eval binary")
+                        help="If given, the binary file of trec_eval will be executed to evaluate ranking performnance")
     parser.add_argument("--base", type=str,
-                        help="Path to rankings by model/system with respect to which we want to test whether improvement is significant")
+                        help="Path to either rankings (when `trec_eval_binary` is given) "
+                             "or existing trec_eval output file for model/system with respect to which we want to test whether improvement is significant")
     parser.add_argument("--contender", type=str,
-                        help="Path to rankings by model/system which should improve on the base model")
+                        help="Path to either rankings (when `trec_eval_binary` is given) "
+                             "or existing trec_eval output file for model/system which should improve on the base model")
     parser.add_argument("--qrels_path", type=str,
                         help="""Path to qrels (ground truth relevance judgements) as needed by trec_eval""")
     args = parser.parse_args()

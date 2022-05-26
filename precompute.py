@@ -249,7 +249,7 @@ if __name__ == "__main__":
         model = AutoModel.from_pretrained(args.encoder_from)
         model.to(args.device)
 
-        if args.model_type == 'mdstransformer':  # parameter loading for 'MDSTransformer' checkpoint
+        if args.model_type == 'mdstransformer':  # parameter loading for 'CODER' checkpoint
             logger.info("Loading encoder weights from: '{}' ...".format(args.load_checkpoint))
             model = utils.load_encoder(model, args.load_checkpoint, device)
             

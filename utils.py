@@ -45,7 +45,7 @@ def rank_docs(docids, scores, shuffle=True):
 def get_relevances(gt_relevant, candidates, max_docs=None):
     """Can handle multiple levels of relevance, including explicitly or implicitly 0 scores.
     Args:
-        gt_relevant: for a given query, it's a dict mapping from ground-truth relevant passage ID to level of relevance
+        gt_relevant: for a given query, it's a dict mapping from ground-truth relevant candidate ID to level of relevance
         candidates: list of candidate pids
         max_docs: consider only the first this many documents
     Returns: list of length min(max_docs, len(pred)) with non-zero relevance scores at the indices corresponding to passages in `gt_relevant`
@@ -53,18 +53,18 @@ def get_relevances(gt_relevant, candidates, max_docs=None):
     """
     if max_docs is None:
         max_docs = len(candidates)
-    return [gt_relevant[pid] if pid in gt_relevant else 0 for pid in candidates[:max_docs]]
+    return [gt_relevant[candid] if candid in gt_relevant else 0 for candid in candidates[:max_docs]]
 
 
 def calculate_metrics(relevances, num_relevant, k):
-    eval_metrics = OrderedDict([('MRR@{}'.format(k), metrics.mean_reciprocal_rank(relevances, k)),
-                                ('MAP@{}'.format(k), metrics.mean_average_precision(relevances, k)),
-                                ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
-                                ('nDCG@{}'.format(k), np.mean([metrics.ndcg_at_k(rel, k) for rel in relevances])),
-
-                                ('MRR', metrics.mean_reciprocal_rank(relevances)),
+    eval_metrics = OrderedDict([('MRR', metrics.mean_reciprocal_rank(relevances)),
+                                ('MRR@{}'.format(k), metrics.mean_reciprocal_rank(relevances, k)),
                                 ('MAP', metrics.mean_average_precision(relevances)),
-                                ('nDCG', np.mean([metrics.ndcg_at_k(rel) for rel in relevances]))])
+                                ('MAP@{}'.format(k), metrics.mean_average_precision(relevances, k)),
+                                ('MAP@R', metrics.mean_average_precision_at_r(relevances, num_relevant)),
+                                ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
+                                ('nDCG', np.mean([metrics.ndcg_at_k(rel) for rel in relevances])),
+                                ('nDCG@{}'.format(k), np.mean([metrics.ndcg_at_k(rel, k) for rel in relevances]))])
     return eval_metrics
 
 
@@ -214,7 +214,7 @@ def load_model(model, model_path, device='cpu', resume=False, change_output=Fals
 
 def load_encoder(model, checkpoint_path, device='cpu'):
     """
-    Loads query encoder weights from a MDSTransformer model checkpoint
+    Loads query encoder weights from a CODER model checkpoint
     :param model: an initialized encoder model object (typically HuggingFace), already on its intended device
     :param checkpoint_path: MDSTransfomer checkpoint file from which to load encoder weights.
     :param device: Where to initially load the tensors. The device of 'model' will determine the final destination,

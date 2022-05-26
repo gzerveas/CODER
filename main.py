@@ -27,7 +27,7 @@ import optuna
 
 # Package modules
 from options import *
-from modeling import RepBERT_Train, MDSTransformer, get_loss_module
+from modeling import RepBERT_Train, CODER, get_loss_module
 from dataset import MYMARCO_Dataset, MSMARCODataset
 from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
 from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiScheduler
@@ -63,7 +63,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                                     relevance_labels_mapping=args.relevance_labels_mapping,
                                     collection_neutrality_path=args.collection_neutrality_path,
                                     query_ids_path=args.train_query_ids)
-    collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu)
+    collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu,
+                                                label_format=model.loss_module.formatting)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
     utils.write_list(os.path.join(args.output_dir, "train_IDs.txt"), train_dataset.qids)
@@ -542,13 +543,8 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
     logger.info("Preparing {} dataset ...".format(eval_mode))
     start_time = time.time()
     eval_dataset = get_dataset(args, eval_mode, tokenizer)  # CHANGED here from eval_mode
-    collate_fn = eval_dataset.get_collate_func(n_gpu=args.n_gpu)
     logger.info("'{}' data loaded in {:.3f} sec".format(eval_mode, time.time() - start_time))
-
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    eval_dataloader = DataLoader(eval_dataset, batch_size=args.eval_batch_size, shuffle=False,
-                                 num_workers=args.data_num_workers, collate_fn=collate_fn)
 
     logger.info("Number of {} samples: {}".format(eval_mode, len(eval_dataset)))
     logger.info("Batch size: %d", args.eval_batch_size)
@@ -571,7 +567,7 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
         # Works with either directory path containing HF config file, or JSON HF config file,  or pre-defined model string
         config_obj = BertConfig.from_pretrained(args.load_model_path)
         model = RepBERT_Train.from_pretrained(args.load_model_path, config=config_obj)
-    else:  # new configuration setup for MultiDocumentScoringTransformer models
+    else:  # new configuration setup for CODER models
         model = get_model(args, eval_dataset.emb_collection.embedding_vectors.shape[1])
 
     logger.debug("Model:\n{}".format(model))
@@ -581,6 +577,10 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
     logger.info("Trainable encoder parameters: {}".format(utils.count_parameters(model.encoder, trainable=True)))
 
     model.to(args.device)  # will also print model architecture, besides moving to GPU
+
+    collate_fn = eval_dataset.get_collate_func(n_gpu=args.n_gpu, label_format=model.loss_module.formatting)
+    eval_dataloader = DataLoader(eval_dataset, batch_size=args.eval_batch_size, shuffle=False,
+                                 num_workers=args.data_num_workers, collate_fn=collate_fn)
 
     if args.task == "train":
         return train(args, model, eval_dataloader, tokenizer, fairrmetric=fairrmetric, trial=trial)
@@ -720,25 +720,25 @@ def get_model(args, doc_emb_dim=None):
         if args.aux_loss_type is not None:
             aux_loss_module = get_loss_module(args.aux_loss_type, args)  # instantiate auxiliary loss module
 
-        return MDSTransformer(custom_encoder=query_encoder,
-                              d_model=args.d_model,
-                              num_heads=args.num_heads,
-                              num_decoder_layers=args.num_layers,
-                              dim_feedforward=args.dim_feedforward,
-                              dropout=args.dropout,
-                              activation=args.activation,
-                              normalization=args.normalization_layer,
-                              doc_emb_dim=doc_emb_dim,
-                              scoring_mode=args.scoring_mode,
-                              query_emb_aggregation=args.query_aggregation,
-                              loss_module=loss_module,
-                              aux_loss_module=aux_loss_module,
-                              aux_loss_coeff=args.aux_loss_coeff,
-                              selfatten_mode=args.selfatten_mode,
-                              no_decoder=args.no_decoder,
-                              no_dec_crossatten=args.no_dec_crossatten,
-                              bias_regul_coeff=args.bias_regul_coeff,
-                              bias_regul_cutoff=args.bias_regul_cutoff)
+        return CODER(custom_encoder=query_encoder,
+                     d_model=args.d_model,
+                     num_heads=args.num_heads,
+                     num_decoder_layers=args.num_layers,
+                     dim_feedforward=args.dim_feedforward,
+                     dropout=args.dropout,
+                     activation=args.activation,
+                     normalization=args.normalization_layer,
+                     doc_emb_dim=doc_emb_dim,
+                     scoring_mode=args.scoring_mode,
+                     query_emb_aggregation=args.query_aggregation,
+                     loss_module=loss_module,
+                     aux_loss_module=aux_loss_module,
+                     aux_loss_coeff=args.aux_loss_coeff,
+                     selfatten_mode=args.selfatten_mode,
+                     no_decoder=args.no_decoder,
+                     no_dec_crossatten=args.no_dec_crossatten,
+                     bias_regul_coeff=args.bias_regul_coeff,
+                     bias_regul_cutoff=args.bias_regul_cutoff)
     else:
         raise NotImplementedError('Unknown model type')
 

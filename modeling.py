@@ -170,7 +170,7 @@ class Scorer(nn.Module):
             self.linear = nn.Linear(d_model, 2)
             self.score_func = torch.nn.LogSoftmax(dim=-1)
         else:
-            self.linear = nn.Linear(d_model, 1)
+            # self.linear = nn.Linear(d_model, 1)
 
             # self.linear.weight.requires_grad = False
             # self.linear.weight.data.fill_(1.00)
@@ -181,14 +181,14 @@ class Scorer(nn.Module):
 
     def forward(self, output_emb, *args, **kwargs):
         """
-        :param output_emb: (num_docs, batch_size, doc_emb_size) transformed sequence of document embeddings
+        :param output_emb: (num_cands, batch_size, doc_emb_size) transformed sequence of document embeddings
         :return: case `scoring_mode`:
-            None: (batch_size, num_docs) relevance scores, floats of arbitrary range
-            'sigmoid': (batch_size, num_docs) relevance scores in [0, 1]
-            'tanh': (batch_size, num_docs) relevance scores in [-1, 1]
-            'softmax': (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
+            None: (batch_size, num_cands) relevance scores, floats of arbitrary range
+            'sigmoid': (batch_size, num_cands) relevance scores in [0, 1]
+            'tanh': (batch_size, num_cands) relevance scores in [-1, 1]
+            'softmax': (batch_size, num_cands, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
         """
-        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, doc_emb_size)
+        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_cands, doc_emb_size)
         return self.score_func(self.linear(output_emb))
 
 
@@ -196,7 +196,7 @@ class CrossAttentionScorer(Scorer):
     """
     Applies multi-headed attention between query term embeddings and final document representations in the "decoder".
     Final document representations are used as Queries, (query) encoder representations are used as Keys and Values.
-    TODO: Experiment with the reverse? doc_emb as K, V, query_emb as Q
+    TODO: Experiment with the reverse? cand_emb as K, V, query_emb as Q
     """
 
     def __init__(self, d_model, scoring_mode=None):
@@ -207,19 +207,19 @@ class CrossAttentionScorer(Scorer):
 
     def forward(self, output_emb, query_emb, query_mask):
         """
-        :param output_emb: output_emb: (num_docs, batch_size, d_model) transformed sequence of document embeddings
+        :param output_emb: output_emb: (num_cands, batch_size, d_model) transformed sequence of document embeddings
         :param query_emb: (query_length, batch_size, d_model) final query term embeddings
         :param query_mask: (batch_size, query_length) attention mask bool tensor for query tokens; 0 use, 1 ignore
         :return: case `scoring_mode`:
-            None or 'cross_attention': (batch_size, num_docs) relevance scores, floats of arbitrary range
-            'sigmoid': (batch_size, num_docs) relevance scores in [0, 1]
-            'tanh': (batch_size, num_docs) relevance scores in [-1, 1]
-            'softmax': (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
+            None or 'cross_attention': (batch_size, num_cands) relevance scores, floats of arbitrary range
+            'sigmoid': (batch_size, num_cands) relevance scores in [0, 1]
+            'tanh': (batch_size, num_cands) relevance scores in [-1, 1]
+            'softmax': (batch_size, num_cands, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
         """
         output_emb = self.activation_func(output_emb)  # TODO: test
         query_emb = self.activation_func(query_emb)  # TODO: test
         out = self.multihead_attn(output_emb, query_emb, query_emb, key_padding_mask=query_mask, need_weights=False)[0]
-        out = out.permute(1, 0, 2)  # (batch_size, num_docs, d_model)
+        out = out.permute(1, 0, 2)  # (batch_size, num_cands, d_model)
         return self.score_func(self.linear(out))
 
 
@@ -231,8 +231,12 @@ def get_aggregation_function(aggregation):
     """
     if aggregation == 'mean':
         aggregation_func = _average_sequence_embeddings
-    else:
+    elif aggregation == 'first':
         aggregation_func = _select_first_embedding
+    else:
+        def identity(x, *y):
+            return x
+        aggregation_func = identity
     return aggregation_func
 
 
@@ -243,12 +247,13 @@ class DotProductScorer(Scorer):
     """
     def __init__(self, scoring_mode='', pre_activation=None, normalize=False, aggregation='mean'):
         """
-        :param scoring_mode: string, same as the option used to initialize `MDSTransformer`. At this point, the string
+        :param scoring_mode: string, same as the option used to initialize `CODER`. At this point, the string
             must start with "doc_product" or "cosine", but the suffix can specify a (non)linear transformation to be used on scores
         :param pre_activation: activation function to use on representations BEFORE computing the inner product
         :param normalize: if True, will divide product by vector norms, i.e. will compute the cosine similarity
         :param aggregation: defines how to aggregate final query token representations to obtain a single vector
-            representation for the query. 'mean' will average, 'first' will simply select the first vector
+            representation for the query. 'mean' will average, 'first' will simply select the first vector.
+            'None' will not aggregate token representations
         """
         super(DotProductScorer, self).__init__(d_model=1, scoring_mode=scoring_mode)
 
@@ -260,47 +265,91 @@ class DotProductScorer(Scorer):
         self.aggregation_func = get_aggregation_function(aggregation)
         self.normalize = normalize
 
-    def forward(self, output_emb, query_emb, query_mask):
+    def forward(self, output_emb, query_emb, query_mask=None):
         """
-        :param output_emb: output_emb: (num_docs, batch_size, d_model) transformed sequence of document embeddings
+        :param output_emb: output_emb: (num_cands, batch_size, d_model) transformed sequence of document embeddings
         :param query_emb: (query_length, batch_size, d_model) final query term embeddings
         :param query_mask: (batch_size, query_length) attention mask bool tensor for query tokens; 0 use, 1 ignore
-        :return: scores: (batch_size, num_docs) inner product between aggregate query embedding and each document embedding
-            if 'dot_product_softmax': (batch_size, num_docs, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
+        :return: scores: (batch_size, num_cands) inner product between aggregate query embedding and each document embedding
+            if 'dot_product_softmax': (batch_size, num_cands, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
         """
         if self.pre_activation_func is not None:
             output_emb = self.pre_activation_func(output_emb)  # TODO: test
             query_emb = self.pre_activation_func(query_emb)  # TODO: test
 
-        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_docs, d_model)
+        output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_cands, d_model)
         query_emb = query_emb.permute(1, 0, 2)  # (batch_size, query_len, d_model)
         agg_query_emb = self.aggregation_func(query_emb, ~query_mask)  # (batch_size, d_model)
 
         if self.normalize:
             scores = F.cosine_similarity(output_emb, agg_query_emb[:, None, :], dim=2, eps=1e-6)
         else:
-            # scores = torch.matmul(output_emb, avg_query_emb[:, :, None])  # (batch_size, num_docs, 1) when using self.score_func for re-scaling
+            # scores = torch.matmul(output_emb, avg_query_emb[:, :, None])  # (batch_size, num_cands, 1) when using self.score_func for re-scaling
             # scores = self.score_func(self.linear(scores))
             scores = torch.matmul(output_emb, agg_query_emb[:, :, None]).squeeze()  # to disable scaling
 
         return scores
 
 
-class RelevanceCrossEntropyLoss(nn.Module):
+class BaseLoss(nn.Module):
+
+    def __init__(self, formatting='scores'):
+        """
+        :param formatting: 'indices' or 'scores'.
+            If 'scores', assumes that `labels` have the same formatting as `predictions`:
+                each position is a relevance score, -Inf for non-relevant and padding, e.g. [2 1 1 -Inf ... -Inf]
+            If 'indices', assumes range(num_relevant) integer indices of relevant documents and is padded with -1,
+                e.g. [0, 1, 2, -1, ..., -1]
+        """
+        super(BaseLoss, self).__init__()
+        self.formatting = formatting
+
+    def forward(self, predictions, labels, padding_mask=None):
+        """
+        :param predictions: (batch_size, num_cands, ...) tensor of predicted scores for each candidate document and query.
+        :param labels: (batch_size, num_cands) ground truth relevance labels. See `formatting`
+        :param padding_mask: (batch_size, num_candidates) boolean mask. 1 where element is padding, 0 where valid
+        :return: loss: scalar tensor. Mean loss per document
+        """
+        raise NotImplementedError("Override in children classes")
+
+
+class MaxMarginLoss(BaseLoss):
+
+    def __init__(self, formatting='indices', **kwargs):
+        super(MaxMarginLoss, self).__init__(formatting='indices')  # force formatting to PyTorch expected
+        self.loss_module = nn.MultiLabelMarginLoss(**kwargs)
+
+    def forward(self, predictions, labels, padding_mask=None):
+        """
+        :param predictions: (batch_size, num_cands) relevance scores for each candidate document and query.
+        :param labels: (batch_size, num_cands) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (cand_inds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `cand_inds`, and labels[n:] == -1,
+                indicating non-relevance.
+        :param padding_mask: (batch_size, num_candidates) boolean mask. 1 where element is padding, 0 where valid
+        :return: loss: scalar tensor. Mean loss per document
+        """
+        labels = labels.to(torch.int64)  # required by PyTorch
+        if padding_mask is not None:
+            predictions[padding_mask] = float("-Inf")
+        return self.loss_module(predictions, labels)
+
+
+class RelevanceCrossEntropyLoss(BaseLoss):
     """
     Special cross-entropy loss
     """
-    def __init__(self):
-        super(RelevanceCrossEntropyLoss, self).__init__()
 
-    def forward(self, predictions, labels):
+    def forward(self, predictions, labels, padding_mask=None):
         """
-        :param predictions: (batch_size, num_docs, 2) relevance class log-probabilities for each candidate document and query.
+        :param predictions: (batch_size, num_cands, 2) relevance class log-probabilities for each candidate document and query.
             Dimension [:, :, 0] corresponds to the log-prob. for the "relevant" class and [:, :, 1] to the "non-relevant" class.
-        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
-                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
-                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+        :param labels: (batch_size, num_cands) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (cand_inds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `cand_inds`, and labels[n:] == -1,
                 indicating non-relevance.
+        :param padding_mask: (batch_size, num_candidates) boolean mask. 1 where element is padding, 0 where valid
         :return: loss: scalar tensor. Mean loss per document
         """
         # WARNING: works assuming that `labels` aren't scores but integer indices of relevant documents padded with -1, e.g. [0, 1, 2, -1, ..., -1]
@@ -309,54 +358,63 @@ class RelevanceCrossEntropyLoss(nn.Module):
         # Here, queries with more positive (and negative) documents contribute more to the loss calculation than queries
         # with a smaller number.
         is_relevant = (labels > -1)
-        total_relevant = is_relevant.sum()  # total number of relevant documents in the batch
-        loss_pos = torch.sum(predictions[:, :, 0] * is_relevant) / total_relevant  # scalar. loss per document, for positive documents
-        loss_neg = torch.sum(predictions[:, :, 1] * ~is_relevant) / (labels.shape[0]*labels.shape[1] - total_relevant)  # scalar. loss per document, for negative documents
+        if padding_mask is None:
+            is_nonrelevant = ~is_relevant
+        else:
+            is_nonrelevant = ~is_relevant & ~padding_mask
+
+        loss_pos = torch.sum(predictions[:, :, 0] * is_relevant) / is_relevant.sum()  # scalar. loss per document, for positive documents
+        loss_neg = torch.sum(predictions[:, :, 1] * is_nonrelevant) / is_nonrelevant.sum()  # scalar. loss per document, for negative documents
         loss = - (loss_pos + loss_neg)
 
         return loss
 
 
-class RelevanceListnetLoss(nn.Module):
+class RelevanceListnetLoss(BaseLoss):
     """
-    ListNet loss
+    KL-divergence loss
     """
-    def __init__(self):
-        super(RelevanceListnetLoss, self).__init__()
 
-    def forward(self, predictions, labels):
+    def forward(self, predictions, labels, padding_mask=None):
         """
-        :param predictions: (batch_size, num_docs) relevance scores (arb. range) for each candidate document and query.
-        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
-                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
-                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
-                indicating non-relevance.
+        :param predictions: (batch_size, num_candidates) relevance scores (arb. range) for each candidate and query.
+        :param labels: (batch_size, num_candidates) tensor. See `formatting`.
+        :param padding_mask: (batch_size, num_candidates) boolean mask. 1 where element is padding, 0 where valid
         :return: loss: scalar tensor. Mean loss per query
         """
-        # WARNING: works assuming that `labels` aren't scores but integer indices of relevant documents padded with -1, e.g. [0, 1, 2, -1, ..., -1]
 
-        _labels_values = labels.new_zeros(labels.shape, dtype=torch.float32)
-        is_relevant = (labels > -1)
-        _labels_values[is_relevant] = 1
+        if self.formatting == 'indices':
+            # works assuming that `labels` aren't scores but range(num_relevant) integer indices of relevant documents padded with -1, e.g. [0, 1, 2, -1, ..., -1]
+            _labels_values = labels.new_zeros(labels.shape, dtype=torch.float32)
+            is_padding = (labels == -1)
+            _labels_values[~is_padding] = 1
+            _labels_values[is_padding] = float("-Inf")
+        else:
+            _labels_values = labels
+
         # NOTE: _labels_values = _labels_values / torch.sum(is_relevant, dim=1).unsqueeze(dim=1)
         # is equivalent but interestingly much slower than setting -Inf and computing Softmax; maybe due to CUDA Softmax code
-        _labels_values[labels == -1] = float("-Inf")
         labels_probs = torch.nn.Softmax(dim=1)(_labels_values)
 
-        predictions_logprobs = torch.nn.LogSoftmax(dim=1)(predictions)  # (batch, num_docs) log-distribution over docs
+        if padding_mask is not None:
+            predictions[padding_mask] = float("-Inf")
+
+        predictions_logprobs = torch.nn.LogSoftmax(dim=1)(predictions)  # (batch, num_cands) log-distribution over docs
         # KLDivLoss expects predictions ('inputs') as log-probabilities and 'targets' as probabilities
         loss = torch.nn.KLDivLoss(reduction='batchmean')(predictions_logprobs, labels_probs)
-        
+
         return loss
 
 
-class MultiTierLoss(nn.Module):
+class MultiTierLoss(BaseLoss):
+    # TODO: This is designed to work with formatting=="indices". Needs to be updated
     """
     Uses multiple tiers of relevance for candidate documents, determined by their ranking from the candidate retrieval method.
     Encourages that the similarity score between the query and all documents in each tier is higher than the similarity
     between the query and all documents from lower tiers.
     """
-    def __init__(self, num_tiers=3, tier_size=50, tier_distance=None, diff_function='maxmargin', gt_function=None, gt_factor=2, reduction='mean'):
+    def __init__(self, formatting='indices', num_tiers=3, tier_size=50, tier_distance=None,
+                 diff_function='maxmargin', gt_function=None, gt_factor=2, reduction='mean'):
         """
         :param num_tiers: total number of tiers (ground truth documents are not considered a separate tier)
         :param tier_size: number of documents in each tier
@@ -370,7 +428,7 @@ class MultiTierLoss(nn.Module):
         :param reduction: if 'none', a loss for each batch item (query) will be computed, otherwise the 'mean' or 'sum'
                         over queries in the batch
         """
-        super(MultiTierLoss, self).__init__()
+        super(MultiTierLoss, self).__init__(formatting=formatting)
 
         self.num_tiers = num_tiers
         self.tier_size = tier_size
@@ -386,7 +444,7 @@ class MultiTierLoss(nn.Module):
         if gt_function == 'same':  # will use the same function as `diff_function`
             self.gt_function = self.compute_gt_diffs
         elif gt_function == 'multilabelmargin':  # this is equivalent to 'same' with `diff_function`=='maxmargin', but much faster (avoids Python loop over batch_size)
-            self.gt_function = nn.MultiLabelMarginLoss(reduction='none')
+            self.gt_function = MaxMarginLoss(reduction='none')
         else:  # if None, no special treatment for ground truth relevant documents.
             self.gt_function = gt_function
         self.gt_factor = gt_factor
@@ -395,7 +453,7 @@ class MultiTierLoss(nn.Module):
 
     def compute_diffs(self, scores, inds1, inds2):
         """
-        :param scores: (batch_size, num_docs) relevance scores for each candidate document and query
+        :param scores: (batch_size, num_cands) relevance scores for each candidate document and query
         :param inds1: (num_tier1docs,) indices (locations) of documents within first tier. Same across batch (i.e. for all queries)! Can be a list or range.
         :param inds2: (num_tier2docs,) indices (locations) of documents within second tier. Same across batch (i.e. for all queries)! Can be a list or range.
         :return query_losses: (batch_size,) loss for each query corresponding
@@ -416,10 +474,10 @@ class MultiTierLoss(nn.Module):
         to call `compute_diffs`.
         # TODO: relies on the easy-to-lift assumption that all g.t. are at the beginning
 
-        :param scores: (batch_size, num_docs) relevance scores for each candidate document and query.
-        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
-                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
-                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+        :param scores: (batch_size, num_cands) relevance scores for each candidate document and query.
+        :param labels: (batch_size, num_cands) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (cand_inds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `cand_inds`, and labels[n:] == -1,
                 indicating non-relevance.
         :return query_losses: (batch_size,) loss for each query
         """
@@ -451,16 +509,19 @@ class MultiTierLoss(nn.Module):
                     start_inds.append(new_ind)
         return start_inds
 
-    def forward(self, scores, labels):
+    def forward(self, scores, labels, padding_mask=None):
         """
-        :param scores: (batch_size, num_docs) relevance scores for each candidate document and query.
-        :param labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices (positions) of the
-                relevant documents within its corresponding pool of candidates (docinds). If n relevant documents exist,
-                then labels[0:n] are the positions of these documents inside `docinds`, and labels[n:] == -1,
+        :param scores: (batch_size, num_cands) relevance scores for each candidate document and query.
+        :param labels: (batch_size, num_cands) int tensor which for each query (row) contains the indices (positions) of the
+                relevant documents within its corresponding pool of candidates (cand_inds). If n relevant documents exist,
+                then labels[0:n] are the positions of these documents inside `cand_inds`, and labels[n:] == -1,
                 indicating non-relevance.
         :return: loss: (batch_size,) tensor of aggregate loss per document for each query if reduction=='none',
                         otherwise scalar tensor of aggregate loss per query and document
         """
+
+        if padding_mask is not None:
+            raise NotImplementedError('MultiTierLoss needs to be updated.')
 
         # is_relevant = (labels > -1)
         # num_relevant = is_relevant.sum(dim=1)  # total number of relevant documents in the batch
@@ -494,16 +555,16 @@ class MultiTierLoss(nn.Module):
 def get_loss_module(loss_type, args):
 
     if loss_type == 'multilabelmargin':
-        return nn.MultiLabelMarginLoss()
+        return MaxMarginLoss(formatting='indices')
     elif loss_type == 'crossentropy':
-        return RelevanceCrossEntropyLoss()
+        return RelevanceCrossEntropyLoss(formatting='indices')
     elif loss_type == 'listnet':
-        return RelevanceListnetLoss()
+        return RelevanceListnetLoss(formatting='scores')
     elif loss_type == 'multitier':
-        return MultiTierLoss(num_tiers=args.num_tiers, tier_size=args.tier_size, tier_distance=args.tier_distance,
+        return MultiTierLoss(formatting='indices',
+                             num_tiers=args.num_tiers, tier_size=args.tier_size, tier_distance=args.tier_distance,
                              diff_function=args.diff_function,
-                             gt_function=args.gt_function,
-                             gt_factor=args.gt_factor)
+                             gt_function=args.gt_function, gt_factor=args.gt_factor)
     else:
         raise NotImplementedError("Loss type '{}' not implemented!".format(args.loss_type))
 
@@ -583,7 +644,7 @@ class LinearTransformerDecoderLayer(nn.TransformerDecoderLayer):
         dim_feedforward: the dimension of the feedforward network model (default=2048).
         dropout: the dropout value (default=0.1).
         activation: the activation function of intermediate layer, relu or gelu (default=relu).
-"""
+    """
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu"):
         super(nn.TransformerDecoderLayer, self).__init__()
@@ -645,7 +706,7 @@ class ReducedTransformerDecoderLayer(nn.TransformerDecoderLayer):
         dim_feedforward: the dimension of the feedforward network model (default=2048).
         dropout: the dropout value (default=0.1).
         activation: the activation function of intermediate layer, relu or gelu (default=relu).
-"""
+    """
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu"):
         super(nn.TransformerDecoderLayer, self).__init__()
@@ -694,15 +755,15 @@ class ReducedTransformerDecoderLayer(nn.TransformerDecoderLayer):
         return tgt
 
 
-class MDSTransformer(nn.Module):
-    r"""Multiple Document Scoring Transformer. By default, consists of a query enconder (Huggingface implementation),
+class CODER(nn.Module):
+    r"""COntextual Document Embedding Reranker. By default, consists of a query enconder (Huggingface implementation),
     and a "decoder" using self-attention over a sequence (set) of document representations and cross-attention over
     the query term representations in the  encoder output.
     Computes a relevance score for each (transformed) document representation and can be thus used for reranking.
 
     Examples::
-        >>> model = MDSTransformer(enc_config, num_heads=16, num_decoder_layers=4)
-        >>> model = MDSTransformer(custom_encoder=my_HF_encoder, num_heads=16, num_decoder_layers=4)
+        >>> model = CODER(enc_config, num_heads=16, num_decoder_layers=4)
+        >>> model = CODER(custom_encoder=my_HF_encoder, num_heads=16, num_decoder_layers=4)
     """
 
     def __init__(self, encoder_config=None, custom_encoder=None, custom_decoder=None,
@@ -748,7 +809,7 @@ class MDSTransformer(nn.Module):
         :param bias_regul_coeff: coefficient for bias regularization term in the total loss
         :param bias_regul_cutoff:
         """
-        super(MDSTransformer, self).__init__()
+        super(CODER, self).__init__()
 
         if custom_encoder is not None:
             self.encoder = custom_encoder
@@ -790,7 +851,7 @@ class MDSTransformer(nn.Module):
         if self.doc_emb_dim is None:
             self.doc_emb_dim = d_model
             logger.warning("Using {} dim. for transformer model dimension; "
-                           "expecting same document embedding dimension!".format(self.d_model))
+                           "expecting same candidate embedding dimension!".format(self.d_model))
 
         self.num_heads = num_heads
 
@@ -809,7 +870,7 @@ class MDSTransformer(nn.Module):
                            "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
 
         self.scoring_mode = scoring_mode
-        self.score_docs = self.get_scoring_module(scoring_mode, query_emb_aggregation)
+        self.score_cands = self.get_scoring_module(scoring_mode, query_emb_aggregation)
 
         self.loss_module = loss_module
         self.aux_loss_module = aux_loss_module
@@ -901,7 +962,7 @@ class MDSTransformer(nn.Module):
                                       memory_key_padding_mask=memory_key_padding_mask)
             # output_emb = self.act(output_emb)  # the output transformer encoder/decoder embeddings don't include non-linearity
 
-        predictions = self.score_docs(output_emb, enc_hidden_states, memory_key_padding_mask)  # relevance scores. dimensions vary depending on scoring_mode
+        predictions = self.score_cands(output_emb, enc_hidden_states, memory_key_padding_mask)  # relevance scores. dimensions vary depending on scoring_mode
         
         if self.scoring_mode.endswith('softmax'):
             rel_scores = torch.exp(predictions[:, :, 0])  # (batch_size, num_docs) relevance scores
@@ -928,10 +989,10 @@ class MDSTransformer(nn.Module):
 
         # Compute loss
         if labels is not None:
-            loss = self.loss_module(rel_scores, labels.to(torch.int64))  # loss is scalar tensor. labels are int16, convert to int64 for PyTorch losses
+            loss = self.loss_module(rel_scores, labels, padding_mask=~doc_padding_mask)  # loss is scalar tensor
 
             if self.aux_loss_module is not None and (self.aux_loss_coeff > 0):  # add auxiliary loss, if specified
-                loss += self.aux_loss_coeff * self.aux_loss_module(rel_scores, labels.to(torch.int64))
+                loss += self.aux_loss_coeff * self.aux_loss_module(rel_scores, labels, padding_mask=~doc_padding_mask)
             if bias_regul_term is not None:
                 if self.bias_regul_coeff < 0:
                     loss = rel_scores.new([0])[0]
