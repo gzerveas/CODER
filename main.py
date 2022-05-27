@@ -59,8 +59,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                                     limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
                                     emb_collection=val_dataloader.dataset.emb_collection,
-                                    include_zero_labels=args.include_zero_labels,
                                     relevance_labels_mapping=args.relevance_labels_mapping,
+                                    include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level,
                                     collection_neutrality_path=args.collection_neutrality_path,
                                     query_ids_path=args.train_query_ids)
     collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu,
@@ -130,6 +130,9 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=args.cuda_ids)
 
+    logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+    logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
     # Initialize performance tracking and evaluate model before training
     best_values = []  # sorted list of length args.num_keep_best, containing the top args.num_keep_best performance metrics
     best_steps = []  # list containing the global step number corresponding to best_values
@@ -159,7 +162,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     model.zero_grad()
     model.train()
     # model.encoder.requires_grad_(False)  # TODO: DEBUG. REMOVE!!!!
-    score_params = [(name, p) for name, p in model.named_parameters() if name.startswith('score')]
+    # score_params = [(name, p) for name, p in model.named_parameters() if name.startswith('score')]
     epoch_iterator = trange(start_epoch, int(args.num_epochs), desc="Epochs")
 
     batch_times = utils.Timer()  # average time for the model to train (forward + backward pass) on a single batch of queries
@@ -214,8 +217,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
                         for i, s in enumerate(scheduler.get_last_lr()):
                             logger.debug('Learning rate ({}): {}'.format(sstr[i], s))
-                        logger.debug("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
-                                                                          np.round(utils.get_current_memory_usage2())))
+                        logger.debug("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
                         logger.debug("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
                         logger.debug("Average lookup time: {} s /samp".format(lookup_times.get_average()))
@@ -284,7 +286,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     logger.debug("Average sample fetching time: {} s".format(sample_fetching_times.get_average()))
     logger.debug("Average collation time: {} s".format(collation_times.get_average()))
 
-    logger.info("Current memory usage: {} MB".format(np.round(utils.get_current_memory_usage())))
+    logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
     return best_metrics
@@ -409,7 +411,9 @@ def evaluate(args, model, dataloader, fairrmetric=None):
 
             if labels_exist:
                 relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
-                num_relevant.extend(len([docid for docid in qrels[qid] if qrels[qid][docid] > 0]) for qid in qids)
+                # number of g.t. positives in entire dataset for each query
+                num_relevant.extend(len([candid for candid in qrels[qid]
+                                         if qrels[qid][candid] >= dataloader.dataset.relevant_at_level]) for qid in qids)
 
     if labels_exist:
         try:
@@ -690,8 +694,8 @@ def get_dataset(args, eval_mode, tokenizer):
                                limit_size=args.eval_limit_size,
                                load_collection_to_memory=args.load_collection_to_memory,
                                inject_ground_truth=args.inject_ground_truth,
-                               include_zero_labels=args.include_zero_labels,
                                relevance_labels_mapping=args.relevance_labels_mapping,
+                               include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level,
                                query_ids_path=args.eval_query_ids)
 
 

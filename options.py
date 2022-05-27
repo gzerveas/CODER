@@ -120,10 +120,15 @@ def run_parse_args():
     parser.add_argument('--num_random_neg', type=int, default=0,
                         help="Number of negatives to randomly sample from other queries in the batch for training. "
                              "If 0, only documents in `train_candidates_path` will be used as negatives.")
-    parser.add_argument('--include_zero_labels', action='store_true',
-                        help="If set, it will include documents with a zero relevance score from "
-                             " `qrels_path` in the set of candidate documents (as negatives). "
-                             "Typically set if one expects these to be 'good quality' negatives.")
+    parser.add_argument('--include_at_level', default=1,
+                        help="The relevance score that candidates in `qrels_path` should at least have (after mapping) "
+                             "in order to be included in the set of candidate documents (as positives/negatives). "
+                             "Typically only set to 0 if one expects these to be reliable negatives.")
+    parser.add_argument('--relevant_at_level', default=1,
+                        help="The relevance score that candidates in `qrels_path` should at least have (after mapping) "
+                             "in order to be considered relevant in training and evaluation (incl. metrics calculation)."
+                             " Below this level, the target relev. prob. will be 0."
+                             "Should be at least as high as `include_at`, and is typically > 0.")
     parser.add_argument("--relevance_labels_mapping", type=str, default=None,
                         help="Optional: A string used to define a dictionary used to override/map relevance scores as "
                              "given in `qrels_path` to a new value, e.g. {1: 0.333}")
@@ -347,5 +352,8 @@ def check_args(config):
 
     if config['relevance_labels_mapping'] is not None:
         config['relevance_labels_mapping'] = eval(config['relevance_labels_mapping'])  # convert string to dict
+
+    if config['relevant_at_level'] < config['include_at_level']:
+        raise ValueError("'relevant_at_level should be at least as high as 'include_at_level'")
 
     return config

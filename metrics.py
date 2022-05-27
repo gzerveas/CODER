@@ -168,6 +168,28 @@ def mean_average_precision(rs, k=None):
         return np.mean([average_precision(r[:min(k, len(r))]) for r in rs])
 
 
+def mean_average_precision_at_r(rs, num_relevant):
+    """
+    IMPORTANT: This metric will be highly underestimated if len(rs) (i.e. number of scored candidates) < num_relevant.
+    This can happen in certain datasets with many ground truth relevant samples for each query (e.g. SOP superclass).
+    Score is mean average precision
+    Relevance is binary (nonzero is relevant).
+    >>> rs = [[1, 1, 0, 0]]
+    >>> mean_average_precision(rs, [2])
+    1.0
+    >>> rs = [[1, 1, 0, 0]]
+    >>> mean_average_precision(rs, [3])
+    0.67
+    Args:
+        rs: Iterator of relevance scores (list or numpy) in rank order
+            (first element is the first item)
+        num_relevant: list of total positive samples for each query in the entire dataset (class_counts['class_name']-1)
+    Returns:
+        Mean average precision at R
+    """
+    return np.mean([average_precision(r[:min(k, len(r))]) for (r, k) in zip(rs, num_relevant)])
+
+
 def dcg_at_k(relevance, k, method=0):
     """Score is discounted cumulative gain (dcg)
     Relevance is positive real values.  Can use binary
