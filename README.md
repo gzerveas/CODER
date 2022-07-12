@@ -6,19 +6,12 @@ If you find this code helpful, please consider citing the CODER paper:
 ```
 @misc{https://doi.org/10.48550/arxiv.2112.08766,
   doi = {10.48550/ARXIV.2112.08766},
-  
   url = {https://arxiv.org/abs/2112.08766},
-  
   author = {Zerveas, George and Rekabsaz, Navid and Cohen, Daniel and Eickhoff, Carsten},
-  
-  keywords = {Information Retrieval (cs.IR), Artificial Intelligence (cs.AI), FOS: Computer and information sciences, FOS: Computer and information sciences},
-  
-  title = {CODER: An efficient framework for improving retrieval through COntextual Document Embedding Reranking},
-  
+  keywords = {Information Retrieval (cs.IR), Artificial Intelligence (cs.AI), FOS: Computer and information sciences, FOS: Computer and information sciences}, 
+  title = {CODER: An efficient framework for improving retrieval through COntextual Document Embedding Reranking} 
   publisher = {arXiv},
-  
   year = {2021},
-  
   copyright = {Creative Commons Attribution 4.0 International}
 }
 ```
@@ -28,6 +21,9 @@ This code additionally implements the paper [Mitigating Bias in Search Results T
 
 
 [As a starting point, this code was initially forked from: https://github.com/jingtaozhan/RepBERT-Index.]
+
+
+-------
 
 
 In the following, we will show how to train and evaluate a CODER model using [TAS-B](https://dl.acm.org/doi/10.1145/3404835.3462891)  (Sebastian Hofstaetter et al., 2021) as a base method.
