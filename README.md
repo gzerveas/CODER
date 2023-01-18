@@ -28,6 +28,8 @@ This code additionally implements the paper [Mitigating Bias in Search Results T
 
 In the following, we will show how to train and evaluate a CODER model using [TAS-B](https://dl.acm.org/doi/10.1145/3404835.3462891)  (Sebastian Hofstaetter et al., 2021) as a base method.
 
+**If you want to use an already trained CODER model, please go to section:** [Using already trained CODER models](#using-already-trained-coder-models).
+
 ## Setup
 
 _Instructions refer to Unix-based systems (e.g. Linux, MacOS)._
