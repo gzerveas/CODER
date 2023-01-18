@@ -144,7 +144,7 @@ The above step should also be executed for `dev` and `dev.small`.
 
 Because of numerous options, CODER is best trained and evaluated using a configuration file, as follows:
 ```bash
-python ~/coder/main.py --config ~/coder/configurations/coder_tasb_train_config.json
+python ~/coder/main.py --config ~/coder/configurations/<coder_tasb_train_config>.json
 ```
 
 We include the configuration files for training and evaluating CODER(TAS-B) in `~coder\configurations`.
@@ -166,7 +166,7 @@ python ~/coder/main.py --help
 
 We can use CODER(TAS-B) for reranking TAS-B on `dev.small` by running:
 ```bash
-python ~/coder/main.py --config ~/coder/configurations/coder_tasb_eval_config.json
+python ~/coder/main.py --config ~/coder/configurations/TEST_<coder_tasb_eval_config>.json
 ```
 
 This will output CODER's rankings for each query inside `~/Experiments/DEMO_NAME/predictions`, and also display several evaluation metrics.
@@ -197,3 +197,25 @@ Finally, we perform dense retrieval:
 ```bash
 python ~/coder/retrieve.py --doc_embedding_dir doc_embeddings_memmap/ --query_embedding_dir Coder_rep/queries.dev.small_memmap --output_path coder_top1000.dev.tsv --hit 1000 --per_gpu_doc_num 3000000
 ```
+
+## Using already trained CODER models
+
+Two CODER retriever models, already trained on MS MARCO using TAS-B and CoCondenser as the base model (i.e. fine-tuning starting point), are available on the HuggingFace Hub:
+[CODER-TAS-B](https://huggingface.co/gzerveas/CODER-TAS-B) and [CODER-CoCondenser](https://huggingface.co/gzerveas/CODER-CoCondenser).
+
+You can use them in your code as follows:
+
+```python
+from transformers import AutoModel, AutoTokenizer
+
+query_encoder = AutoModel.from_pretrained('gzerveas/CODER-TAS-B')
+tokenizer = AutoTokenizer.from_pretrained('gzerveas/CODER-TAS-B')
+```
+
+Thus, instead of training CODER, in case you want to use these trained models to precompute query representations in order to perform dense retrieval on an entire set, the command given in the immediately preceding section will now become:
+
+```bash
+python ~/coder/precompute.py --model_type mdst_transformer --encoder_from "gzerveas/CODER-TAS-B" --output_dir CODER_rep --tokenized_queries queries.dev.small.json --per_gpu_batch_size 256
+```
+
+Please note that CODER only traines the query encoder and therefore the document encoders (as well as tokenizers for queries and documents) will be the same as the ones of the base model, i.e. [TAS-B](https://huggingface.co/sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco) or [CoCondenser](https://huggingface.co/Luyu/co-condenser-marco-retriever), and can be used with the options `--query_encoder_from <HF_string_ID>` or `--encoder_from <HF_string_ID>` in the commands above, or directly downloaded and used through HuggingFace API, e.g. `AutoModel.from_pretrained('sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco')`.
