@@ -98,7 +98,7 @@ def process_reciprocal_neighbors(args):
         for qid in tqdm(query_ids, desc="query "):
             start_time = time.time()
             query_embedding = query_embedding_memmap[qid2pos[qid]]
-            query_embedding = torch.from_numpy(query_embedding)
+            query_embedding = torch.from_numpy(query_embedding, dtype=torch.float32)
 
             doc_ids = qid_to_candidate_passages[qid]
 
@@ -113,7 +113,7 @@ def process_reciprocal_neighbors(args):
             doc_ids = np.array(doc_ids, dtype=int)
 
             doc_embeddings = doc_embedding_memmap[[did2pos[docid] for docid in doc_ids]]
-            doc_embeddings = torch.from_numpy(doc_embeddings)  # (num_cands, emb_dim)
+            doc_embeddings = torch.from_numpy(doc_embeddings, dtype=torch.float32)  # (num_cands, emb_dim)
             global embed_load_times
             embed_load_times.update(time.perf_counter() - start_time)
 
