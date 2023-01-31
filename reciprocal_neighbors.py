@@ -2,19 +2,15 @@
 Algorithm loosely based on code from Zhong et al., 2017: https://github.com/zhunzhong07/person-re-ranking
 """
 
-"""
-API
-q_g_dist: query-gallery distance matrix, numpy array, shape [num_query, num_gallery]
-q_q_dist: query-query distance matrix, numpy array, shape [num_query, num_query]
-g_g_dist: gallery-gallery distance matrix, numpy array, shape [num_gallery, num_gallery]
-k1, k2, lambda_value: parameters, the original paper is (k1=20, k2=6, lambda_value=0.3)
-Returns:
-  final_dist: re-ranked distance, numpy array, shape [num_query, num_gallery]
-"""
-
 
 import numpy as np
 import torch
+
+import utils
+from reciprocal_neighbors import pairwise_similarities
+
+embed_load_times = utils.Timer()
+pwise_times = utils.Timer()
 
 # class ReciprocalNeighbors(object):
 #     def __init__(self, pwise_sims=None) -> None:
@@ -109,7 +105,7 @@ def extended_k_recip_NN(recip_neighbors, initial_rank, trust_factor=1/2, overlap
 
 def assign_neighbor_weights(neighbors, similarities, weight_func='exp', param=2.4):
     """Defines and applies function assigning weights to reciprocal neighbors based on their similarity to a probe.
-    These weights are used e.g. in computing the Jaccard similarity or performing local query vector expansion.
+    These weights are used e.g. in computing the Jaccard similarity, and affect local query vector expansion.
     The type of function and its parameters should be chosen depending on the similarity measure and its normalization.
     Weights are normalized to sum to 1. 
 
@@ -127,7 +123,7 @@ def assign_neighbor_weights(neighbors, similarities, weight_func='exp', param=2.
         # will be weighted ~4 times higher than a vector with half the similarity (sim=0.5)
         weights = torch.exp(param * similarities[neighbors]) - 1 # (num_neighbors,) weight per neighbor
     else:
-        weights = similarities[neighbors]  # uses similarities themselves as weights
+        weights = similarities[neighbors]  # uses similarities themselves as weights (proportional weighting)
     weights = weights / torch.sum(weights)    
 
     return weights
@@ -136,6 +132,7 @@ def compute_rNN_matrix(pwise_sims, initial_rank, k=20, trust_factor=0.5, overlap
     """
     Compute the reciprocal adjecency matrix, i.e. sparse reciprocal neighbor vectors 
     for each item corresponding to a row in `pwise_sims`.
+    If turst_factor > 0, will build an extended set of reciprocal neighbors, by considering neighbors of neighbors.
 
     :param pwise_sims: (m, m) tensor, where m = N + 1. Similarities between all m*m pairs of emb. vectors in the set {query, doc1, ..., doc_N}
     :param initial_rank: (m, k+1) int tensor, which for each item (row) ranks all other items by decreasing proximity;
@@ -143,11 +140,12 @@ def compute_rNN_matrix(pwise_sims, initial_rank, k=20, trust_factor=0.5, overlap
         Since the item itself is contained in each row, it is expected that initial_rank[i, 0] = i 
         (i.e. the nearest item is the item itself).
     :param k: number of Nearest Neighbors, defaults to 20
-    :param trust_factor: the number of reciprocal neighbors to consider including for each k-reciprocal neighbor 
-        is trust_factor*k. Defaults to 1/2
+    :param trust_factor: If > 0, will build an extended set of reciprocal neighbors, by considering neighbors of neighbors.
+            The number of reciprocal neighbors to consider for each k-reciprocal neighbor is trust_factor*k. Defaults to 1/2
     :param overlap_factor: float in [0, 1], how much overlap with the original set of recip. neighbors the
         set of recip. neighbors of each of its members should have in order to be included. Defaults to 2/3
-    :param weight_func: function mapping similarities to weights, defaults to 'exp'
+    :param weight_func: function mapping similarities to weights, defaults to 'exp'. 
+                        If None, returns binary adjacency matrix, without weighting based on geometric similarity.
     :param param: parameter of the weight function, defaults to 2.4
     :return: (m, m) float tensor, nonzero elements in each row correspond to reciprocal neighbors and their values to a function mapping similarity to weight
     """
@@ -158,8 +156,11 @@ def compute_rNN_matrix(pwise_sims, initial_rank, k=20, trust_factor=0.5, overlap
         if trust_factor > 0:
             # extend set of reciprocal neighbors by considering neighbors of neighbors
             recip_neighbors = extended_k_recip_NN(recip_neighbors, initial_rank, trust_factor, overlap_factor) # (m,) bool tensor, True only at indices of the extended set of reciprocal nearest neighbors
-        # assign weights to nonzero values of a sparse vector where the index of nonzero elements is the index of neighbors
-        V[i, recip_neighbors] = assign_neighbor_weights(recip_neighbors, pwise_sims[i, :], weight_func, param) # (m,) float tensor
+        if weight_func is None:  # returns binary adjacency matrix, without weighting based on geometric similarity
+            V[i, recip_neighbors] = recip_neighbors if recip_neighbors.type() is 'torch.BoolTensor' else boolean_vectorize(recip_neighbors, pwise_sims.shape[0])
+        else:
+            # assign weights to nonzero values of a sparse vector where the index of nonzero elements is the index of neighbors
+            V[i, recip_neighbors] = assign_neighbor_weights(recip_neighbors, pwise_sims[i, :], weight_func, param) # (m,) float tensor
         
     return V
         
@@ -186,7 +187,7 @@ def compute_jaccard_sim(V):
 
     :param V: (m, m) float tensor, non-zero elements in each row correspond to reciprocal neighbors and their values depend on their similarity (to the item corresponding to the row).
                 Row 0 corresponds to the probe/query.
-    :return: (m,) float tensor, Jaccard similarity of the probe with each of the m candidates
+    :return: (m,) float tensor, Jaccard similarity of the probe with each of the m (num_candidates + 1) candidates
     """
     # intersection = torch.min(V[0, :].unsqueeze(0), V) # (m, m)
     # union = torch.max(V[0, :].unsqueeze(0), V)  # (m, m)
@@ -194,45 +195,35 @@ def compute_jaccard_sim(V):
     
     return jaccard_sim
 
-def combine_similarities(orig_sims, jaccard_sims, comb_type='linear', orig_coef=0.3):
+def combine_similarities(orig_sims, jaccard_sims, combine_type='linear', orig_coef=0.3):
     """Combines geometric similarities with Jaccard similarities into the final similarities used to rank documents.
 
-    :param orig_sims: _description_
-    :param jaccard_sims: _description_
-    :param comb_type: _description_, defaults to 'linear'
-    :param orig_coef: _description_, defaults to 0.3
-    :raises NotImplementedError: _description_
-    :return: _description_
+    :param orig_sims: (m,) tensor, where m = num_candidates + 1. Geometric similarities between probe (query) and N documents
+    :param jaccard_sims: (m,) float tensor, Jaccard similarity of the probe with each of the m (num_candidates + 1) candidates
+    :param comb_type: function used to combine geometric and Jaccard similarities, defaults to 'linear'
+    :param orig_coef: float in [0, 1]. If > 0, this will be the coefficient of the original geometric similarities (in `pwise_sims`)
+                        when computing the final similarities.
+    :raises NotImplementedError: for unknown `combine_type`
+    :return: (m,) tensor, final similarities
     """
 
-    if comb_type == 'linear':
+    if combine_type == 'linear':
         final_sims = orig_coef * orig_sims + (1 - orig_coef) * jaccard_sims
     else:
-        raise NotImplementedError("Combination function '{}' not implemented".format(comb_type))
+        raise NotImplementedError("Combination function '{}' not implemented".format(combine_type))
     return final_sims
 
 
-def re_ranking(pwise_sims, k=20, k_exp=6, lambda_value=0.3):
-    """Assumes similarities, not distances
 
-    :param pwise_sims: (m, m) tensor, where m = N + 1. Similarities between all m*m pairs of emb. vectors in the set {query, doc1, ..., doc_N}
-    :param k: number of Nearest Neighbors, defaults to 20
-    :param k_exp: k used for query expansion. No expansion takes place with k<=1. Defaults to 6
-    :param lambda_value: _description_, defaults to 0.3
+
+
+def smoothen_labels(orig_relevances, similarities, smooth_factor=0.25):
+    """Assumes that orig_relevances and simililarities are disjoint, i.e. non-zero similarities are given for all non-g.t. relevant candidates.
+
+    :param orig_relevances: (num_candidates,) original ground truth relevance between query and each candidate. May have been normalized to sum to 1.
+    :param similarities: (num_candidates,) similarity between query and each candidate
+    :param smooth_factor: proportion of the original prob. weight what will be reassigned to new candidates based on similarity, defaults to 0.25
     :return: _description_
     """
-
-    num_total = pwise_sims.shape[0]  # number of candidate documents + 1 (query)
-    initial_rank = torch.topk(pwise_sims, k+1, dim=1, largest=True, sorted=True).indices  # (m, k+1) tensor of indices corresponding to largest values in each row of pwise_sims
-
-    # Compute sparse reciprocal neighbor vectors for each item (i.e. reciprocal adjecency matrix)
-    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=0.5, overlap_factor=2/3, weight_func='exp', param=2.4) # (m, m) float tensor, (sparse) adjacency matrix
-
-    if k_exp > 1:
-        V = local_query_expansion(V, initial_rank, k_exp)  # (m, m)
     
-    jaccard_sims = compute_jaccard_sim(V)  # (m,)
-
-    final_sims = combine_similarities(pwise_sims[0, :], jaccard_sims, orig_coef=0.3)  # (m,) includes self-similarity at index 0
-
-    return final_sims
+    return smooth_qrels
