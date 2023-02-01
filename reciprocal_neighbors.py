@@ -2,12 +2,9 @@
 Algorithm loosely based on code from Zhong et al., 2017: https://github.com/zhunzhong07/person-re-ranking
 """
 
-
-import numpy as np
 import torch
 
 import utils
-from reciprocal_neighbors import pairwise_similarities
 
 embed_load_times = utils.Timer()
 pwise_times = utils.Timer()
@@ -60,7 +57,7 @@ def k_reciprocal_NN(initial_rank, ind, k=None):
     # valid_rows = torch.nonzero(backward_kNN_inds==ind)[:, 0]  # indices of rows of backward_kNN_inds where ind exists (equivalent)
     return forward_kNN_inds[valid_rows]
 
-def boolean_vectorize(indices, length):
+def boolean_vectorize(indices, length, device=None):
     """Converts a 1D tensor of integer indices into a sparse boolean tensor of length `length` 
     with True only at the index locations in `indices`.
 
@@ -68,9 +65,9 @@ def boolean_vectorize(indices, length):
     :param length: int, length of boolean vector
     :return: (length,) boolean tensor of length `length` with True only at the index locations in `indices`.
     """
-    return torch.zeros(length, dtype=bool).index_fill_(0, indices, True)
+    return torch.zeros(length, dtype=bool, device=device).index_fill_(0, indices, True)
 
-def extended_k_recip_NN(recip_neighbors, initial_rank, trust_factor=1/2, overlap_factor=2/3, out_type='bool'):
+def extended_k_recip_NN(recip_neighbors, initial_rank, trust_factor=1/2, overlap_factor=2/3, out_type='bool', device=None):
     """Extends a given set of k reciprocal neighbors of a probe by considering for each neighbor 
     a smaller ("trusted") set of its own k reciprocal neighbors and including them in case this tursted set 
     has significant overlap with the existing set of reciprocal neighbors.
@@ -92,10 +89,10 @@ def extended_k_recip_NN(recip_neighbors, initial_rank, trust_factor=1/2, overlap
     # NOTE: original implementation uses k without +1, i.e.: round(tf*k) + 1
     num_secondary_rNN = round(trust_factor * initial_rank.shape[1]) + 1  # num. rNN of each rNN. Should be trust_factor*k, +1 because item itself is included in neighbors
 
-    rNN_bool = boolean_vectorize(recip_neighbors, m)  # (m,) boolean indicating original recip. NNs as True
+    rNN_bool = boolean_vectorize(recip_neighbors, m, device=device)  # (m,) boolean indicating original recip. NNs as True
     extended_rneighbors = rNN_bool.clone()  # (m,) boolean indicating extended rNN as True
     for rneighbor in recip_neighbors:
-        rneighbor_candidates = boolean_vectorize(k_reciprocal_NN(initial_rank, rneighbor, num_secondary_rNN), m) # (m,) boolean indicating rNNs of rneighbor as True
+        rneighbor_candidates = boolean_vectorize(k_reciprocal_NN(initial_rank, rneighbor, num_secondary_rNN), m, device=device) # (m,) boolean indicating rNNs of rneighbor as True
         if (rneighbor_candidates & rNN_bool).sum() > overlap_factor * rneighbor_candidates.sum():  # if intersection of candidates with *original* rNNs is significant 
             extended_rneighbors = extended_rneighbors | rneighbor_candidates  # union of candidates with current rNNs
 
@@ -128,7 +125,7 @@ def assign_neighbor_weights(neighbors, similarities, weight_func='exp', param=2.
 
     return weights
 
-def compute_rNN_matrix(pwise_sims, initial_rank, k=20, trust_factor=0.5, overlap_factor=2/3, weight_func='exp', param=2.4):
+def compute_rNN_matrix(pwise_sims, initial_rank, k=20, trust_factor=0.5, overlap_factor=2/3, weight_func='exp', param=2.4, device=None):
     """
     Compute the reciprocal adjecency matrix, i.e. sparse reciprocal neighbor vectors 
     for each item corresponding to a row in `pwise_sims`.
@@ -150,21 +147,21 @@ def compute_rNN_matrix(pwise_sims, initial_rank, k=20, trust_factor=0.5, overlap
     :return: (m, m) float tensor, nonzero elements in each row correspond to reciprocal neighbors and their values to a function mapping similarity to weight
     """
     
-    V = torch.zeros_like(pwise_sims, dtype=torch.float32)
+    V = torch.zeros_like(pwise_sims, dtype=torch.float32, device=device)
     for i in range(pwise_sims.shape[0]):
         recip_neighbors = k_reciprocal_NN(initial_rank, i, k)  # (r,) int tensor of indices of reciprocal neighbors of i, r in [1, k+1]
         if trust_factor > 0:
             # extend set of reciprocal neighbors by considering neighbors of neighbors
-            recip_neighbors = extended_k_recip_NN(recip_neighbors, initial_rank, trust_factor, overlap_factor) # (m,) bool tensor, True only at indices of the extended set of reciprocal nearest neighbors
+            recip_neighbors = extended_k_recip_NN(recip_neighbors, initial_rank, trust_factor, overlap_factor, device=device) # (m,) bool tensor, True only at indices of the extended set of reciprocal nearest neighbors
         if weight_func is None:  # returns binary adjacency matrix, without weighting based on geometric similarity
-            V[i, recip_neighbors] = recip_neighbors if recip_neighbors.type() is 'torch.BoolTensor' else boolean_vectorize(recip_neighbors, pwise_sims.shape[0])
+            V[i, recip_neighbors] = recip_neighbors if recip_neighbors.type() is 'torch.BoolTensor' else boolean_vectorize(recip_neighbors, pwise_sims.shape[0], device=device)
         else:
             # assign weights to nonzero values of a sparse vector where the index of nonzero elements is the index of neighbors
             V[i, recip_neighbors] = assign_neighbor_weights(recip_neighbors, pwise_sims[i, :], weight_func, param) # (m,) float tensor
         
     return V
         
-def local_query_expansion(V, initial_rank, k_exp):
+def local_query_expansion(V, initial_rank, k_exp, device=None):
     """Perform 'local query expansion', i.e. a linear combination of each sparse vector with its k_exp Nearest Neighbors.
     NOTE: Unlike in the Zhang et al. implementation (but not in the paper), where there are interactions between all queries and all documents,
     here only a single query vector participates in the expansion; document sparse vectors may also be expanded based on the query.
@@ -175,7 +172,7 @@ def local_query_expansion(V, initial_rank, k_exp):
     :param k_exp: _description_
     :return: _description_
     """
-    V_qexp = np.zeros_like(V, dtype=np.float32)
+    V_qexp = torch.zeros_like(V, dtype=torch.float32, device=device)
     for i in range(V_qexp.shape[0]):
         V_qexp[i, :] = torch.mean(V[initial_rank[i, :k_exp], :], dim=0)
     return V_qexp

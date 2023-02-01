@@ -5,7 +5,7 @@ from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
 
 from options import *
-from main import main, setup
+from reciprocal_compute import rerank_reciprocal_neighbors, run_parse_args
 import utils
 
 # Metric for hyperparam optimization.
@@ -55,7 +55,7 @@ def objective(trial):
     # args.dim_feedforward = trial.suggest_int('dim_feedforward', int(1.5*args.d_model), max_dimFF)
 
     config = setup(args)  # configuration dictionary containing the arguments as specified in main.py and overriden above
-    best_values = main(config, trial)  # best metrics found during evaluation
+    best_values = rerank_reciprocal_neighbors(config, trial)  # best metrics found during evaluation
 
     for name, value in best_values.items():
         trial.set_user_attr(name, value)  # log in database / study object

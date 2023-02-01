@@ -585,7 +585,7 @@ def get_max_memory_usage():
 class Timer(object):
 
     def __init__(self):
-        self.total_time = 0
+        self.total_time = 0.0
         self.count = 0
 
     def update(self, measured_time):
