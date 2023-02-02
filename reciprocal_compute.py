@@ -46,10 +46,10 @@ def get_embed_memmap(memmap_dir, dim):
 
 
 def print_memory_info(memmap, docs_per_chunk, device):
-    doc_chunk_size = sys.getsizeof(np.array(memmap[:docs_per_chunk]))/1024**2
-    logger.info("{} chunks of {} documents (total of {}), each of approx. size {} MB, "
-                "will be loaded to the following device:".format(math.ceil(memmap.shape[0]/docs_per_chunk), docs_per_chunk,
-                                                                 memmap.shape[0], math.ceil(doc_chunk_size)))
+    # doc_chunk_size = sys.getsizeof(np.array(memmap[:docs_per_chunk]))/1024**2
+    # logger.info("{} chunks of {} documents (total of {}), each of approx. size {} MB, "
+    #             "will be loaded to the following device:".format(math.ceil(memmap.shape[0]/docs_per_chunk), docs_per_chunk,
+    #                                                              memmap.shape[0], math.ceil(doc_chunk_size)))
 
     if device.type == 'cuda':
         logger.info("Device: {}".format(torch.cuda.get_device_name(0)))
@@ -61,8 +61,8 @@ def print_memory_info(memmap, docs_per_chunk, device):
         logger.info("Allocated memory: {} MB".format(math.ceil(allocated_mem)))
         free_mem = total_mem - allocated_mem
         logger.info("Free memory: {} MB".format(math.ceil(free_mem)))
-        logger.warning("This device could potentially support "
-                       "`per_gpu_doc_num` up to {}".format(math.floor(args.per_gpu_doc_num*free_mem/doc_chunk_size)))
+        # logger.warning("This device could potentially support "
+        #                "`per_gpu_doc_num` up to {}".format(math.floor(args.per_gpu_doc_num*free_mem/doc_chunk_size)))
     else:
         logger.info("CPU")
 
@@ -131,7 +131,7 @@ def rerank_reciprocal_neighbors(args):
         global pwise_times
         pwise_times.update(time.perf_counter() - start_time)
 
-        final_sims = recompute_similarities(pwise_sims, k=args.k, k_exp=args.k_exp, orig_coef=args.sim_mixing_coef, device=args.device)[1:]  # (num_cands,)
+        final_sims = recompute_similarities(pwise_sims, k=args.k, trust_factor=args.trust_factor, k_exp=args.k_exp, orig_coef=args.sim_mixing_coef, device=args.device)[1:]  # (num_cands,)
 
         # Final selection of top candidates
         start_time = time.perf_counter()
@@ -185,7 +185,7 @@ def smoothen_relevance_labels():
     pass
 
 
-def recompute_similarities(pwise_sims, k=20, k_exp=6, orig_coef=0.3, device=None):
+def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, orig_coef=0.3, device=None):
     """Compute new similarities with respect to a probe (query) based on its reciprocal nearest neighbors Jaccard similarity 
     with the geometric Nearest Neibors, as well as geometric similarities. Assumes similarities, not distances.
 
@@ -205,7 +205,7 @@ def recompute_similarities(pwise_sims, k=20, k_exp=6, orig_coef=0.3, device=None
 
     # Compute sparse reciprocal neighbor vectors for each item (i.e. reciprocal adjecency matrix)
     start_time = time.perf_counter()
-    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=0.5, overlap_factor=2/3, weight_func='exp', param=2.4, device=device) # (m, m) float tensor, (sparse) adjacency matrix
+    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=trust_factor, overlap_factor=2/3, weight_func='exp', param=2.4, device=device) # (m, m) float tensor, (sparse) adjacency matrix
     recipNN_times.update(time.perf_counter() - start_time)
 
     if k_exp > 1:
@@ -281,10 +281,11 @@ def run_parse_args():
     parser = argparse.ArgumentParser("Retrieval (for 1 GPU) based on precomputed query and document embeddings.")
 
     ## Required parameters
-    parser.add_argument("--task", choices=['rerank', 'label_smoothing'])
-    parser.add_argument("--per_gpu_doc_num", default=4000000, type=int,
-                        help="Number of documents to be loaded on the single GPU. Set to 4e6 for ~12GB GPU memory. "
-                             "Reduce number in case of insufficient GPU memory.")
+    parser.add_argument("--task", choices=['rerank', 'label_smoothing'], default='rerank')
+    parser.add_argument("--device", choices=['cuda', 'cpu'], default='cuda')
+    # parser.add_argument("--per_gpu_doc_num", default=4000000, type=int,
+    #                     help="Number of documents to be loaded on the single GPU. Set to 4e6 for ~12GB GPU memory. "
+    #                          "Reduce number in case of insufficient GPU memory.")
     parser.add_argument("--hit", type=int, default=1000, 
                         help="Number of retrieval results (ranked candidates) for each query.")
     parser.add_argument("--embedding_dim", type=int, default=768)
@@ -311,6 +312,9 @@ def run_parse_args():
                         help="Score threshold in qrels (g.t. relevance judgements) to consider a document relevant.")
     parser.add_argument('--k', type=int, default=20, 
                         help="Number of Nearest Neighbors in terms of similarity. Used in finding Reciprocal Nearest Neighbors.")
+    parser.add_argument('--trust_factor', type=float, default=0.5,
+                        help="If > 0, will build an extended set of reciprocal neighbors, by considering neighbors of neighbors. "
+                        "The number of nearest reciprocal neighbors to consider for each k-reciprocal neighbor is trust_factor*k")
     parser.add_argument('--k_exp', type=int, default=6, 
                         help="Number of Nearest Neighbors to consider when performing 'local query expansion' of "
                         "Reciprocal NN sparse vectors.")
@@ -319,7 +323,7 @@ def run_parse_args():
     args = parser.parse_args()
 
     # Setup CUDA, GPU 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     n_gpu = torch.cuda.device_count()
     if n_gpu > 1:
         logger.warning("Found {} GPUs, but only a single GPU will be used by this program.".format(n_gpu))
