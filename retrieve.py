@@ -3,18 +3,13 @@ import sys
 import os
 import math
 import random
-import json
 import torch
 import logging
 import argparse
 import numpy as np
 from tqdm import tqdm
 from queue import PriorityQueue
-from collections import namedtuple, defaultdict, OrderedDict
-from transformers import BertTokenizer, BertConfig
-from torch.utils.data import DataLoader, Dataset
-from dataset import CollectionDataset, pack_tensor_2D, MSMARCODataset
-from utils import generate_rank, eval_results
+from collections import defaultdict, OrderedDict
 import logging
 import time
 

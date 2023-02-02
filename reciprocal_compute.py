@@ -4,7 +4,6 @@ logger = logging.getLogger()
 
 logger.info("Loading packages ...")
 
-import sys
 import os
 import math
 import torch
@@ -72,12 +71,14 @@ def rerank_reciprocal_neighbors(args):
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
     did2pos = {str(identity): i for i, identity in enumerate(doc_id_memmap)}
-    doc_embedding_memmap = np.array(doc_embedding_memmap)
+    if not args.save_memory:
+        doc_embedding_memmap = np.array(doc_embedding_memmap)
 
     logger.info("Loading query embeddings memmap ...")
     query_embedding_memmap, query_id_memmap = get_embed_memmap(args.query_embedding_dir, args.embedding_dim)
     qid2pos = {str(identity): i for i, identity in enumerate(query_id_memmap)}
-    query_embedding_memmap = np.array(query_embedding_memmap)
+    if not args.save_memory:
+        query_embedding_memmap = np.array(query_embedding_memmap)
 
     logger.info("Loading candidate documents per query from: '{}'".format(args.candidates_path))
     qid_to_candidate_passages = load_candidates(args.candidates_path)
@@ -97,10 +98,14 @@ def rerank_reciprocal_neighbors(args):
         logger.info("Loading ground truth documents (labels) in '{}' ...".format(args.qrels_path))
         qrels = load_qrels(args.qrels_path, relevance_level=args.relevance_thr, score_mapping=None)  # dict: {qID: {passageid: g.t. relevance}}
 
+    logger.info("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
+                                                                          np.round(utils.get_current_memory_usage2())))
+    logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
     logger.info("Reranking candidates ...")
 
     results = {}  # final predictions dict: {qID: {passageid: score}}. Used for metrics calculation through pytrec_eval
-    out_rankfile =  open(args.output_path, 'w')
+    out_rankfilepath = os.path.join(args.output_dir, f"recipNN_k{args.k}_trustfactor{args.trust_factor}_kexp{args.k_exp}_lambda{args.sim_mixing_coef}_rerank_" + os.path.basename(args.candidates_path))
+    out_rankfile =  open(out_rankfilepath, 'w')
     
     for qid in tqdm(query_ids, desc="query "):
         start_total = time.perf_counter()
@@ -286,11 +291,14 @@ def run_parse_args():
     # parser.add_argument("--per_gpu_doc_num", default=4000000, type=int,
     #                     help="Number of documents to be loaded on the single GPU. Set to 4e6 for ~12GB GPU memory. "
     #                          "Reduce number in case of insufficient GPU memory.")
+    parser.add_argument("--save_memory", action="store_true",
+                        help="If set, embeddings will be loaded from memmaps and not entirely preloaded to memory. "
+                        "Saves much memory (approx. 2GB vs 50GB) at the expense of approx. x2 time")
     parser.add_argument("--hit", type=int, default=1000, 
                         help="Number of retrieval results (ranked candidates) for each query.")
     parser.add_argument("--embedding_dim", type=int, default=768)
-    parser.add_argument("--output_path", type=str,
-                        help="File path where to write the predictions/ranked candidates.")
+    parser.add_argument("--output_dir", type=str,
+                        help="Directory path where to write the predictions/ranked candidates file.")
     parser.add_argument("--doc_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to document embeddings.")
     parser.add_argument("--query_embedding_dir", type=str,
@@ -337,10 +345,10 @@ def run_parse_args():
         total_mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
         logger.info("Total memory: {} MB".format(int(total_mem)))
 
-    if not os.path.exists(os.path.dirname(args.output_path)):
-        os.makedirs(os.path.dirname(args.output_path))
-    if os.path.isdir(args.output_path):
-        raise IOError("Option `output_path` should be a file path, not directory path")
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    if not os.path.isdir(args.output_dir):
+        raise IOError("Option `output_dir` should be a directory path, not a file path")
     
     return args
     
@@ -363,4 +371,5 @@ if __name__ == "__main__":
     logger.info("Avg. Jaccard sim. time per query: {} sec".format(jaccard_sim_times.get_average()))
     logger.info("Avg. time to get top results per query: {} sec".format(top_results_times.get_average()))
     logger.info("Avg. time to write results to file per query: {} sec".format(write_results_times.get_average()))
+    logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
     logger.info("Done!")
