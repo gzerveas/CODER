@@ -10,6 +10,7 @@ import ipdb
 from copy import deepcopy
 import traceback
 import resource
+import time
 
 import numpy as np
 import torch
@@ -17,11 +18,11 @@ import xlrd
 import xlwt
 import xlutils.copy
 import psutil
+from beir.retrieval.evaluation import EvaluateRetrieval
 
 import metrics
 
 import logging
-
 logging.basicConfig(format='%(asctime)s | %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -426,7 +427,7 @@ def export_record(filepath, values):
     work_book.save(filepath)
 
 
-def register_record(filepath, timestamp, experiment_name, best_metrics, final_metrics=None, comment=''):
+def register_record(filepath, timestamp, experiment_name, best_metrics, final_metrics=None, parameters=None, comment=''):
     """
     Adds the best and final metrics of a given experiment as a record in an excel sheet with other experiment records.
     Creates excel sheet if it doesn't exist.
@@ -436,22 +437,30 @@ def register_record(filepath, timestamp, experiment_name, best_metrics, final_me
         experiment_name: string
         best_metrics: dict of metrics at best epoch {metric_name: metric_value}. Includes "epoch" as first key
         final_metrics: dict of metrics at final epoch {metric_name: metric_value}. Includes "epoch" as first key
+        parameters: dict of hyperparameters {param_name: param_value}
         comment: optional description
     """
     metrics_names, metrics_values = zip(*best_metrics.items())
-    row_values = [timestamp, experiment_name, comment] + list(metrics_values)
+    row_values = [timestamp, experiment_name, comment]
+    if parameters is not None:
+        param_names, param_values = zip(*parameters.items())
+        row_values += list(param_values)
+    row_values += list(metrics_values)
     if final_metrics is not None:
         final_metrics_names, final_metrics_values = zip(*final_metrics.items())
         row_values += list(final_metrics_values)
-
     if not os.path.exists(filepath):  # Create a records file for the first time
         logger.warning("Records file '{}' does not exist! Creating new file ...".format(filepath))
         directory = os.path.dirname(filepath)
         if len(directory) and not os.path.exists(directory):
             os.makedirs(directory)
-        header = ["Timestamp", "Name", "Comment"] + ["Best " + m for m in metrics_names]
+        header = ["Timestamp", "Name", "Comment"]
+        if parameters is not None:
+            header += param_names
+        header += ["Best " + m for m in metrics_names]
         if final_metrics is not None:
             header += ["Final " + m for m in final_metrics_names]
+
         book = xlwt.Workbook()  # excel work book
         book = write_table_to_sheet([header, row_values], book, sheet_name="records")
         book.save(filepath)
@@ -466,6 +475,37 @@ def register_record(filepath, timestamp, experiment_name, best_metrics, final_me
 
     logger.info("Exported performance record to '{}'".format(filepath))
 
+
+def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)):
+    """Compute retrieval performance metrics with parity to the official TREC implementation. 
+
+    :param results: dict of method's predictions per query, {str qID: {str pID: float score}}
+    :param qrels: dict of ground truth relevance judgements per query, {str qID: {str pID: int relevance}}
+    :param cutoff_values: interable of @k cut-offs for metrics calculation, defaults to (1, 3, 5, 10, 100, 1000)
+    :return: dict of aggregate metrics, {"metric@k": avg. metric value}
+    """
+    
+    if len(results) < len(qrels):
+        logger.warning(f"qrels file contains rel. labels for {len(qrels)} queries, while only {len(results)} "
+                    "queries were evaluated. Performance metrics will only consider the intersection.")
+        qrels = {qid: qrels[qid] for qid in results.keys()}  # trim qrels dict
+    
+    logger.info("Computing metrics ...")
+    start_time = time.perf_counter()
+    # Evaluate using BEIR (which relies on pytrec_eval) for comparison with BEIR benchmarks
+    # Returns dictionaries with metrics for each cut-off value, e.g. ndcg["NDCG@{k}".format(cutoff_values[0])] == 0.3
+    cutoff_values = [1, 3, 5, 10, 100, 1000]
+    metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values)  # tuple of metrics dicts (ndct, ...)
+    mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR')
+    metrics_time = time.perf_counter() - start_time
+    logger.info("Time to calculate performance metrics: {:.3f} s".format(metrics_time))
+    
+    # Merge all dicts into a single OrderedDict and sort by k for guaranteed consistency
+    perf_metrics = OrderedDict()
+    for met_dict in (mrr, ) + metric_dicts:
+        perf_metrics.update(sorted(met_dict.items(), key=lambda x: 0 if not '@' in x[0] else int(x[0].split('@')[1])))
+
+    return perf_metrics
 
 class Printer(object):
     """Class for printing output by refreshing the same line in the console, e.g. for indicating progress of a process"""
@@ -598,3 +638,60 @@ class Timer(object):
             return self.total_time / self.count
         else:
             return None
+
+
+def load_qrels(filepath, relevance_level=1, score_mapping=None):
+    """Load ground truth relevant passages from file. Can handle several levels of relevance.
+    Assumes that if a passage is not listed for a query, it is non-relevant.
+    :param filepath: path to file of ground truth relevant passages in the following format:
+        "qID1 \t Q0 \t pID1 \t 2\n
+         qID1 \t Q0 \t pID2 \t 0\n
+         qID1 \t Q0 \t pID3 \t 1\n..."
+    :param relevance_level: only include candidates which have at least the specified relevance score
+        (after potential mapping)
+    :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 2 -> 0.3)
+    :return:
+        qid2relevance (dict): dictionary mapping from query_id to relevant passages (dict {passageid : relevance})
+    """
+    qid2relevance = defaultdict(dict)
+    with open(filepath, 'r') as f:
+        for line in f:
+            try:
+                qid, _, pid, relevance = line.strip().split()
+                relevance = int(relevance)
+                if (score_mapping is not None) and (relevance in score_mapping):
+                    relevance = score_mapping[relevance]  # map score to new value
+                if relevance >= relevance_level:  # include only if score >= specified relevance level
+                    qid2relevance[qid][pid] = relevance
+            except Exception as x:
+                print(x)
+                raise IOError("'{}' is not valid format".format(line))
+    return qid2relevance
+
+
+def load_predictions(filepath, seperator=None):
+    """
+    Load retrieved document/passage IDs from a file with their respective scores, if they exist.
+    If scores are not explicitly given (as a 4th field), fictitious values are used.
+    Assumes that retrieved documents per query are given in the order of rank (most relevant first) in the first 2
+    columns as "qID1 \t pID1 \t [rank] \t [score]\n qID1 \t pID2\n ..."  but not necessarily contiguously (sorted by qID).
+    :param filepath: path to file of candidate (retrieved) documents/passages per query
+    :return:
+        qid_to_candidate_passages: dict: {qID : {pID: score}}
+    """
+
+    qid_to_candidate_passages = defaultdict(dict)  # dict: {qID : {pID: score}}
+    score = 100  # initialize fake score value, required for TREC evaluation tools if scores not explicitly given
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            fields = line.strip().split(seperator)
+            qid = fields[0]
+            pid = fields[1]
+            try:
+                score = float(fields[3])
+            except IndexError:
+                score = 0.999 * score  # ensures score will be decreasing
+            qid_to_candidate_passages[qid][pid] = score
+    
+    return qid_to_candidate_passages

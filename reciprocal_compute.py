@@ -10,10 +10,9 @@ import torch
 import argparse
 import numpy as np
 from tqdm import tqdm
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import time
-
-from beir.retrieval.evaluation import EvaluateRetrieval
+import datetime
 
 import utils
 from reciprocal_neighbors import pairwise_similarities, compute_rNN_matrix, compute_jaccard_sim, combine_similarities, local_query_expansion
@@ -28,6 +27,13 @@ jaccard_sim_times = utils.Timer()
 top_results_times = utils.Timer()
 write_results_times = utils.Timer()
 total_times = utils.Timer()
+
+
+WEIGHT_FUNC = 'exp'
+WEIGHT_FUNC_PARAM = 2.4
+NORMALIZATION = 'max'
+OVERLAP_FACTOR = 2/3
+
 
 
 def get_embed_memmap(memmap_dir, dim):
@@ -66,8 +72,37 @@ def print_memory_info(memmap, docs_per_chunk, device):
         logger.info("CPU")
 
 
+def load_ranked_candidates(path_to_candidates):
+    """
+    Load ranked/sorted candidate (retrieved) documents/passages from a file.
+    Assumes that retrieved documents per query are given in the order of rank (most relevant first) in the first 2
+    columns (ignores rest columns) as "qID1 \t pID1\n qID1 \t pID2\n ..."  but not necessarily contiguously (sorted by qID).
+    :param path_to_candidates: path to file of candidate (retrieved) documents/passages per query
+    :return:
+        qid_to_candidate_passages: dict: {qID : list of retrieved pIDs in order of relevance}
+    """
+
+    qid_to_candidate_passages = defaultdict(list)  # dict: {qID : list of retrieved pIDs in order of relevance}
+
+    with open(path_to_candidates, 'r') as f:
+        for line in tqdm(f, desc="Query"):
+            try:
+                fields = line.strip().split('\t')
+                qid = fields[0]
+                pid = fields[1]
+
+                qid_to_candidate_passages[qid].append(pid)
+            except Exception as x:
+                print(x)
+                logger.warning("Line \"{}\" is not in valid format and resulted in: {}".format(line, fields))
+    return qid_to_candidate_passages
+
+
 def rerank_reciprocal_neighbors(args):
     """Reranks existing candidates per query in a qID -> ranked cand. list memmap"""
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
     did2pos = {str(identity): i for i, identity in enumerate(doc_id_memmap)}
@@ -81,7 +116,7 @@ def rerank_reciprocal_neighbors(args):
         query_embedding_memmap = np.array(query_embedding_memmap)
 
     logger.info("Loading candidate documents per query from: '{}'".format(args.candidates_path))
-    qid_to_candidate_passages = load_candidates(args.candidates_path)
+    qid_to_candidate_passages = load_ranked_candidates(args.candidates_path)
 
     if args.query_ids is None:
         query_ids = qid_to_candidate_passages.keys()
@@ -96,7 +131,7 @@ def rerank_reciprocal_neighbors(args):
 
     if args.qrels_path:
         logger.info("Loading ground truth documents (labels) in '{}' ...".format(args.qrels_path))
-        qrels = load_qrels(args.qrels_path, relevance_level=args.relevance_thr, score_mapping=None)  # dict: {qID: {passageid: g.t. relevance}}
+        qrels = utils.load_qrels(args.qrels_path, relevance_level=args.relevance_thr, score_mapping=None)  # dict: {qID: {passageid: g.t. relevance}}
 
     logger.info("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
                                                                           np.round(utils.get_current_memory_usage2())))
@@ -132,7 +167,7 @@ def rerank_reciprocal_neighbors(args):
         embed_load_times.update(time.perf_counter() - start_time)
 
         start_time = time.perf_counter()
-        pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0), normalize='max') # (num_cands+1, num_cands+1)
+        pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0), normalize=NORMALIZATION) # (num_cands+1, num_cands+1)
         global pwise_times
         pwise_times.update(time.perf_counter() - start_time)
 
@@ -162,26 +197,21 @@ def rerank_reciprocal_neighbors(args):
     out_rankfile.close()
 
     if args.qrels_path:
-        if len(query_ids) < len(qrels):
-            logger.warning(f"File '{args.qrels_path}' contains rel. labels for {len(qrels)} queries, while only {len(query_ids)} "
-                        "queries were evaluated. Performance metrics will only consider the intersection.")
-            qrels = {qid: qrels[qid] for qid in query_ids}  # trim qrels dict
+        perf_metrics = utils.get_retrieval_metrics(results, qrels)
+        perf_metrics['time'] = total_times.get_average()
+        print(perf_metrics)
         
-        logger.info("Computing metrics ...")
-        start_time = time.perf_counter()
-        # Evaluate using BEIR (which relies on pytrec_eval) for comparison with BEIR benchmarks
-        # Returns dictionaries with metrics for each cut-off value, e.g. ndcg["NDCG@{k}".format(cutoff_values[0])] == 0.3
-        cutoff_values = [1, 3, 5, 10, 100, 1000]
-        ndcg, _map, recall, precision = EvaluateRetrieval.evaluate(qrels, results, cutoff_values)
-        mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR')
-        metrics_time = time.perf_counter() - start_time
-        logger.info("Time to calculate performance metrics: {:.3f}".format(metrics_time))
+        parameters = OrderedDict()
+        parameters['sim_mixing_coef'] = args.sim_mixing_coef
+        parameters['k'] = args.k
+        parameters['trust_factor'] = args.trust_factor
+        parameters['k_exp'] = args.k_exp
+        parameters['normalize'] = NORMALIZATION
+        parameters['weight_func'] = WEIGHT_FUNC
+        parameters['weight_func_param'] = WEIGHT_FUNC_PARAM
         
-        print(mrr)
-        print(ndcg)
-        print(_map)
-        print(recall)
-        print(precision)
+        # Export record metrics to a file accumulating records from all experiments
+        utils.register_record(args.records_file, timestamp, os.path.basename(out_rankfilepath), perf_metrics, parameters=parameters)
         
     return
 
@@ -210,7 +240,7 @@ def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, orig_coe
 
     # Compute sparse reciprocal neighbor vectors for each item (i.e. reciprocal adjecency matrix)
     start_time = time.perf_counter()
-    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=trust_factor, overlap_factor=2/3, weight_func='exp', param=2.4, device=device) # (m, m) float tensor, (sparse) adjacency matrix
+    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=trust_factor, overlap_factor=OVERLAP_FACTOR, weight_func=WEIGHT_FUNC, param=WEIGHT_FUNC_PARAM, device=device) # (m, m) float tensor, (sparse) adjacency matrix
     recipNN_times.update(time.perf_counter() - start_time)
 
     if k_exp > 1:
@@ -225,61 +255,6 @@ def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, orig_coe
     final_sims = combine_similarities(pwise_sims[0, :], jaccard_sims, orig_coef=orig_coef)  # (m,) includes self-similarity at index 0
 
     return final_sims
-
-
-def load_qrels(filepath, relevance_level=1, score_mapping=None):
-    """Load ground truth relevant passages from file. Can handle several levels of relevance.
-    Assumes that if a passage is not listed for a query, it is non-relevant.
-    :param filepath: path to file of ground truth relevant passages in the following format:
-        "qID1 \t Q0 \t pID1 \t 2\n
-         qID1 \t Q0 \t pID2 \t 0\n
-         qID1 \t Q0 \t pID3 \t 1\n..."
-    :param relevance_level: only include candidates which have at least the specified relevance score
-        (after potential mapping)
-    :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 2 -> 0.3)
-    :return:
-        qid2relevance (dict): dictionary mapping from query_id to relevant passages (dict {passageid : relevance})
-    """
-    qid2relevance = defaultdict(dict)
-    with open(filepath, 'r') as f:
-        for line in f:
-            try:
-                qid, _, pid, relevance = line.strip().split()
-                relevance = int(relevance)
-                if (score_mapping is not None) and (relevance in score_mapping):
-                    relevance = score_mapping[relevance]  # map score to new value
-                if relevance >= relevance_level:  # include only if score >= specified relevance level
-                    qid2relevance[qid][pid] = relevance
-            except Exception as x:
-                print(x)
-                raise IOError("'{}' is not valid format".format(line))
-    return qid2relevance
-
-
-def load_candidates(path_to_candidates):
-    """
-    Load candidate (retrieved) documents/passages from a file.
-    Assumes that retrieved documents per query are given in the order of rank (most relevant first) in the first 2
-    columns (ignores rest columns) as "qID1 \t pID1\n qID1 \t pID2\n ..."  but not necessarily contiguously (sorted by qID).
-    :param path_to_candidates: path to file of candidate (retrieved) documents/passages per query
-    :return:
-        qid_to_candidate_passages: dict: {qID : list of retrieved pIDs in order of relevance}
-    """
-
-    qid_to_candidate_passages = defaultdict(list)  # dict: {qID : list of retrieved pIDs in order of relevance}
-
-    with open(path_to_candidates, 'r') as f:
-        for line in tqdm(f, desc="Query"):
-            try:
-                fields = line.strip().split('\t')
-                qid = fields[0]
-                pid = fields[1]
-
-                qid_to_candidate_passages[qid].append(pid)
-            except Exception as x:
-                print(x)
-                logger.warning("Line \"{}\" is not in valid format and resulted in: {}".format(line, fields))
-    return qid_to_candidate_passages
 
 
 def run_parse_args():
@@ -299,6 +274,7 @@ def run_parse_args():
     parser.add_argument("--embedding_dim", type=int, default=768)
     parser.add_argument("--output_dir", type=str,
                         help="Directory path where to write the predictions/ranked candidates file.")
+    parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
     parser.add_argument("--doc_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to document embeddings.")
     parser.add_argument("--query_embedding_dir", type=str,
