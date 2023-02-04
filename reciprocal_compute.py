@@ -1,4 +1,6 @@
 import logging
+import random
+import string
 logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
 
@@ -12,7 +14,7 @@ import numpy as np
 from tqdm import tqdm
 from collections import OrderedDict, defaultdict
 import time
-import datetime
+from datetime import datetime
 
 import utils
 from reciprocal_neighbors import pairwise_similarities, compute_rNN_matrix, compute_jaccard_sim, combine_similarities, local_query_expansion
@@ -101,8 +103,6 @@ def load_ranked_candidates(path_to_candidates):
 def rerank_reciprocal_neighbors(args):
     """Reranks existing candidates per query in a qID -> ranked cand. list memmap"""
     
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
     did2pos = {str(identity): i for i, identity in enumerate(doc_id_memmap)}
@@ -139,7 +139,7 @@ def rerank_reciprocal_neighbors(args):
     logger.info("Reranking candidates ...")
 
     results = {}  # final predictions dict: {qID: {passageid: score}}. Used for metrics calculation through pytrec_eval
-    out_rankfilepath = os.path.join(args.output_dir, f"recipNN_k{args.k}_trustfactor{args.trust_factor}_kexp{args.k_exp}_lambda{args.sim_mixing_coef}_rerank_" + os.path.basename(args.candidates_path))
+    out_rankfilepath = os.path.join(args.output_dir, args.out_rankfilename) #f"recipNN_k{args.k}_trustfactor{args.trust_factor}_kexp{args.k_exp}_lambda{args.sim_mixing_coef}_rerank_" + os.path.basename(args.candidates_path))
     out_rankfile =  open(out_rankfilepath, 'w')
     
     for qid in tqdm(query_ids, desc="query "):
@@ -167,11 +167,13 @@ def rerank_reciprocal_neighbors(args):
         embed_load_times.update(time.perf_counter() - start_time)
 
         start_time = time.perf_counter()
-        pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0), normalize=NORMALIZATION) # (num_cands+1, num_cands+1)
+        pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0), normalize=args.normalize) # (num_cands+1, num_cands+1)
         global pwise_times
         pwise_times.update(time.perf_counter() - start_time)
 
-        final_sims = recompute_similarities(pwise_sims, k=args.k, trust_factor=args.trust_factor, k_exp=args.k_exp, orig_coef=args.sim_mixing_coef, device=args.device)[1:]  # (num_cands,)
+        final_sims = recompute_similarities(pwise_sims, k=args.k, trust_factor=args.trust_factor, k_exp=args.k_exp,
+                                            weight_func=args.weight_func, weight_func_param=args.weight_func_param, 
+                                            orig_coef=args.sim_mixing_coef, device=args.device)[1:]  # (num_cands,)
 
         # Final selection of top candidates
         start_time = time.perf_counter()
@@ -196,6 +198,7 @@ def rerank_reciprocal_neighbors(args):
     
     out_rankfile.close()
 
+    perf_metrics = None
     if args.qrels_path:
         perf_metrics = utils.get_retrieval_metrics(results, qrels)
         perf_metrics['time'] = total_times.get_average()
@@ -206,21 +209,21 @@ def rerank_reciprocal_neighbors(args):
         parameters['k'] = args.k
         parameters['trust_factor'] = args.trust_factor
         parameters['k_exp'] = args.k_exp
-        parameters['normalize'] = NORMALIZATION
-        parameters['weight_func'] = WEIGHT_FUNC
-        parameters['weight_func_param'] = WEIGHT_FUNC_PARAM
+        parameters['normalize'] = args.normalize
+        parameters['weight_func'] = args.weight_func
+        parameters['weight_func_param'] = args.weight_func_param
         
         # Export record metrics to a file accumulating records from all experiments
-        utils.register_record(args.records_file, timestamp, os.path.basename(out_rankfilepath), perf_metrics, parameters=parameters)
+        utils.register_record(args.records_file, args.formatted_timestamp, args.out_rankfilename, perf_metrics, parameters=parameters)
         
-    return
+    return perf_metrics
 
 
 def smoothen_relevance_labels():
     pass
 
 
-def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, orig_coef=0.3, device=None):
+def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3, device=None):
     """Compute new similarities with respect to a probe (query) based on its reciprocal nearest neighbors Jaccard similarity 
     with the geometric Nearest Neibors, as well as geometric similarities. Assumes similarities, not distances.
 
@@ -240,7 +243,8 @@ def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, orig_coe
 
     # Compute sparse reciprocal neighbor vectors for each item (i.e. reciprocal adjecency matrix)
     start_time = time.perf_counter()
-    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=trust_factor, overlap_factor=OVERLAP_FACTOR, weight_func=WEIGHT_FUNC, param=WEIGHT_FUNC_PARAM, device=device) # (m, m) float tensor, (sparse) adjacency matrix
+    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=trust_factor, overlap_factor=OVERLAP_FACTOR, 
+                           weight_func=weight_func, param=weight_func_param, device=device) # (m, m) float tensor, (sparse) adjacency matrix
     recipNN_times.update(time.perf_counter() - start_time)
 
     if k_exp > 1:
@@ -257,15 +261,24 @@ def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, orig_coe
     return final_sims
 
 
+def setup(args):
+    
+    # Create prefix and output file name
+    initial_timestamp = datetime.now()
+    args.formatted_timestamp = initial_timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+    rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
+    args.out_rankfilename = args.formatted_timestamp + "_" + rand_suffix
+    args.out_rankfilename += "_rerank_" + os.path.basename(args.candidates_path)
+    
+    return args
+
+
 def run_parse_args():
     parser = argparse.ArgumentParser("Retrieval (for 1 GPU) based on precomputed query and document embeddings.")
 
     ## Required parameters
     parser.add_argument("--task", choices=['rerank', 'label_smoothing'], default='rerank')
     parser.add_argument("--device", choices=['cuda', 'cpu'], default='cuda')
-    # parser.add_argument("--per_gpu_doc_num", default=4000000, type=int,
-    #                     help="Number of documents to be loaded on the single GPU. Set to 4e6 for ~12GB GPU memory. "
-    #                          "Reduce number in case of insufficient GPU memory.")
     parser.add_argument("--save_memory", action="store_true",
                         help="If set, embeddings will be loaded from memmaps and not entirely preloaded to memory. "
                         "Saves much memory (approx. 2GB vs 50GB) at the expense of approx. x2 time")
@@ -274,7 +287,8 @@ def run_parse_args():
     parser.add_argument("--embedding_dim", type=int, default=768)
     parser.add_argument("--output_dir", type=str,
                         help="Directory path where to write the predictions/ranked candidates file.")
-    parser.add_argument('--records_file', default='./records.xls', help='Excel file keeping best records of all experiments')
+    parser.add_argument('--records_file', default='./records.xls', 
+                        help='Excel file keeping best records of all experiments')
     parser.add_argument("--doc_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to document embeddings.")
     parser.add_argument("--query_embedding_dir", type=str,
@@ -304,6 +318,8 @@ def run_parse_args():
                         "Reciprocal NN sparse vectors.")
     parser.add_argument('--sim_mixing_coef', type=float, default=0.3,
                         help="Coefficient of geometric similarity when linearly mixing it with Jaccard similarity based on Recip. NN")
+    parser.add_argument('--normalize', type=str, choices=['max', 'mean'], default='max',
+                        help="How to normalize values. It is *extremely* important to consider what function is used to map similarities to weights")
     args = parser.parse_args()
 
     # Setup CUDA, GPU 
@@ -331,7 +347,9 @@ def run_parse_args():
 
 if __name__ == "__main__":
     args = run_parse_args()
+    args = setup(args)
 
+    total_start_time = time.time()
     with torch.no_grad():
         if args.task == 'rerank':
             rerank_reciprocal_neighbors(args)
@@ -347,5 +365,7 @@ if __name__ == "__main__":
     logger.info("Avg. Jaccard sim. time per query: {} sec".format(jaccard_sim_times.get_average()))
     logger.info("Avg. time to get top results per query: {} sec".format(top_results_times.get_average()))
     logger.info("Avg. time to write results to file per query: {} sec".format(write_results_times.get_average()))
+    total_runtime = time.time() - total_start_time
+    logger.info("Total runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(total_runtime)))
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
     logger.info("Done!")

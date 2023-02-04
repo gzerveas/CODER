@@ -29,10 +29,12 @@ def pairwise_similarities(vectors, type='dot_product', normalize=None):
         similarities = torch.nn.functional.cosine_similarity(vectors, vectors[:, None, :], dim=2)  # stable
     else:
         raise NotImplementedError("Similarity '{}' not implemented".format(type))
+    
     if normalize == 'max':
         similarities = similarities / similarities.max(dim=1).values.unsqueeze(1) # divides by the largest sim. per row
     elif normalize == 'mean':
         similarities = similarities / (1e-8 + similarities.mean(dim=1).unsqueeze(1)) # divides by the mean sim. per row
+    # else, no noramlization
     
     return similarities
 
