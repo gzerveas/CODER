@@ -31,11 +31,7 @@ write_results_times = utils.Timer()
 total_times = utils.Timer()
 
 
-WEIGHT_FUNC = 'exp'
-WEIGHT_FUNC_PARAM = 2.4
-NORMALIZATION = 'max'
 OVERLAP_FACTOR = 2/3
-
 
 
 def get_embed_memmap(memmap_dir, dim):
@@ -146,13 +142,14 @@ def rerank_reciprocal_neighbors(args):
         start_total = time.perf_counter()
         start_time = start_total
         doc_ids = qid_to_candidate_passages[qid]  # list of string IDs
+        max_candidates = min(args.hit, len(doc_ids))
+        doc_ids = doc_ids[:max_candidates]
 
         if args.qrels_path and args.inject_ground_truth:
             rel_docs = qrels[qid].keys()
             # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
             # while ensuring that they are only included once
-            num_candidates = len(doc_ids)
-            new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:num_candidates]
+            new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:max_candidates]
             doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
 
         doc_ids = np.array(doc_ids)  # string IDs
@@ -177,8 +174,7 @@ def rerank_reciprocal_neighbors(args):
 
         # Final selection of top candidates
         start_time = time.perf_counter()
-        num_retrieve = min(args.hit, len(doc_ids))
-        top_scores, top_indices = torch.topk(final_sims, num_retrieve, largest=True, sorted=True)
+        top_scores, top_indices = torch.topk(final_sims, max_candidates, largest=True, sorted=True)
         top_doc_ids = doc_ids[top_indices.cpu()]
         top_scores = top_scores.cpu().numpy()
         global top_results_times
@@ -268,6 +264,7 @@ def setup(args):
     args.formatted_timestamp = initial_timestamp.strftime("%Y-%m-%d_%H-%M-%S")
     rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
     args.out_rankfilename = args.formatted_timestamp + "_" + rand_suffix
+    args.out_rankfilename += "_{}_".format(args.exp_name)
     args.out_rankfilename += "_rerank_" + os.path.basename(args.candidates_path)
     
     return args
@@ -283,10 +280,13 @@ def run_parse_args():
                         help="If set, embeddings will be loaded from memmaps and not entirely preloaded to memory. "
                         "Saves much memory (approx. 2GB vs 50GB) at the expense of approx. x2 time")
     parser.add_argument("--hit", type=int, default=1000, 
-                        help="Number of retrieval results (ranked candidates) for each query.")
+                        help="Number of top retrieval results (ranked candidates) to consider for each query when reranking.")
     parser.add_argument("--embedding_dim", type=int, default=768)
-    parser.add_argument("--output_dir", type=str,
+    parser.add_argument("--output_dir", type=str, default='.',
                         help="Directory path where to write the predictions/ranked candidates file.")
+    parser.add_argument("--exp_name", type=str, default=None,
+                        help="Characteristic string describing the experiment. "
+                        " This is going to be appended after the timestamp and random prefix, and before the original filename.")
     parser.add_argument('--records_file', default='./records.xls', 
                         help='Excel file keeping best records of all experiments')
     parser.add_argument("--doc_embedding_dir", type=str,
@@ -318,8 +318,12 @@ def run_parse_args():
                         "Reciprocal NN sparse vectors.")
     parser.add_argument('--sim_mixing_coef', type=float, default=0.3,
                         help="Coefficient of geometric similarity when linearly mixing it with Jaccard similarity based on Recip. NN")
-    parser.add_argument('--normalize', type=str, choices=['max', 'mean'], default='max',
-                        help="How to normalize values. It is *extremely* important to consider what function is used to map similarities to weights")
+    parser.add_argument('--normalize', type=str, choices=['max', 'mean', 'None'], default='None',
+                        help="How to normalize values. It is *extremely* important to consider what function is used to map similarities to weights, i.e. `weight_func`")
+    parser.add_argument('--weight_func', type=str, choices=['linear', 'exp'], default='linear',
+                        help="How to weight (potentially normalized) geometric similarities when building sparse neighbors vector.")
+    parser.add_argument('--weight_func_param', type=float, default=1.0,
+                        help="Parameter of weight function (used when function is exponential)")
     args = parser.parse_args()
 
     # Setup CUDA, GPU 

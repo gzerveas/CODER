@@ -27,7 +27,10 @@ def objective(trial):
     args.k_exp = trial.suggest_int('k_exp', 1, 10) 
     args.normalize = trial.suggest_categorical("normalize", ['max', 'mean', 'None']) #[NORMALIZATION])  # constant
     args.weight_func = trial.suggest_categorical("weight_func", ['exp', 'linear']) #[WEIGHT_FUNC])  # constant
-    args.weight_func_param = trial.suggest_float("weight_func_param", 0.1, 10, log=True) #trial.suggest_categorical("weight_func_param", [WEIGHT_FUNC_PARAM])  # constant
+    if args.weight_func == 'exp':
+        args.weight_func_param = trial.suggest_float("weight_func_param", 0.1, 10, log=True) #trial.suggest_categorical("weight_func_param", [WEIGHT_FUNC_PARAM])  # constant
+    else:
+        args.weight_func_param = trial.suggest_float("weight_func_param", 1.0, 1.0)  # constant
 
     best_values = rerank_reciprocal_neighbors(args)  # best metrics found during evaluation
 

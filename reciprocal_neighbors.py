@@ -13,7 +13,7 @@ pwise_times = utils.Timer()
 #     def __init__(self, pwise_sims=None) -> None:
 #         pass
 
-def pairwise_similarities(vectors, type='dot_product', normalize=None):
+def pairwise_similarities(vectors, type='dot_product', normalize="None"):
     """Computes similarities between all pairs of vectors in a tensor `vectors`.
 
     :param vectors: (m, d) float tensor, a sequence of m vectors
@@ -34,7 +34,7 @@ def pairwise_similarities(vectors, type='dot_product', normalize=None):
         similarities = similarities / similarities.max(dim=1).values.unsqueeze(1) # divides by the largest sim. per row
     elif normalize == 'mean':
         similarities = similarities / (1e-8 + similarities.mean(dim=1).unsqueeze(1)) # divides by the mean sim. per row
-    # else, no noramlization
+    # else, no normalization
     
     return similarities
 
