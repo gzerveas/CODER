@@ -5,7 +5,7 @@ from optuna.samplers import TPESampler, GridSampler
 from optuna.pruners import MedianPruner
 
 from options import *
-from reciprocal_compute import rerank_reciprocal_neighbors, run_parse_args, setup, NORMALIZATION, WEIGHT_FUNC, WEIGHT_FUNC_PARAM
+from reciprocal_compute import rerank_reciprocal_neighbors, run_parse_args, setup
 import utils
 
 # Metric for hyperparam optimization.
@@ -28,9 +28,8 @@ def objective(trial):
     args.normalize = trial.suggest_categorical("normalize", ['max', 'mean', 'None']) #[NORMALIZATION])  # constant
     args.weight_func = trial.suggest_categorical("weight_func", ['exp', 'linear']) #[WEIGHT_FUNC])  # constant
     if args.weight_func == 'exp':
-        args.weight_func_param = trial.suggest_float("weight_func_param", 0.1, 10, log=True) #trial.suggest_categorical("weight_func_param", [WEIGHT_FUNC_PARAM])  # constant
-    else:
-        args.weight_func_param = trial.suggest_float("weight_func_param", 1.0, 1.0)  # constant
+        args.weight_func_param = trial.suggest_float("weight_func_param", 0.001, 10, log=True)
+        args.weight_func_param = trial.suggest_float("weight_func_param", 1.0, 1.0, log=True)  # constant
 
     best_values = rerank_reciprocal_neighbors(args)  # best metrics found during evaluation
 
@@ -42,7 +41,7 @@ def objective(trial):
 
 if __name__ == '__main__':
 
-    storage = 'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_MSMARCO_optuna.db'
+    storage = 'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_TripClick_optuna.db'
     study_name = 'recipNN_postprocess_reranking_study_normalization'  # This name is shared across jobs/processes
     n_trials = 200
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())

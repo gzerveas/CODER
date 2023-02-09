@@ -389,7 +389,7 @@ def export_performance_metrics(filepath, metrics_table, header, book=None, sheet
     book = write_table_to_sheet([header] + metrics_table, book, sheet_name=sheet_name)
 
     book.save(filepath)
-    logger.info("Exported per epoch performance metrics in '{}'".format(filepath))
+    logger.info("Exported per epoch performance metrics in '{}'".format(os.path.realpath(filepath)))
 
     return book
 
@@ -473,7 +473,7 @@ def register_record(filepath, timestamp, experiment_name, best_metrics, final_me
             export_record(alt_path, row_values)
             filepath = alt_path
 
-    logger.info("Exported performance record to '{}'".format(filepath))
+    logger.info("Exported performance record to '{}'".format(os.path.realpath(filepath)))
 
 
 def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)):
@@ -485,16 +485,19 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     :return: dict of aggregate metrics, {"metric@k": avg. metric value}
     """
     
-    if len(results) < len(qrels):
-        logger.warning(f"qrels file contains rel. labels for {len(qrels)} queries, while only {len(results)} "
-                    "queries were evaluated. Performance metrics will only consider the intersection.")
-        qrels = {qid: qrels[qid] for qid in results.keys()}  # trim qrels dict
+    intersect_qids = results.keys() & qrels.keys()
+    if len(intersect_qids) < len(qrels) or len(intersect_qids) < len(results):
+        logger.warning(f"qrels file contains rel. labels for {len(qrels)} queries, while {len(results)} "
+                    f"queries were evaluated! Performance metrics will only consider the intersection ({len(intersect_qids)} queries)!")
+        logger.warning("{} queries in reference but not in predictions".format(len(qrels.keys() - results.keys())))
+        logger.warning("{} queries in predictions but not in reference".format(len(results.keys() - qrels.keys())))
+        qrels = {qid: qrels[qid] for qid in intersect_qids}
+        results = {qid: results[qid] for qid in intersect_qids}
     
     logger.info("Computing metrics ...")
     start_time = time.perf_counter()
     # Evaluate using BEIR (which relies on pytrec_eval) for comparison with BEIR benchmarks
     # Returns dictionaries with metrics for each cut-off value, e.g. ndcg["NDCG@{k}".format(cutoff_values[0])] == 0.3
-    cutoff_values = [1, 3, 5, 10, 100, 1000]
     metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values)  # tuple of metrics dicts (ndct, ...)
     mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR')
     metrics_time = time.perf_counter() - start_time

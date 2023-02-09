@@ -113,21 +113,28 @@ def rerank_reciprocal_neighbors(args):
 
     logger.info("Loading candidate documents per query from: '{}'".format(args.candidates_path))
     qid_to_candidate_passages = load_ranked_candidates(args.candidates_path)
-
-    if args.query_ids is None:
-        query_ids = qid_to_candidate_passages.keys()
-    else:  # read subset of (integer) query IDs from file
-        logger.info("Will use queries inside: {}".format(args.query_ids))
-        with open(args.query_ids, 'r') as f:
-            query_ids = {line.split()[0] for line in f}
-        logger.info("{} queries found".format(len(query_ids)))
-        query_ids = qid_to_candidate_passages.keys() & query_ids
-
-    logger.info("Total queries to evaluate: {}".format(len(query_ids)))
+    query_ids = qid_to_candidate_passages.keys()
 
     if args.qrels_path:
         logger.info("Loading ground truth documents (labels) in '{}' ...".format(args.qrels_path))
         qrels = utils.load_qrels(args.qrels_path, relevance_level=args.relevance_thr, score_mapping=None)  # dict: {qID: {passageid: g.t. relevance}}
+        
+        if args.compute_only_for_qrels:
+            intersection = query_ids & qrels.keys()
+            if len(intersection) < len(query_ids):
+                logger.warning(f"Only {len(intersection)} of queries in {args.query_embedding_dir} are contained in qrels file, "
+                               f"which contains {len(qrels)} queries."
+                               "Computation will be limited to this smaller intersection set.")
+                query_ids = intersection
+
+    if args.query_ids is not None:  # read subset of (integer) query IDs from file
+        logger.info("Will only use queries inside: {}".format(args.query_ids))
+        with open(args.query_ids, 'r') as f:
+            ext_query_ids = {line.split()[0] for line in f}
+        logger.info("{} queries found".format(len(ext_query_ids)))
+        query_ids = query_ids & ext_query_ids
+
+    logger.info("Total queries to evaluate: {}".format(len(query_ids)))
 
     logger.info("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
                                                                           np.round(utils.get_current_memory_usage2())))
@@ -232,6 +239,8 @@ def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, weight_f
     """
 
     global topk_times, recipNN_times, query_exp_times, jaccard_sim_times
+    
+    k = min(k, pwise_sims.shape[1] - 1)  #  otherwise topk would fail if num_candidates < k
 
     start_time = time.perf_counter()
     initial_rank = torch.topk(pwise_sims, k+1, dim=1, largest=True, sorted=True).indices  # (m, k+1) tensor of indices corresponding to largest values in each row of pwise_sims
@@ -264,7 +273,8 @@ def setup(args):
     args.formatted_timestamp = initial_timestamp.strftime("%Y-%m-%d_%H-%M-%S")
     rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
     args.out_rankfilename = args.formatted_timestamp + "_" + rand_suffix
-    args.out_rankfilename += "_{}_".format(args.exp_name)
+    if args.exp_name:
+        args.out_rankfilename += "_{}".format(args.exp_name)
     args.out_rankfilename += "_rerank_" + os.path.basename(args.candidates_path)
     
     return args
@@ -292,7 +302,8 @@ def run_parse_args():
     parser.add_argument("--doc_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to document embeddings.")
     parser.add_argument("--query_embedding_dir", type=str,
-                        help="Directory containing the memmap files corresponding to query embeddings.")
+                        help="Directory containing the memmap files corresponding to query embeddings. "
+                        "By default, all queries found within these files will be used to compute candidate scores.")
     parser.add_argument("--query_ids", type=str, default=None,
                         help="A text file containing query IDs (and possibly other fields, separated by whitespace), "
                              "one per line. If provided, will limit retrieval to this subset.")
@@ -308,6 +319,9 @@ def run_parse_args():
                         help="Path to file of ground truth relevant passages in the following format: 'qID1 \t Q0 \t pID1 \t 1\n qID1 \t Q0 \t pID2 \t 1\n ...)'")
     parser.add_argument('--relevance_thr', type=float, default=1.0, 
                         help="Score threshold in qrels (g.t. relevance judgements) to consider a document relevant.")
+    parser.add_argument("--compute_only_for_qrels", type=bool, default=True,
+                        help="If true, and a `qrels_path` is provided, then scores will be computed only for queries which also exist "
+                        "in the qrels file")
     parser.add_argument('--k', type=int, default=20, 
                         help="Number of Nearest Neighbors in terms of similarity. Used in finding Reciprocal Nearest Neighbors.")
     parser.add_argument('--trust_factor', type=float, default=0.5,
