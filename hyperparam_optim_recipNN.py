@@ -5,8 +5,7 @@ from optuna.samplers import TPESampler, GridSampler
 from optuna.pruners import MedianPruner
 
 from options import *
-from reciprocal_compute import rerank_reciprocal_neighbors, run_parse_args, setup
-import utils
+from reciprocal_compute import recip_NN_rerank, run_parse_args, setup
 
 # Metric for hyperparam optimization.
 # Can be different from "key_metric" of main, which determines the set of "best_values" and saved checkpoints
@@ -31,7 +30,7 @@ def objective(trial):
         args.weight_func_param = trial.suggest_float("weight_func_param", 0.001, 10, log=True)
         args.weight_func_param = trial.suggest_float("weight_func_param", 1.0, 1.0, log=True)  # constant
 
-    best_values = rerank_reciprocal_neighbors(args)  # best metrics found during evaluation
+    best_values = recip_NN_rerank(args)  # run main function and get best metrics found during evaluation
 
     for name, value in best_values.items():
         trial.set_user_attr(name, value)  # log in database / study object

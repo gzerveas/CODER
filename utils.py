@@ -504,7 +504,7 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     logger.info("Time to calculate performance metrics: {:.3f} s".format(metrics_time))
     
     # Merge all dicts into a single OrderedDict and sort by k for guaranteed consistency
-    perf_metrics = OrderedDict()
+    perf_metrics = OrderedDict()  # to also work with Python 3.6
     for met_dict in (mrr, ) + metric_dicts:
         perf_metrics.update(sorted(met_dict.items(), key=lambda x: 0 if not '@' in x[0] else int(x[0].split('@')[1])))
 

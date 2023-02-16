@@ -1,37 +1,28 @@
 import logging
-import random
-import string
 logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger()
-
 logger.info("Loading packages ...")
-
+import random
+import string
 import os
 import math
-import torch
-import argparse
-import numpy as np
-from tqdm import tqdm
 from collections import OrderedDict, defaultdict
 import time
 from datetime import datetime
+import argparse
+
+import torch
+import numpy as np
+from tqdm import tqdm
 
 import utils
-from reciprocal_neighbors import pairwise_similarities, compute_rNN_matrix, compute_jaccard_sim, combine_similarities, local_query_expansion
+from reciprocal_neighbors import pairwise_similarities, recompute_similarities, topk_times, recipNN_times, query_exp_times, jaccard_sim_times
 
 embed_load_times = utils.Timer()
 pwise_times = utils.Timer()
-topk_times = utils.Timer()
-pwise_times = utils.Timer()
-recipNN_times = utils.Timer()
-query_exp_times = utils.Timer()
-jaccard_sim_times = utils.Timer()
 top_results_times = utils.Timer()
 write_results_times = utils.Timer()
 total_times = utils.Timer()
-
-
-OVERLAP_FACTOR = 2/3
 
 
 def get_embed_memmap(memmap_dir, dim):
@@ -48,7 +39,7 @@ def get_embed_memmap(memmap_dir, dim):
     return embedding_memmap, id_memmap
 
 
-def print_memory_info(memmap, docs_per_chunk, device):
+def print_memory_info(device):
     # doc_chunk_size = sys.getsizeof(np.array(memmap[:docs_per_chunk]))/1024**2
     # logger.info("{} chunks of {} documents (total of {}), each of approx. size {} MB, "
     #             "will be loaded to the following device:".format(math.ceil(memmap.shape[0]/docs_per_chunk), docs_per_chunk,
@@ -95,126 +86,209 @@ def load_ranked_candidates(path_to_candidates):
                 logger.warning("Line \"{}\" is not in valid format and resulted in: {}".format(line, fields))
     return qid_to_candidate_passages
 
-
-def rerank_reciprocal_neighbors(args):
-    """Reranks existing candidates per query in a qID -> ranked cand. list memmap"""
+class ReciprocalNearestNeighbors(object):
     
-    logger.info("Loading document embeddings memmap ...")
-    doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
-    did2pos = {str(identity): i for i, identity in enumerate(doc_id_memmap)}
-    if not args.save_memory:
-        doc_embedding_memmap = np.array(doc_embedding_memmap)
-
-    logger.info("Loading query embeddings memmap ...")
-    query_embedding_memmap, query_id_memmap = get_embed_memmap(args.query_embedding_dir, args.embedding_dim)
-    qid2pos = {str(identity): i for i, identity in enumerate(query_id_memmap)}
-    if not args.save_memory:
-        query_embedding_memmap = np.array(query_embedding_memmap)
-
-    logger.info("Loading candidate documents per query from: '{}'".format(args.candidates_path))
-    qid_to_candidate_passages = load_ranked_candidates(args.candidates_path)
-    query_ids = qid_to_candidate_passages.keys()
-
-    if args.qrels_path:
-        logger.info("Loading ground truth documents (labels) in '{}' ...".format(args.qrels_path))
-        qrels = utils.load_qrels(args.qrels_path, relevance_level=args.relevance_thr, score_mapping=None)  # dict: {qID: {passageid: g.t. relevance}}
+    def __init__(self, query_embedding_dir, doc_embedding_dir, embedding_dim, candidates_path, 
+                 qrels_path=None, query_ids_path=None, 
+                 compute_only_for_qrels=True, inject_ground_truth=False, relevance_thr=1.0,
+                 device='cpu', save_memory=False) -> None:
+        """
+        :param query_embedding_dir: _description_
+        :param doc_embedding_dir: _description_
+        :param embedding_dim: _description_
+        :param candidates_path: _description_
+        :param qrels_path: _description_, defaults to None
+        :param query_ids_path: _description_, defaults to None
+        :param compute_only_for_qrels: _description_, defaults to True
+        :param inject_ground_truth: _description_, defaults to False
+        :param relevance_thr: _description_, defaults to 1.0
+        :param device: PyTorch device to run the computation. By default CPU.
+        :param save_memory: _description_, defaults to False
+        """
+        # System
+        self.device = device
+        self.save_memory = save_memory
+        # IO
+        self.query_embedding_dir = query_embedding_dir
+        self.doc_embedding_dir = doc_embedding_dir
+        self.candidates_path = candidates_path
+        self.qrels_path = qrels_path
+        self.query_ids_path = query_ids_path
+        # Setting
+        self.compute_only_for_qrels = compute_only_for_qrels
+        self.embedding_dim = embedding_dim
+        self.inject_ground_truth = inject_ground_truth
+        self.relevance_thr = relevance_thr
         
-        if args.compute_only_for_qrels:
-            intersection = query_ids & qrels.keys()
-            if len(intersection) < len(query_ids):
-                logger.warning(f"Only {len(intersection)} of queries in {args.query_embedding_dir} are contained in qrels file, "
-                               f"which contains {len(qrels)} queries."
-                               "Computation will be limited to this smaller intersection set.")
-                query_ids = intersection
+        self.load_from_files()
+            
+    def set(self, **kwargs):
+        for key in kwargs:
+            if key in self.__dict__:
+                setattr(self, key, kwargs[key])
+            else:
+                raise KeyError(f"Key '{key}' not a memmber of '{self}'")
+            
+    def load_from_files(self):
+        """Load document embeddings, query embeddings, candidate documents and qrels from files."""
+        
+        logger.info("Loading document embeddings memmap ...")
+        self.doc_embedding_memmap, doc_id_memmap = get_embed_memmap(self.doc_embedding_dir, self.embedding_dim)
+        self.did2pos = {str(identity): i for i, identity in enumerate(doc_id_memmap)}
+        if not self.save_memory:
+            self.doc_embedding_memmap = np.array(self.doc_embedding_memmap)
 
-    if args.query_ids is not None:  # read subset of (integer) query IDs from file
-        logger.info("Will only use queries inside: {}".format(args.query_ids))
-        with open(args.query_ids, 'r') as f:
-            ext_query_ids = {line.split()[0] for line in f}
-        logger.info("{} queries found".format(len(ext_query_ids)))
-        query_ids = query_ids & ext_query_ids
+        logger.info("Loading query embeddings memmap ...")
+        self.query_embedding_memmap, query_id_memmap = get_embed_memmap(self.query_embedding_dir, self.embedding_dim)
+        self.qid2pos = {str(identity): i for i, identity in enumerate(query_id_memmap)}
+        if not self.save_memory:
+            self.query_embedding_memmap = np.array(self.query_embedding_memmap)
 
-    logger.info("Total queries to evaluate: {}".format(len(query_ids)))
+        logger.info("Loading candidate documents per query from: '{}'".format(self.candidates_path))
+        self.qid_to_candidate_passages = load_ranked_candidates(self.candidates_path)
+        self.query_ids = self.qid_to_candidate_passages.keys()
 
-    logger.info("Current memory usage: {} MB or {} MB".format(np.round(utils.get_current_memory_usage()),
-                                                                          np.round(utils.get_current_memory_usage2())))
+        if self.qrels_path:
+            logger.info("Loading ground truth documents (labels) in '{}' ...".format(self.qrels_path))
+            self.qrels = utils.load_qrels(self.qrels_path, relevance_level=self.relevance_thr, score_mapping=None)  # dict: {qID: {passageid: g.t. relevance}}
+            
+            if self.compute_only_for_qrels:
+                intersection = self.query_ids & self.qrels.keys()
+                if len(intersection) < len(self.query_ids):
+                    logger.warning(f"Only {len(intersection)} of queries in {self.query_embedding_dir} are contained in qrels file, "
+                                f"which contains {len(self.qrels)} queries."
+                                "Computation will be limited to this smaller intersection set.")
+                    self.query_ids = intersection
+        else:
+            self.qrels = None
+
+        if self.query_ids_path is not None:  # read subset of (integer) query IDs from file
+            logger.info("Will only use queries inside: {}".format(self.query_ids_path))
+            with open(self.query_ids_path, 'r') as f:
+                ext_query_ids = {line.split()[0] for line in f}
+            logger.info("{} queries found".format(len(ext_query_ids)))
+            self.query_ids = self.query_ids & ext_query_ids
+        
+        logger.info("Total queries to evaluate: {}".format(len(self.query_ids)))
+        
+        return
+
+    def rerank(self, query_ids, hit=1000, 
+               normalize='None', k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3):
+        """Reranks existing candidates per query in a qID -> ranked cand. list .tsv file
+
+        :param query_ids: iterable of query IDs for which to rerank candidates
+        :param hit: number of (top) candidates to consider for each query
+        :param normalize: how to normalize the original geometric similarity scores, defaults to 'None'
+        :param k: number of Nearest Neighbors, defaults to 20
+        :param trust_factor: If > 0, will build an extended set of reciprocal neighbors, by considering neighbors of neighbors.
+                The number of reciprocal neighbors to consider for each k-reciprocal neighbor is trust_factor*k. Defaults to 1/2
+        :param k_exp: k used for query expansion, i.e. how many Nearest Neighbors should be linearly combined to result in an expanded sparse vector (row). 
+                        No expansion takes place with k<=1.
+        :param weight_func: function mapping similarities to weights, defaults to 'exp'.
+                            When not 'exp', uses similarities themselves as weights (proportional weighting) 
+                            If None, returns binary adjacency matrix, without weighting based on geometric similarity.
+        :param weight_func_param: parameter of the weight function. Only used when `weight_func` is 'exp'.
+        :param orig_coef: float in [0, 1]. If > 0, this will be the coefficient of the original geometric similarities (in `pwise_sims`)
+                            when computing the final similarities.
+        :return reranked_scores: final/reranked predictions dict: {qID: OrderedDict{passageid: score}}
+        :return orig_scores: original predictions dict: {qID: OrderedDict{passageid: score}}
+        """        
+        
+        orig_scores = {}  # original predictions dict: {qID: OrderedDict{passageid: score}}
+        reranked_scores = {}  # final/reranked predictions dict: {qID: OrderedDict{passageid: score}}. Used for metrics calculation through pytrec_eval
+        
+        for qid in tqdm(query_ids, desc="query "):
+            start_total = time.perf_counter()
+            start_time = start_total
+            doc_ids = self.qid_to_candidate_passages[qid]  # list of string IDs
+            max_candidates = min(hit, len(doc_ids))
+            doc_ids = doc_ids[:max_candidates]
+
+            if self.qrels and self.inject_ground_truth:
+                rel_docs = self.qrels[qid].keys()
+                # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
+                # while ensuring that they are only included once
+                new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:max_candidates]
+                doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
+
+            doc_ids = np.array(doc_ids)  # string IDs
+
+            doc_embeddings = self.doc_embedding_memmap[[self.did2pos[docid] for docid in doc_ids]]
+            doc_embeddings = torch.from_numpy(doc_embeddings).float().to(self.device)  # (num_cands, emb_dim)
+            
+            query_embedding = self.query_embedding_memmap[self.qid2pos[qid]]
+            query_embedding = torch.from_numpy(query_embedding).float().to(self.device)
+            
+            global embed_load_times
+            embed_load_times.update(time.perf_counter() - start_time)
+
+            start_time = time.perf_counter()
+            pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0), normalize=normalize) # (num_cands+1, num_cands+1)
+            global pwise_times
+            pwise_times.update(time.perf_counter() - start_time)
+            
+            orig_scores[qid] = OrderedDict((str(docid), float(pwise_sims[0, 1 + i])) for i, docid in enumerate(top_doc_ids))
+
+            final_sims = recompute_similarities(pwise_sims, k=k, trust_factor=trust_factor, k_exp=k_exp,
+                                                weight_func=weight_func, weight_func_param=weight_func_param, 
+                                                orig_coef=orig_coef, device=self.device)[1:]  # (num_cands,)
+
+            # Final selection of top candidates
+            start_time = time.perf_counter()
+            top_scores, top_indices = torch.topk(final_sims, max_candidates, largest=True, sorted=True)
+            top_doc_ids = doc_ids[top_indices.cpu()]
+            top_scores = top_scores.cpu().numpy()
+            global top_results_times
+            top_results_times.update(time.perf_counter() - start_time)
+            
+            reranked_scores[qid] = OrderedDict((str(docid), float(top_scores[i])) for i, docid in enumerate(top_doc_ids))
+            
+            global total_times
+            total_times.update(time.perf_counter() - start_total)
+        
+        return reranked_scores, orig_scores
+
+
+def recip_NN_rerank(args):
+    """Reranks existing candidates per query in a qID -> ranked cand. list .tsv file.
+
+    :param args: arguments object, as returned by argparse
+    :return perf_metrics: dict {metric_name: metric_value}
+    """
+    
+    rNN_reranker = ReciprocalNearestNeighbors(args.query_embedding_dir, args.doc_embedding_dir, args.embedding_dim, args.candidates_path,
+                                              args.qrels_path, args.query_ids_path, args.compute_only_for_qrels, args.inject_ground_truth, args.relevance_thr,
+                                              args.device, args.save_memory)
+    
+    logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+    
     logger.info("Reranking candidates ...")
-
-    results = {}  # final predictions dict: {qID: {passageid: score}}. Used for metrics calculation through pytrec_eval
-    out_rankfilepath = os.path.join(args.output_dir, args.out_rankfilename) #f"recipNN_k{args.k}_trustfactor{args.trust_factor}_kexp{args.k_exp}_lambda{args.sim_mixing_coef}_rerank_" + os.path.basename(args.candidates_path))
-    out_rankfile =  open(out_rankfilepath, 'w')
+    reranked_scores, _ = rNN_reranker.rerank(rNN_reranker.query_ids, args.hit,
+                                             args.normalize, args.k, args.trust_factor, args.k_exp, args.weight_func, args.weight_func_param, args.orig_coef)
     
-    for qid in tqdm(query_ids, desc="query "):
-        start_total = time.perf_counter()
-        start_time = start_total
-        doc_ids = qid_to_candidate_passages[qid]  # list of string IDs
-        max_candidates = min(args.hit, len(doc_ids))
-        doc_ids = doc_ids[:max_candidates]
-
-        if args.qrels_path and args.inject_ground_truth:
-            rel_docs = qrels[qid].keys()
-            # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
-            # while ensuring that they are only included once
-            new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:max_candidates]
-            doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
-
-        doc_ids = np.array(doc_ids)  # string IDs
-
-        doc_embeddings = doc_embedding_memmap[[did2pos[docid] for docid in doc_ids]]
-        doc_embeddings = torch.from_numpy(doc_embeddings).float().to(args.device)  # (num_cands, emb_dim)
-        
-        query_embedding = query_embedding_memmap[qid2pos[qid]]
-        query_embedding = torch.from_numpy(query_embedding).float().to(args.device)
-        
-        global embed_load_times
-        embed_load_times.update(time.perf_counter() - start_time)
-
-        start_time = time.perf_counter()
-        pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0), normalize=args.normalize) # (num_cands+1, num_cands+1)
-        global pwise_times
-        pwise_times.update(time.perf_counter() - start_time)
-
-        final_sims = recompute_similarities(pwise_sims, k=args.k, trust_factor=args.trust_factor, k_exp=args.k_exp,
-                                            weight_func=args.weight_func, weight_func_param=args.weight_func_param, 
-                                            orig_coef=args.sim_mixing_coef, device=args.device)[1:]  # (num_cands,)
-
-        # Final selection of top candidates
-        start_time = time.perf_counter()
-        top_scores, top_indices = torch.topk(final_sims, max_candidates, largest=True, sorted=True)
-        top_doc_ids = doc_ids[top_indices.cpu()]
-        top_scores = top_scores.cpu().numpy()
-        global top_results_times
-        top_results_times.update(time.perf_counter() - start_time)
-        
-        results[qid] = {str(docid): float(top_scores[i]) for i, docid in enumerate(top_doc_ids)}
-        
+    if args.write_scores_to_file:
         # Write new ranks to file
-        start_time = time.perf_counter()
-        for i, docid in enumerate(top_doc_ids):
-            out_rankfile.write(f"{qid}\t{docid}\t{i+1}\t{top_scores[i]}\n")
-        global write_results_times
-        write_results_times.update(time.perf_counter() - start_time)
-        
-        global total_times
-        total_times.update(time.perf_counter() - start_total)
-    
-    out_rankfile.close()
+        with open(args.out_rankfilepath, 'w') as out_rankfile:
+            start_time = time.perf_counter()
+            for qid, doc2score in reranked_scores.items():
+                for i, (docid, score) in enumerate(doc2score.items()):
+                    out_rankfile.write(f"{qid}\t{docid}\t{i+1}\t{score}\n")
+                global write_results_times
+                write_results_times.update(time.perf_counter() - start_time)
 
     perf_metrics = None
     if args.qrels_path:
-        perf_metrics = utils.get_retrieval_metrics(results, qrels)
+        perf_metrics = utils.get_retrieval_metrics(reranked_scores, rNN_reranker.qrels)
         perf_metrics['time'] = total_times.get_average()
-        print(perf_metrics)
-        
-        parameters = OrderedDict()
-        parameters['sim_mixing_coef'] = args.sim_mixing_coef
-        parameters['k'] = args.k
-        parameters['trust_factor'] = args.trust_factor
-        parameters['k_exp'] = args.k_exp
-        parameters['normalize'] = args.normalize
-        parameters['weight_func'] = args.weight_func
-        parameters['weight_func_param'] = args.weight_func_param
+        # NOTE: Order of keys is guaranteed in Python 3.7+ (but informally also in 3.6)
+        parameters = {'sim_mixing_coef': args.sim_mixing_coef,
+                      'k': args.k,
+                      'trust_factor': args.trust_factor,
+                      'normalize': args.normalize,
+                      'weight_func': args.weight_func,
+                      'weight_func_param': args.weight_func_param}
         
         # Export record metrics to a file accumulating records from all experiments
         utils.register_record(args.records_file, args.formatted_timestamp, args.out_rankfilename, perf_metrics, parameters=parameters)
@@ -224,46 +298,6 @@ def rerank_reciprocal_neighbors(args):
 
 def smoothen_relevance_labels():
     pass
-
-
-def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3, device=None):
-    """Compute new similarities with respect to a probe (query) based on its reciprocal nearest neighbors Jaccard similarity 
-    with the geometric Nearest Neibors, as well as geometric similarities. Assumes similarities, not distances.
-
-    :param pwise_sims: (m, m) tensor, where m = N + 1. Geometric similarities between all m*m pairs of emb. vectors in the set {query, doc1, ..., doc_N}
-    :param k: number of Nearest Neighbors, defaults to 20
-    :param k_exp: k used for query expansion. No expansion takes place with k<=1. Defaults to 6
-    :param orig_coef: float in [0, 1]. If > 0, this will be the coefficient of the original geometric similarities (in `pwise_sims`)
-                        when computing the final similarities. 
-    :return: (m,) tensor, updated similarities. Includes self-similarity at index 0
-    """
-
-    global topk_times, recipNN_times, query_exp_times, jaccard_sim_times
-    
-    k = min(k, pwise_sims.shape[1] - 1)  #  otherwise topk would fail if num_candidates < k
-
-    start_time = time.perf_counter()
-    initial_rank = torch.topk(pwise_sims, k+1, dim=1, largest=True, sorted=True).indices  # (m, k+1) tensor of indices corresponding to largest values in each row of pwise_sims
-    topk_times.update(time.perf_counter() - start_time)
-
-    # Compute sparse reciprocal neighbor vectors for each item (i.e. reciprocal adjecency matrix)
-    start_time = time.perf_counter()
-    V = compute_rNN_matrix(pwise_sims, initial_rank, k=k, trust_factor=trust_factor, overlap_factor=OVERLAP_FACTOR, 
-                           weight_func=weight_func, param=weight_func_param, device=device) # (m, m) float tensor, (sparse) adjacency matrix
-    recipNN_times.update(time.perf_counter() - start_time)
-
-    if k_exp > 1:
-        start_time = time.perf_counter()
-        V = local_query_expansion(V, initial_rank, k_exp, device=device)  # (m, m)
-        query_exp_times.update(time.perf_counter() - start_time)
-    
-    start_time = time.perf_counter()
-    jaccard_sims = compute_jaccard_sim(V)  # (m,)
-    jaccard_sim_times.update(time.perf_counter() - start_time)
-
-    final_sims = combine_similarities(pwise_sims[0, :], jaccard_sims, orig_coef=orig_coef)  # (m,) includes self-similarity at index 0
-
-    return final_sims
 
 
 def setup(args):
@@ -276,6 +310,8 @@ def setup(args):
     if args.exp_name:
         args.out_rankfilename += "_{}".format(args.exp_name)
     args.out_rankfilename += "_rerank_" + os.path.basename(args.candidates_path)
+    
+    args.out_rankfilepath = os.path.join(args.output_dir, args.out_rankfilename)
     
     return args
 
@@ -299,12 +335,14 @@ def run_parse_args():
                         " This is going to be appended after the timestamp and random prefix, and before the original filename.")
     parser.add_argument('--records_file', default='./records.xls', 
                         help='Excel file keeping best records of all experiments')
+    parser.add_argument("--write_scores_to_file", type=bool, default=True,
+                        help="If set, predictions (scores per document for each query) will be written to a .tsv file")
     parser.add_argument("--doc_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to document embeddings.")
     parser.add_argument("--query_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to query embeddings. "
                         "By default, all queries found within these files will be used to compute candidate scores.")
-    parser.add_argument("--query_ids", type=str, default=None,
+    parser.add_argument("--query_ids", dest='query_ids_path', type=str, default=None,
                         help="A text file containing query IDs (and possibly other fields, separated by whitespace), "
                              "one per line. If provided, will limit retrieval to this subset.")
     parser.add_argument("--candidates_path", type=str, default=None,
@@ -338,7 +376,7 @@ def run_parse_args():
                         help="How to weight (potentially normalized) geometric similarities when building sparse neighbors vector.")
     parser.add_argument('--weight_func_param', type=float, default=1.0,
                         help="Parameter of weight function (used when function is exponential)")
-    args = parser.parse_args()
+    #args = parser.parse_args()
 
     # Setup CUDA, GPU 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -370,7 +408,8 @@ if __name__ == "__main__":
     total_start_time = time.time()
     with torch.no_grad():
         if args.task == 'rerank':
-            rerank_reciprocal_neighbors(args)
+            perf_metrics = recip_NN_rerank(args)
+            print(perf_metrics)
         else:
             raise NotImplementedError(f'Task {args.task} not implemented!')
 
