@@ -228,7 +228,7 @@ class ReciprocalNearestNeighbors(object):
             global pwise_times
             pwise_times.update(time.perf_counter() - start_time)
             
-            orig_scores[qid] = OrderedDict((str(docid), float(pwise_sims[0, 1 + i])) for i, docid in enumerate(top_doc_ids))
+            orig_scores[qid] = OrderedDict((str(docid), float(pwise_sims[0, 1 + i])) for i, docid in enumerate(doc_ids))
 
             final_sims = recompute_similarities(pwise_sims, k=k, trust_factor=trust_factor, k_exp=k_exp,
                                                 weight_func=weight_func, weight_func_param=weight_func_param, 
