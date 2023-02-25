@@ -18,28 +18,38 @@ jaccard_sim_times = utils.Timer()
 #     def __init__(self, pwise_sims=None) -> None:
 #         pass
 
-def pairwise_similarities(vectors, type='dot_product', normalize="None"):
+def pairwise_similarities(vectors, stype='dot_product'):
     """Computes similarities between all pairs of vectors in a tensor `vectors`.
 
     :param vectors: (m, d) float tensor, a sequence of m vectors
-    :param type: str, function to compute similarity, defaults to 'dot_product'
-    :param normalize: str, how to normalize similarity values. It is *extremely* important to consider what function is used in `assign_neighbor_weights`
-        to map similarities to weights (e.g. an exponential function when using unnormalized values may lead to NaN)
+    :param stype: str, function to compute similarity, defaults to 'dot_product'
     :return: (m, m) float tensor, similarity matrix between all m*m pairs of elements in `vectors`
     """
 
-    if type == 'dot_product':
+    if stype == 'dot_product':
         similarities = torch.mm(vectors, vectors.T)
-    elif type == 'cosine':
+    elif stype == 'cosine':
         similarities = torch.nn.functional.cosine_similarity(vectors, vectors[:, None, :], dim=2)  # stable
     else:
         raise NotImplementedError("Similarity '{}' not implemented".format(type))
     
-    if normalize == 'max':
+    return similarities
+
+
+def normalize(similarities, ntype="None"):
+    """Normalize similarities. By default the identity function. 
+    :param similarities: (m, m) tensor, where m = N + 1. Similarities between all m*m pairs of emb. vectors in the set {query, doc1, ..., doc_N}
+    :param normalize: str, how to normalize similarity values. If 'None', no normalization takes place.
+        Other options are 'max' (divide by maximum value per row) and 'mean' (divide by mean value per row).
+    :return: (m, m) tensor, normalized similarities  
+    """
+    if ntype == 'max':
         similarities = similarities / similarities.max(dim=1).values.unsqueeze(1) # divides by the largest sim. per row
-    elif normalize == 'mean':
+    elif ntype == 'mean':
         similarities = similarities / (1e-8 + similarities.mean(dim=1).unsqueeze(1)) # divides by the mean sim. per row
     # else, no normalization
+    elif ntype != 'None':
+        raise NotImplementedError(f"Normalization '{ntype}' not implemented")
     
     return similarities
 
@@ -196,18 +206,20 @@ def local_query_expansion(V, initial_rank, k_exp, device=None):
     return V_qexp
 
 
-def compute_jaccard_sim(V):
-    """Computes the Jaccard similarity between the probe (query) and each of the m (i.e. num_candidates + 1) candidates (including the query itself).
+def jaccard_similarity(V, ind=0):
+    """Computes the Jaccard similarity between the probe (typically query), defined by the row index `ind`, 
+    and each of the m candidates (typically m = num_candidates + 1, including the query itself).
     The Jaccard similarity is the "intersection over union" of the reciprocal neighbors of the probe and each candidate.
-    This implementation works also for non-binary (i.e. with weighted non-zero values) reciprocal neighbor vectors V[i, :].
+    This implementation works also for non-binary (i.e. with weighted non-zero values) reciprocal neighbor vectors V[j, :].
 
     :param V: (m, m) float tensor, non-zero elements in each row correspond to reciprocal neighbors and their values depend on their similarity (to the item corresponding to the row).
                 Row 0 corresponds to the probe/query.
+    :param ind: int, ordinal index (i.e. row index) of the item acting as a probe. By default 0, corresponding to the query (conventionally the first vector)
     :return: (m,) float tensor, Jaccard similarity of the probe with each of the m (num_candidates + 1) candidates
     """
     # intersection = torch.min(V[0, :].unsqueeze(0), V) # (m, m)
     # union = torch.max(V[0, :].unsqueeze(0), V)  # (m, m)
-    jaccard_sim = torch.sum(torch.min(V[0, :].unsqueeze(0), V), dim=1) / torch.sum(torch.max(V[0, :].unsqueeze(0), V), dim=1)  # (m,)
+    jaccard_sim = torch.sum(torch.min(V[ind, :].unsqueeze(0), V), dim=1) / torch.sum(torch.max(V[ind, :].unsqueeze(0), V), dim=1)  # (m,)
     
     return jaccard_sim
 
@@ -231,7 +243,7 @@ def combine_similarities(orig_sims, jaccard_sims, combine_type='linear', orig_co
     return final_sims
 
 
-def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3, device=None):
+def compute_jaccard_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, device=None):
     """Compute new similarities with respect to a probe (query) based on its reciprocal nearest neighbors Jaccard similarity 
     with the geometric Nearest Neibors, as well as geometric similarities. Assumes similarities, not distances.
 
@@ -245,8 +257,6 @@ def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, weight_f
                         When not 'exp', uses similarities themselves as weights (proportional weighting) 
                         If None, returns binary adjacency matrix, without weighting based on geometric similarity.
     :param weight_func_param: parameter of the weight function. Only used when `weight_func` is 'exp'.
-    :param orig_coef: float in [0, 1]. If > 0, this will be the coefficient of the original geometric similarities (in `pwise_sims`)
-                        when computing the final similarities.
     :param device: PyTorch device to run the computation. By default CPU. 
     :return: (m,) tensor, updated similarities. Includes self-similarity at index 0
     """
@@ -271,21 +281,7 @@ def recompute_similarities(pwise_sims, k=20, trust_factor=0.5, k_exp=6, weight_f
         query_exp_times.update(time.perf_counter() - start_time)
     
     start_time = time.perf_counter()
-    jaccard_sims = compute_jaccard_sim(V)  # (m,)
+    jaccard_sims = jaccard_similarity(V)  # (m,)
     jaccard_sim_times.update(time.perf_counter() - start_time)
 
-    final_sims = combine_similarities(pwise_sims[0, :], jaccard_sims, orig_coef=orig_coef)  # (m,) includes self-similarity at index 0
-
-    return final_sims
-
-
-# def smoothen_labels(orig_relevances, similarities, smooth_factor=0.25):
-#     """Assumes that orig_relevances and simililarities are disjoint, i.e. non-zero similarities are given for all non-g.t. relevant candidates.
-
-#     :param orig_relevances: (num_candidates,) original ground truth relevance between query and each candidate. May have been normalized to sum to 1.
-#     :param similarities: (num_candidates,) similarity between query and each candidate
-#     :param smooth_factor: proportion of the original prob. weight what will be reassigned to new candidates based on similarity, defaults to 0.25
-#     :return: _description_
-#     """
-    
-#     return smooth_qrels
+    return jaccard_sims

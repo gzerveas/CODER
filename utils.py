@@ -32,7 +32,7 @@ def rank_docs(docids, scores, shuffle=True):
     and coresponding document IDs in the order of descending scores."""
     actual_scores = scores[:len(docids)]
 
-    if shuffle:  # used to remove any possible bias in documents order
+    if shuffle:  # used to remove any possible bias (e.g. in case of score ties) in documents order
         inds = np.random.permutation(len(docids))
         actual_scores = actual_scores[inds]
         docids = [docids[i] for i in inds]

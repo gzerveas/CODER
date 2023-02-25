@@ -16,7 +16,7 @@ import numpy as np
 from tqdm import tqdm
 
 import utils
-from reciprocal_neighbors import pairwise_similarities, recompute_similarities, topk_times, recipNN_times, query_exp_times, jaccard_sim_times
+from reciprocal_neighbors import pairwise_similarities, normalize, combine_similarities, compute_jaccard_similarities, topk_times, recipNN_times, query_exp_times, jaccard_sim_times
 
 embed_load_times = utils.Timer()
 pwise_times = utils.Timer()
@@ -174,18 +174,18 @@ class ReciprocalNearestNeighbors(object):
         return
 
     def rerank(self, query_ids, hit=1000, 
-               normalize='None', k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3):
+               normalization='None', k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3):
         """Reranks existing candidates per query in a qID -> ranked cand. list .tsv file
 
         :param query_ids: iterable of query IDs for which to rerank candidates
-        :param hit: number of (top) candidates to consider for each query
-        :param normalize: how to normalize the original geometric similarity scores, defaults to 'None'
-        :param k: number of Nearest Neighbors, defaults to 20
+        :param hit: int, number of (top) candidates to consider for each query
+        :param normalization: str, how to normalize the original geometric similarity scores, defaults to 'None'
+        :param k: int, number of Nearest Neighbors, defaults to 20
         :param trust_factor: If > 0, will build an extended set of reciprocal neighbors, by considering neighbors of neighbors.
                 The number of reciprocal neighbors to consider for each k-reciprocal neighbor is trust_factor*k. Defaults to 1/2
-        :param k_exp: k used for query expansion, i.e. how many Nearest Neighbors should be linearly combined to result in an expanded sparse vector (row). 
+        :param k_exp: int, k used for query expansion, i.e. how many Nearest Neighbors should be linearly combined to result in an expanded sparse vector (row). 
                         No expansion takes place with k<=1.
-        :param weight_func: function mapping similarities to weights, defaults to 'exp'.
+        :param weight_func: str, function mapping similarities to weights, defaults to 'exp'.
                             When not 'exp', uses similarities themselves as weights (proportional weighting) 
                             If None, returns binary adjacency matrix, without weighting based on geometric similarity.
         :param weight_func_param: parameter of the weight function. Only used when `weight_func` is 'exp'.
@@ -201,6 +201,7 @@ class ReciprocalNearestNeighbors(object):
         for qid in tqdm(query_ids, desc="query "):
             start_total = time.perf_counter()
             start_time = start_total
+            
             doc_ids = self.qid_to_candidate_passages[qid]  # list of string IDs
             max_candidates = min(hit, len(doc_ids))
             doc_ids = doc_ids[:max_candidates]
@@ -224,15 +225,22 @@ class ReciprocalNearestNeighbors(object):
             embed_load_times.update(time.perf_counter() - start_time)
 
             start_time = time.perf_counter()
-            pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0), normalize=normalize) # (num_cands+1, num_cands+1)
+            pwise_sims = pairwise_similarities(torch.cat((query_embedding.unsqueeze(0), doc_embeddings), dim=0)) # (num_cands+1, num_cands+1)
+            pwise_sims = normalize(pwise_sims, normalization) # (num_cands+1, num_cands+1)
             global pwise_times
             pwise_times.update(time.perf_counter() - start_time)
             
-            orig_scores[qid] = OrderedDict((str(docid), float(pwise_sims[0, 1 + i])) for i, docid in enumerate(doc_ids))
+            orig_scores[qid] = OrderedDict((docid, float(pwise_sims[0, 1 + i])) for i, docid in enumerate(doc_ids))
 
-            final_sims = recompute_similarities(pwise_sims, k=k, trust_factor=trust_factor, k_exp=k_exp,
-                                                weight_func=weight_func, weight_func_param=weight_func_param, 
-                                                orig_coef=orig_coef, device=self.device)[1:]  # (num_cands,)
+            jaccard_sims = compute_jaccard_similarities(pwise_sims, k=k, trust_factor=trust_factor, k_exp=k_exp,
+                                                        weight_func=weight_func, weight_func_param=weight_func_param, 
+                                                        device=self.device)  # (num_cands+1,) includes self-similarity at index 0
+            
+            # top_scores, top_indices = torch.topk(jaccard_sims[1:], max_candidates, largest=True, sorted=True)
+            # top_doc_ids = doc_ids[top_indices.cpu()]
+            # top_scores = top_scores.cpu().numpy()
+            
+            final_sims = combine_similarities(pwise_sims[0, :], jaccard_sims, orig_coef=orig_coef)[1:]  # (num_cands,) 
 
             # Final selection of top candidates
             start_time = time.perf_counter()
@@ -242,7 +250,7 @@ class ReciprocalNearestNeighbors(object):
             global top_results_times
             top_results_times.update(time.perf_counter() - start_time)
             
-            reranked_scores[qid] = OrderedDict((str(docid), float(top_scores[i])) for i, docid in enumerate(top_doc_ids))
+            reranked_scores[qid] = OrderedDict((docid, float(top_scores[i])) for i, docid in enumerate(top_doc_ids))
             
             global total_times
             total_times.update(time.perf_counter() - start_total)
