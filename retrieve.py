@@ -3,18 +3,13 @@ import sys
 import os
 import math
 import random
-import json
 import torch
 import logging
 import argparse
 import numpy as np
 from tqdm import tqdm
 from queue import PriorityQueue
-from collections import namedtuple, defaultdict, OrderedDict
-from transformers import BertTokenizer, BertConfig
-from torch.utils.data import DataLoader, Dataset
-from dataset import CollectionDataset, pack_tensor_2D, MSMARCODataset
-from utils import generate_rank, eval_results
+from collections import defaultdict, OrderedDict
 import logging
 import time
 
@@ -59,6 +54,7 @@ def print_memory_info(memmap, docs_per_chunk, device):
 
 
 def allrank(args):
+    """Retrieves from the entire collection as found in document embeddings memmap"""
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
     # assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))  # NOTE: valid only for MSMARCO
@@ -187,6 +183,7 @@ def allrank(args):
 
 
 def rerank3(args):
+    """Reranks existing candidates per query in a qID -> ranked cand. list memmap"""
     logger.info("Loading document embeddings memmap ...")
     doc_embedding_memmap, doc_id_memmap = get_embed_memmap(args.doc_embedding_dir, args.embedding_dim)
     # assert np.all(doc_id_memmap == list(range(len(doc_id_memmap))))  # only for MSMARCO

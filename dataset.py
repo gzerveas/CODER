@@ -280,7 +280,7 @@ def load_qrels(filepath, relevance_level=1, score_mapping=None):
         (after potential mapping)
     :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 1 -> 0.03)
     :return:
-        qid2relevance (dict): dictionary mapping from query_id (int) to relevant passages (dict {passageid : relevance})
+        qid2relevance (dict): dictionary mapping from query_id (int) to passages with g.t. relevance judgement (dict {passageid : relevance})
     """
     qid2relevance = defaultdict(dict)
     with open(filepath, 'r') as f:
