@@ -4,8 +4,11 @@ import optuna
 from optuna.samplers import TPESampler, GridSampler
 from optuna.pruners import MedianPruner
 
-from options import *
-from reciprocal_compute import recip_NN_rerank, run_parse_args, setup
+import reciprocal_compute
+from reciprocal_compute import recip_NN_rerank, extend_relevances
+import options
+import main
+import utils
 
 # Metric for hyperparam optimization.
 # Can be different from "key_metric" of main, which determines the set of "best_values" and saved checkpoints
@@ -13,10 +16,10 @@ OPTIM_METRIC = 'NDCG@10'
 NEG_METRICS = []
 
 
-def objective(trial):
+def recipNN_rerank_objective(trial):
     random.seed()  # re-randomize seed (it's fixed inside `main`), because it's needed for dir name suffix
-    args = run_parse_args()  # `argsparse` object
-    args = setup(args)
+    args = reciprocal_compute.run_parse_args()  # `argsparse` object
+    args = reciprocal_compute.setup(args)
     
 
     ## Optuna overrides
@@ -38,10 +41,53 @@ def objective(trial):
     return best_values[OPTIM_METRIC]
 
 
+def smooth_labels_objective(trial):
+    random.seed()  # re-randomize seed (it's fixed inside `main`), because it's needed for dir name suffix
+    # Setup label smoothing
+    args_rNN = reciprocal_compute.run_parse_args()  # `argsparse` object
+    args_rNN = reciprocal_compute.setup(args_rNN)
+    
+
+    # Optuna overrides
+    # args_rNN.sim_mixing_coef = trial.suggest_float('sim_mixing_coef', 1e-3, 1, log=True)
+    
+    args_rNN.rel_aggregation = trial.suggest_categorical("rel_aggregation", ['max', 'mean', 'sum'])
+    args_rNN.redistribute = trial.suggest_categorical("redistribute", ['fully', 'partially', 'radically'])
+    args_rNN.redistr_prt = trial.suggest_float("weight_func_param", 0.01, 0.8, log=False)
+
+    _ = extend_relevances(args_rNN, trial)  # run function to recompute relevance labels and store them as a file
+
+    # Run main function (and optionally, hyperparam optimization) for training
+    args = options.run_parse_args()  # `argsparse` object for training
+    args.target_labels = args_rNN.out_filepath  # the file used to store smoothened labels becoms the input labels file for training
+    
+    # Optuna overrides for main training
+    # config = utils.load_config(args)  # config dictionary, which potentially comes from a JSON file
+    # args = utils.dict2obj(config)  # convert back to args object
+    # args.config_filepath = None  # the contents of a JSON file (if specified) have been loaded already, so prevent the `main.setup` from overwriting the Optuna overrides
+    # args.some_training_param = trial.suggest_float("some_training_param", 0.01, 0.8, log=False)
+
+    config = main.setup(args)  # Setup main training session
+    best_values = main.main(config, trial)  # best metrics found during evaluation
+
+    for name, value in best_values.items():
+        trial.set_user_attr(name, value)  # log in database / study object
+
+    return best_values[OPTIM_METRIC]
+
+
 if __name__ == '__main__':
+    
+    task = 'rerank'  # 'smooth_labels'
+    if task == 'rerank':
+        study_name = 'recipNN_postprocess_reranking_study_normalization'  # This name is shared across jobs/processes
+        objective = recipNN_rerank_objective
+    elif task == 'smooth_labels':
+        study_name = 'recipNN_smooth_labels_study'  # This name is shared across jobs/processes
+        objective = recipNN_rerank_objective
 
     storage = 'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_TripClick_optuna.db'
-    study_name = 'recipNN_postprocess_reranking_study_normalization'  # This name is shared across jobs/processes
+    
     n_trials = 200
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())
     direction = 'minimize' if OPTIM_METRIC in NEG_METRICS else 'maximize'

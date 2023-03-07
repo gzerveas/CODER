@@ -661,7 +661,7 @@ def load_qrels(filepath, relevance_level=1, score_mapping=None):
         for line in f:
             try:
                 qid, _, pid, relevance = line.strip().split()
-                relevance = int(relevance)
+                relevance = float(relevance)
                 if (score_mapping is not None) and (relevance in score_mapping):
                     relevance = score_mapping[relevance]  # map score to new value
                 if relevance >= relevance_level:  # include only if score >= specified relevance level

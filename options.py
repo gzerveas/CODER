@@ -32,7 +32,7 @@ def run_parse_args():
                         help="'train' is used to train the model (and validate on a validation set specified by `eval_candidates_path`).\n"
                              "'dev' is used for evaluation when labels are available: this allows to calculate metrics, "
                              "plot histograms, inject ground truth relevant document in set of candidates to be reranked.\n"
-                             "'eval' mode is used for evaluation ONLY if NO labels are available.\n"
+                             "'eval' mode is used for evaluation/inference ONLY if NO labels are available.\n"
                              "'inspect' is used to interactively examine an existing ranked candidates file/memmap "
                              "specified by `eval_candidates_path`, together with "
                              "the respective original queries and documents, reconstructed tokenizations, embeddings, "
