@@ -1,6 +1,6 @@
 import math
 import logging
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Union
 
 import torch
 import numpy as np
@@ -216,8 +216,8 @@ class CrossAttentionScorer(Scorer):
             'tanh': (batch_size, num_cands) relevance scores in [-1, 1]
             'softmax': (batch_size, num_cands, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
         """
-        output_emb = self.activation_func(output_emb)  # TODO: test
-        query_emb = self.activation_func(query_emb)  # TODO: test
+        output_emb = self.activation_func(output_emb)  # NOTE: also test performance if omitted
+        query_emb = self.activation_func(query_emb)  # NOTE: also test performance if ommitted
         out = self.multihead_attn(output_emb, query_emb, query_emb, key_padding_mask=query_mask, need_weights=False)[0]
         out = out.permute(1, 0, 2)  # (batch_size, num_cands, d_model)
         return self.score_func(self.linear(out))
@@ -244,8 +244,11 @@ class DotProductScorer(Scorer):
     """
     Computes scores as a dot product between the aggregate (e.g. mean) query representation and each final document
     embedding.
+    # NOTE: Every additional computation/transformation performed here on the embeddings or scores 
+    # (e.g. normalization, temperature, pre-activation function) would have to be replicated 
+    # when using the model for dense retrieval, i.e. outside of reranking. However, linear transformations don't affect rankings.
     """
-    def __init__(self, scoring_mode='', pre_activation=None, normalize=False, aggregation='mean'):
+    def __init__(self, scoring_mode='', pre_activation=None, normalize=False, aggregation='mean', temperature: Union[str,float,None]=None):
         """
         :param scoring_mode: string, same as the option used to initialize `CODER`. At this point, the string
             must start with "doc_product" or "cosine", but the suffix can specify a (non)linear transformation to be used on scores
@@ -254,6 +257,9 @@ class DotProductScorer(Scorer):
         :param aggregation: defines how to aggregate final query token representations to obtain a single vector
             representation for the query. 'mean' will average, 'first' will simply select the first vector.
             'None' will not aggregate token representations
+        :param temperature: A float parameter by which to divide the final scores. This may allow better score calibration
+            and better match target score distribution within a KL-Divergence (Listnet) loss. If 'learnable', will be learned during training.
+            If 'learnable', it will be a parameter learned during training; otherwise, the specified value will be used.
         """
         super(DotProductScorer, self).__init__(d_model=1, scoring_mode=scoring_mode)
 
@@ -264,6 +270,14 @@ class DotProductScorer(Scorer):
 
         self.aggregation_func = get_aggregation_function(aggregation)
         self.normalize = normalize
+        
+        if temperature == 'learnable':
+            self.temperature = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=True)
+        elif temperature is not None and temperature > 0:
+            self.temperature = nn.Parameter(torch.full(1, temperature, dtype=torch.float32), requires_grad=False)
+        else:
+            self.temperature = None
+        return
 
     def forward(self, output_emb, query_emb, query_mask=None):
         """
@@ -274,8 +288,8 @@ class DotProductScorer(Scorer):
             if 'dot_product_softmax': (batch_size, num_cands, 2) 0-> relevance log-probability, 1-> non-relevance log-probability
         """
         if self.pre_activation_func is not None:
-            output_emb = self.pre_activation_func(output_emb)  # TODO: test
-            query_emb = self.pre_activation_func(query_emb)  # TODO: test
+            output_emb = self.pre_activation_func(output_emb)
+            query_emb = self.pre_activation_func(query_emb)
 
         output_emb = output_emb.permute(1, 0, 2)  # (batch_size, num_cands, d_model)
         query_emb = query_emb.permute(1, 0, 2)  # (batch_size, query_len, d_model)
@@ -287,6 +301,9 @@ class DotProductScorer(Scorer):
             # scores = torch.matmul(output_emb, avg_query_emb[:, :, None])  # (batch_size, num_cands, 1) when using self.score_func for re-scaling
             # scores = self.score_func(self.linear(scores))
             scores = torch.matmul(output_emb, agg_query_emb[:, :, None]).squeeze()  # to disable scaling
+            
+        if self.temperature:
+            scores = scores / self.temperature
 
         return scores
 
@@ -297,8 +314,8 @@ class BaseLoss(nn.Module):
         """
         :param formatting: 'indices' or 'scores'.
             If 'scores', assumes that `labels` have the same formatting as `predictions`:
-                each position is a relevance score, -Inf for non-relevant and padding, e.g. [2 1 1 -Inf ... -Inf]
-            If 'indices', assumes range(num_relevant) integer indices of relevant documents and is padded with -1,
+                each position is a relevance score, -Inf for non-relevant and padding, e.g. [2.0 1.0 1.0 -Inf ... -Inf]
+            If 'indices', assumes num_relevant integer indices of relevant documents and is padded with -1,
                 e.g. [0, 1, 2, -1, ..., -1]
         """
         super(BaseLoss, self).__init__()
@@ -338,7 +355,7 @@ class MaxMarginLoss(BaseLoss):
 
 class RelevanceCrossEntropyLoss(BaseLoss):
     """
-    Special cross-entropy loss
+    Special cross-entropy loss: num_candidates separate binary classification loss terms
     """
 
     def forward(self, predictions, labels, padding_mask=None):
@@ -370,6 +387,7 @@ class RelevanceCrossEntropyLoss(BaseLoss):
         return loss
 
 
+# TODO: implement a learnable Temperature parameter
 class RelevanceListnetLoss(BaseLoss):
     """
     KL-divergence loss
@@ -553,6 +571,10 @@ class MultiTierLoss(BaseLoss):
 
 
 def get_loss_module(loss_type, args):
+    """
+    Initializes the appropriate loss module based on `args` object.
+    Some loss modules support more than one formatting types, but here the most appropriate one is enforced.
+    """
 
     if loss_type == 'multilabelmargin':
         return MaxMarginLoss(formatting='indices')
@@ -771,7 +793,7 @@ class CODER(nn.Module):
                  num_decoder_layers: int = 6, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: str = "relu", normalization: str = "LayerNorm", positional_encoding=None,
                  doc_emb_dim: int = None,
-                 scoring_mode='cross_attention', query_emb_aggregation='mean',
+                 scoring_mode='cross_attention', query_emb_aggregation='mean', temperature: Union[float,str,None]=None,
                  loss_module=None, aux_loss_module=None, aux_loss_coeff=0,
                  selfatten_mode=0, no_decoder=False, no_dec_crossatten=False, transform_doc_emb=False,
                  bias_regul_coeff=0.0, bias_regul_cutoff=100) -> None:
@@ -794,6 +816,8 @@ class CODER(nn.Module):
         :param doc_emb_dim: the expected document vector dimension. If None, it will be assumed to be d_model
         :param scoring_mode: Scoring function to map the final embeddings to scores: 'dot_product', 'sigmoid', 'cross_attention', ...
         :param query_emb_aggregation: how to aggregate individual token embeddings into a query embedding: 'first' or 'mean'
+        :param temperature: parameter by which to divide the final scores. This may allow better score calibration
+            and better match target score distribution within a KL-Divergence (Listnet) loss
         :param loss_module: nn.Module to be used to compute the loss, when given a tensor of scores and a tensor of labels
         :param aux_loss_module: loss module to be used for the optional auxiliary loss component
         :param aux_loss_coeff: coefficient to weigh the contribution of the auxiliary loss to the total loss
@@ -870,7 +894,7 @@ class CODER(nn.Module):
                            "of dimension {} to match!".format(self.d_model, self.doc_emb_dim))
 
         self.scoring_mode = scoring_mode
-        self.score_cands = self.get_scoring_module(scoring_mode, query_emb_aggregation)
+        self.score_cands = self.get_scoring_module(scoring_mode, query_emb_aggregation, temperature)
 
         self.loss_module = loss_module
         self.aux_loss_module = aux_loss_module
@@ -879,7 +903,7 @@ class CODER(nn.Module):
         self.bias_regul_coeff = bias_regul_coeff
         self.bias_regul_cutoff = bias_regul_cutoff
 
-    def get_scoring_module(self, scoring_mode, query_emb_aggregation):
+    def get_scoring_module(self, scoring_mode, query_emb_aggregation, temperature):
 
         if scoring_mode.startswith('cross_attention'):
             return CrossAttentionScorer(self.d_model, scoring_mode)
@@ -888,7 +912,7 @@ class CODER(nn.Module):
                 pre_activation_func = 'gelu'
             else:
                 pre_activation_func = None
-            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func, aggregation=query_emb_aggregation)
+            return DotProductScorer(scoring_mode=scoring_mode, pre_activation=pre_activation_func, aggregation=query_emb_aggregation, temperature=temperature)
         elif scoring_mode.startswith('cosine'):
             if 'gelu' in scoring_mode:
                 pre_activation_func = 'gelu'
@@ -919,9 +943,16 @@ class CODER(nn.Module):
                     This is for causality, and if FloatTensor, can be directly added on top of the attention matrix.
                     If BoolTensor, positions with ``True`` are ignored, while ``False`` values will be considered.
         :param  doc_neutscore: (batch_size, num_docs) sequence of document neutrality scores to calculate fairness.
-        :param  labels: (batch_size, num_docs) int tensor which for each query (row) contains the indices of the
+        :param  labels: (batch_size, num_docs) optional tensor, if provided, the loss will be computed. 
+            Depends on `self.loss_module.formatting`: 'indices' or 'scores'.
+            If 'scores', it is a float tensor with the same formatting as predictions: for each row, each position 
+                is a relevance score, with -Inf for non-relevant and padding, e.g. [2.0 1.0 1.0 -Inf ... -Inf].
+            If 'indices', int tensor which for each query (row) contains the range(num_relevant) integer indices of the
+                relevant documents within its corresponding pool of candidates (docinds), and is padded with -1,
+                e.g. [0, 1, 2, -1, ..., -1]. 
+        (batch_size, num_docs) int tensor which for each query (row) contains the indices of the
                 relevant documents within its corresponding pool of candidates (docinds).
-                    Optional: If provided, the loss will be computed.
+                    
 
         :returns:
             dict containing:
@@ -965,7 +996,7 @@ class CODER(nn.Module):
         predictions = self.score_cands(output_emb, enc_hidden_states, memory_key_padding_mask)  # relevance scores. dimensions vary depending on scoring_mode
         
         if self.scoring_mode.endswith('softmax'):
-            rel_scores = torch.exp(predictions[:, :, 0])  # (batch_size, num_docs) relevance scores
+            rel_scores = torch.exp(predictions[:, :, 0])  # (batch_size, num_docs) scores for "relevant" class (binary classification)
         else:
             rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores
             

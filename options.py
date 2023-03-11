@@ -47,6 +47,9 @@ def run_parse_args():
                         help='Root output directory. Must exist. Time-stamped directories will be created inside.')
     parser.add_argument("--qrels_path", type=str,
                         help="Path of the text file or directory with the ground truth relevance labels, qrels")
+    parser.add_argument("--target_scores_path", type=str, 
+                        help="Optional: Path to a text file containing relevance scores which will be used as training labels "
+                             "instead of qrels, which will be used only for evaluation.")
     parser.add_argument("--train_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv",
                         help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini."
                              " If not provided, candidates will be sampled at random from the entire collection.")
@@ -254,6 +257,8 @@ def run_parse_args():
                                  'dot_product', 'dot_product_gelu', 'dot_product_softmax',
                                  'cosine', 'cosine_gelu', 'cosine_softmax'},
                         default='raw', help='Scoring function to map the final embeddings to scores')
+    parser.add_argument('--temperature', default=None,
+                        help="A float parameter by which to divide the final scores. If set to 'learnable', will be learned during training.")
     parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier'},
                         default='multilabelmargin', help='Loss applied to document scores')
     parser.add_argument('--aux_loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier', None},

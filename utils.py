@@ -43,18 +43,19 @@ def rank_docs(docids, scores, shuffle=True):
     return docids, actual_scores
 
 
-def get_relevances(gt_relevant, candidates, max_docs=None):
+def get_relevances(gt_relevant, candidates, max_docs=None, relevant_at_level=1):
     """Can handle multiple levels of relevance, including explicitly or implicitly 0 scores.
     Args:
         gt_relevant: for a given query, it's a dict mapping from ground-truth relevant candidate ID to level of relevance
         candidates: list of candidate pids
         max_docs: consider only the first this many documents
+        relevant_at_level: any relevance lower than this threshold will be set to 0. This is for calculating binary metrics such as MRR.
     Returns: list of length min(max_docs, len(pred)) with non-zero relevance scores at the indices corresponding to passages in `gt_relevant`
         e.g. [0 2 1 0 0 1 0]
     """
     if max_docs is None:
         max_docs = len(candidates)
-    return [gt_relevant[candid] if candid in gt_relevant else 0 for candid in candidates[:max_docs]]
+    return [gt_relevant[candid] if (candid in gt_relevant) and gt_relevant[candid] >= relevant_at_level else 0 for candid in candidates[:max_docs]]
 
 
 def calculate_metrics(relevances, num_relevant, k):
@@ -643,7 +644,7 @@ class Timer(object):
             return None
 
 
-def load_qrels(filepath, relevance_level=1, score_mapping=None):
+def load_qrels(filepath, relevance_level=1, score_mapping=None, rel_type='int'):
     """Load ground truth relevant passages from file. Can handle several levels of relevance.
     Assumes that if a passage is not listed for a query, it is non-relevant.
     :param filepath: path to file of ground truth relevant passages in the following format:
@@ -656,12 +657,20 @@ def load_qrels(filepath, relevance_level=1, score_mapping=None):
     :return:
         qid2relevance (dict): dictionary mapping from query_id to relevant passages (dict {passageid : relevance})
     """
+    
+    if rel_type == 'int':
+        typefunc = builtins.int
+    elif rel_type == 'float':
+        typefunc = builtins.float
+    else:
+        raise ValueError(f"Unknown rel_type {rel_type}")
+    
     qid2relevance = defaultdict(dict)
     with open(filepath, 'r') as f:
         for line in f:
             try:
                 qid, _, pid, relevance = line.strip().split()
-                relevance = float(relevance)
+                relevance = typefunc(relevance)
                 if (score_mapping is not None) and (relevance in score_mapping):
                     relevance = score_mapping[relevance]  # map score to new value
                 if relevance >= relevance_level:  # include only if score >= specified relevance level

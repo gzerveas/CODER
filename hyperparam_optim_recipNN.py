@@ -51,15 +51,17 @@ def smooth_labels_objective(trial):
     # Optuna overrides
     # args_rNN.sim_mixing_coef = trial.suggest_float('sim_mixing_coef', 1e-3, 1, log=True)
     
-    args_rNN.rel_aggregation = trial.suggest_categorical("rel_aggregation", ['max', 'mean', 'sum'])
+    args_rNN.rel_aggregation = trial.suggest_categorical("rel_aggregation", ['max', 'mean'])
     args_rNN.redistribute = trial.suggest_categorical("redistribute", ['fully', 'partially', 'radically'])
-    args_rNN.redistr_prt = trial.suggest_float("weight_func_param", 0.01, 0.8, log=False)
+    args_rNN.norm_relevances = trial.suggest_categorical("norm_relevances", ['max', 'minmax', 'None', 'std'])
+    args_rNN.boost_factor = trial.suggest_float("boost_factor", 1.00, 10.0, log=False)
+    # args_rNN.redistr_prt = trial.suggest_float("redistr_prt", 0.01, 0.8, log=False)
 
     _ = extend_relevances(args_rNN, trial)  # run function to recompute relevance labels and store them as a file
 
     # Run main function (and optionally, hyperparam optimization) for training
     args = options.run_parse_args()  # `argsparse` object for training
-    args.target_labels = args_rNN.out_filepath  # the file used to store smoothened labels becoms the input labels file for training
+    args.target_scores_path = args_rNN.out_filepath  # the file used to store smoothened labels becoms the input labels file for training
     
     # Optuna overrides for main training
     # config = utils.load_config(args)  # config dictionary, which potentially comes from a JSON file

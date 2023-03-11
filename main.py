@@ -40,7 +40,7 @@ val_times = utils.Timer()  # stores measured validation times
 
 STEP_THRESHOLD = 0  #4000 # Used for fairness regularization; checkpoints corresponding to best performance before STEP_THRESHOLD steps will be ignored
 
-
+# TODO: here and in evaluation, options add the target_scores, and make sure label_format == 'scores'
 def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=None):
     """
     Prepare training dataset, train the model and handle results.
@@ -54,15 +54,14 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     logger.info("Preparing {} dataset ...".format('train'))
     start_time = time.time()
     train_dataset = MYMARCO_Dataset('train', args.embedding_memmap_dir, args.tokenized_path, args.train_candidates_path,
-                                    qrels_path=args.qrels_path, tokenizer=tokenizer,
-                                    max_query_length=args.max_query_length, num_candidates=args.num_candidates,
-                                    limit_size=args.train_limit_size,
+                                    qrels_path=args.qrels_path, target_scores_path=args.target_scores_path, query_ids_path=args.train_query_ids,
+                                    tokenizer=tokenizer, max_query_length=args.max_query_length,
+                                    num_candidates=args.num_candidates, limit_size=args.train_limit_size,
                                     load_collection_to_memory=args.load_collection_to_memory,
                                     emb_collection=val_dataloader.dataset.emb_collection,
                                     relevance_labels_mapping=args.relevance_labels_mapping,
                                     include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level,
-                                    collection_neutrality_path=args.collection_neutrality_path,
-                                    query_ids_path=args.train_query_ids)
+                                    collection_neutrality_path=args.collection_neutrality_path)
     collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu,
                                                 label_format=model.loss_module.formatting)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
@@ -212,6 +211,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         tb_writer.add_scalar('learn_rate{}'.format(s), scheduler.get_last_lr()[s][0], global_step)
                     cur_loss = (train_loss - logging_loss) / args.logging_steps  # mean loss over last args.logging_steps (smoothened "current loss")
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
+                    if model.score_cands.temperature is not None:
+                        tb_writer.add_scalar('train/temperature', model.score_cands.temperature, global_step) 
 
                     if args.debug:
                         logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
@@ -410,7 +411,7 @@ def evaluate(args, model, dataloader, fairrmetric=None):
                                           index=[qids[i]] * len(docids[i])) for i in range(len(qids)))
 
             if labels_exist:
-                relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i]) for i in range(len(qids)))
+                relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i], relevant_at_level=dataloader.dataset.relevant_at_level) for i in range(len(qids)))
                 # number of g.t. positives in entire dataset for each query
                 num_relevant.extend(len([candid for candid in qrels[qid]
                                          if qrels[qid][candid] >= dataloader.dataset.relevant_at_level]) for qid in qids)
@@ -688,15 +689,14 @@ def get_dataset(args, eval_mode, tokenizer):
                               args.max_query_length, args.max_doc_length, limit_size=args.eval_limit_size)
     else:
         return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.eval_query_tokens_path,
-                               args.eval_candidates_path, qrels_path=args.qrels_path, tokenizer=tokenizer,
-                               max_query_length=args.max_query_length,
+                               args.eval_candidates_path, qrels_path=args.qrels_path, query_ids_path=args.eval_query_ids,
+                               tokenizer=tokenizer, max_query_length=args.max_query_length,
                                num_candidates=None,  # Always use ALL candidates for evaluation
                                limit_size=args.eval_limit_size,
                                load_collection_to_memory=args.load_collection_to_memory,
                                inject_ground_truth=args.inject_ground_truth,
                                relevance_labels_mapping=args.relevance_labels_mapping,
-                               include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level,
-                               query_ids_path=args.eval_query_ids)
+                               include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level)
 
 
 def get_query_encoder(query_encoder_from, query_encoder_config):
@@ -734,6 +734,7 @@ def get_model(args, doc_emb_dim=None):
                      normalization=args.normalization_layer,
                      doc_emb_dim=doc_emb_dim,
                      scoring_mode=args.scoring_mode,
+                     temperature=args.temperature,
                      query_emb_aggregation=args.query_aggregation,
                      loss_module=loss_module,
                      aux_loss_module=aux_loss_module,

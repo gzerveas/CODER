@@ -7,6 +7,7 @@ from itertools import chain
 from operator import itemgetter
 import time
 import sys
+import pickle
 
 import numpy as np
 from tqdm import tqdm
@@ -269,14 +270,14 @@ def load_querydoc_pairs(msmarco_dir, mode):
     return qids, pids, labels, qrels
 
 
-def load_qrels(filepath, relevance_level=1, score_mapping=None):
+def load_qrels(filepath, relevance_thr=1, score_mapping=None):
     """Load ground truth relevant passages from file. Can handle several levels of relevance.
     Assumes that if a passage is not listed for a query, it is non-relevant.
     :param filepath: path to file of ground truth relevant passages in the following format:
         "qID1 \t Q0 \t pID1 \t 2\n
          qID1 \t Q0 \t pID2 \t 0\n
          qID1 \t Q0 \t pID3 \t 1\n..."
-    :param relevance_level: only include candidates which have at least the specified relevance score
+    :param relevance_thr: only include candidates which have at least the specified relevance threshold score
         (after potential mapping)
     :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 1 -> 0.03)
     :return:
@@ -290,7 +291,7 @@ def load_qrels(filepath, relevance_level=1, score_mapping=None):
                 relevance = float(relevance)
                 if (score_mapping is not None) and (relevance in score_mapping):
                     relevance = score_mapping[relevance]  # map score to new value
-                if relevance >= relevance_level:  # include only if score >= specified relevance level
+                if relevance >= relevance_thr:  # include only if score >= specified relevance threshold level
                     qid2relevance[int(qid)][int(pid)] = relevance
             except Exception as x:
                 print(x)
@@ -336,11 +337,12 @@ class MYMARCO_Dataset(Dataset):
         4. qrels file of ground truth relevant passages (if used for training or validation)
     """
     def __init__(self, mode,
-                 embedding_memmap_dir, queries_tokenids_path, candidates_path=None, qrels_path=None, query_ids_path=None,
+                 embedding_memmap_dir, queries_tokenids_path, candidates_path=None, 
+                 qrels_path=None, target_scores_path=None, query_ids_path=None,
                  tokenizer=None, max_query_length=64,
                  num_candidates=None, candidate_sampling=None, dynamic_candidates=None,
                  limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False,
-                 relevance_labels_mapping=None, include_at_level=1, relevant_at_level=1, num_inject_relevant=1000,
+                 relevance_labels_mapping=None, include_at_level=1, relevant_at_level=1, max_inj_relevant=1000,
                  collection_neutrality_path=None):
         """
         :param mode: 'train', 'dev' or 'eval'
@@ -351,10 +353,13 @@ class MYMARCO_Dataset(Dataset):
             corresponding query IDs, and the number of candidates per query in two more memmpap files
         :param qrels_path: dir or path to file of ground truth relevant passages in the following format:
             "qID1 \t Q0 \t pID1 \t 1\n qID1 \t Q0 \t pID2 \t 1\n ..."
+        :param target_scores_path: Optional. Path to a file containing relevance scores which will be used as training labels
+            (instead of qrels, which will be used only for evaluation).
+        :param query_ids_path: Optional. Path to a file containing a subset of externally provided query IDs to be used in dataset.
         :param tokenizer: HuggingFace Tokenizer object. Must be the same as the one used for pre-tokenizing queries.
         :param max_query_length: max. number of query tokens, excluding special tokens
         :param num_candidates: number of document IDs to sample from all document IDs corresponding to a query and found
-            in `candidates_path` file. If None, all found document IDs will be used
+            in `candidates_path` file. If None, all found document IDs will be used.
         :param candidate_sampling: method to use for sampling candidates. If None, the top `num_candidates` will be used
         :param limit_size: If set, limit dataset size to a smaller subset, e.g. for debugging. If in [0,1], it will
             be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
@@ -432,7 +437,7 @@ class MYMARCO_Dataset(Dataset):
                 qrels_path = os.path.join(qrels_path, "qrels.{}.tsv".format(mode))
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
             # relevance level for qrels can be different from the one used for injection (and metrics evaluation)
-            self.qrels = load_qrels(qrels_path, relevance_level=include_at_level, score_mapping=relevance_labels_mapping)  # dict{qID: dict{pID: relevance}}
+            self.qrels = load_qrels(qrels_path, relevance_thr=include_at_level, score_mapping=relevance_labels_mapping)  # dict{qID: dict{pID: relevance}}
             extra_qids = set(self.qids) - set(self.qrels.keys())
             if len(extra_qids) > 0:  # fail early if there are missing labels
                 err_str = "{} query IDs in the specified '{}' dataset do not exist in '{}'!".format(len(extra_qids), mode, qrels_path)
@@ -442,9 +447,20 @@ class MYMARCO_Dataset(Dataset):
         else:
             self.qrels = None
 
+        if target_scores_path is not None:
+            if self.mode != 'train':
+                raise ValueError("Continuous target scores are not supposed to used for evaluation, only for training")
+            if target_scores_path.endswith('.pickle'):
+                with open(target_scores_path, 'rb') as f:
+                    self.target_sores = pickle.load(f)  # dict{qID: dict{pID: relevance}} continuous (float) label scores used for training
+            else:
+                self.target_scores = load_qrels(target_scores_path, relevance_thr=include_at_level)
+        else:
+            self.target_scores = None
+
         self.include_at_level = include_at_level
         self.relevant_at_level = relevant_at_level
-        self.num_inject_relevant = num_inject_relevant
+        self.max_inj_relevant = max_inj_relevant  # limits the number of documents considered "relevant" that will be injected (e.g. to leave space for dynamic negatives)
 
 
         self.tokenizer = tokenizer
@@ -518,11 +534,11 @@ class MYMARCO_Dataset(Dataset):
         query_token_ids = query_token_ids[:self.max_query_length]
         query_token_ids = [self.cls_id] + query_token_ids + [self.sep_id]
 
-        if not self.dynamic_canidates:
+        if not self.dynamic_candidates:
             tic = time.perf_counter()
             if self.candidates is not None:  # typical case
                 doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of estimated relevance
-                doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
+                doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids. Enforces maximum self.num_candidates
             else:  # if no candidates are provided, randomly samples from entire collection
                 # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
                 # Sampling time does not depend on the number of sampled values; only on the size of the population set!
@@ -533,18 +549,22 @@ class MYMARCO_Dataset(Dataset):
                 else:  # x2 faster than if replace=False
                     doc_ids = list(set(np.random.choice(self.emb_collection.ids, size=(self.num_candidates+num_safety_docs), replace=True)))
             retrieve_candidates_times.update(time.perf_counter() - tic)
-        else:  # will be retrieved per-batch for efficiency
+        else:  # will be retrieved per-batch for efficiency (in collate_fn)
             doc_ids = []
 
         if self.mode == "train" or self.inject_ground_truth:
+            if self.target_scores is not None:
+                label_source = self.target_scores
+            else:
+                label_source = self.qrels
             # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
             # while ensuring that they are only included once.
-            # num_candidates = len(doc_ids)  # enforce fixed number of candidates, regardless of g.t. relevant or static candidates
-            rel_cands, rel_scores = zip(*[(docid, score) for docid, score in
-                                          sorted(self.qrels[qid].items(), key=itemgetter(1), reverse=True) if
-                                          score >= self.include_at_level])  # relevant_at_level can be chosen to be different from qrels
-            rel_cands = list(rel_cands[:self.num_inject_relevant])
-            rel_scores = list(rel_scores[:self.num_inject_relevant])
+            # because of sorting, g.t. positives may be excluded when target_scores are provided, if their score is not high enough to receive a rank < max_inj_relevant
+            # rel_cands, rel_scores = zip(*[(docid, score) for docid, score in sorted(label_source[qid].items(), key=itemgetter(1), reverse=True) if score >= self.include_at_level])
+            rel_cands, rel_scores = zip(*[sorted(((docid, score) for docid, score in label_source[qid].items() if score >= self.include_at_level), key=itemgetter(1), reverse=True)])
+            # We can limit the number of injected documents from the label source, to allow space for negatives (e.g. dynamic)
+            rel_cands = list(rel_cands[:self.max_inj_relevant])
+            rel_scores = list(rel_scores[:self.max_inj_relevant])
 
             # also covers case of dynamic candidates, in which initially doc_ids = [] and then doc_ids = rel_cands
             new_cand_ids = (rel_cands + [candid for candid in doc_ids if candid not in set(rel_cands)])
@@ -579,9 +599,9 @@ class MYMARCO_Dataset(Dataset):
             `num_candidates` will be reduced accordingly, if necessary.
         :param n_gpu: number of GPUs used for data parallelism
         :param label_format: 'indices' or 'scores'.
-            If 'scores', assumes that `labels` have the same formatting as `predictions`:
-                each position is a relevance score, -Inf for non-relevant and padding, e.g. [2 1 1 -Inf ... -Inf]
-            If 'indices', assumes range(num_relevant) integer indices of relevant documents and is padded with -1,
+            If 'scores', `labels` have the same formatting as `predictions`:
+                each position is a relevance score, -Inf for non-relevant and padding, e.g. [2.0 1.0 1.0 -Inf ... -Inf]
+            If 'indices', labels are num_relevant integer indices of relevant documents and padded with -1,
                 e.g. [0, 1, 2, -1, ..., -1]. Used with MaxMargin loss
         :param relevant_at_level: relevance level to be considered relevant in labels (will use init default if None).
             When `label_format` is 'indices', a candidate with a qrels score >= this level is considered relevant,
@@ -655,9 +675,9 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
     :param max_candidates: maximum number of candidates per query to be scored by the model (capacity of model)
     :param n_gpu: number of GPUs used for data parallelism
     :param label_format: 'indices' or 'scores'.
-              If 'scores', assumes that `labels` have the same formatting as `predictions`:
-                  each position is a relevance score, -Inf for non-relevant and padding, e.g. [2 1 1 -Inf ... -Inf]
-              If 'indices', assumes range(num_relevant) integer indices of relevant documents and is padded with -1,
+              If 'scores', returned rows of `labels` have the same formatting as `predictions`:
+                  each position is a relevance score, -Inf for non-relevant and padding, e.g. [2.0 1.0 1.0 -Inf ... -Inf]
+              If 'indices', each row of `labels` is num_relevant integer indices of relevant documents and is padded with -1,
                   e.g. [0, 1, 2, -1, ..., -1]. Used with MaxMargin loss
     :param relevant_at_level: relevance level to be considered relevant in labels.
         When `label_format` is 'indices', a candidate with a qrels score >= this level is considered relevant,
@@ -685,7 +705,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
                 to the pool of candidates for each query
 
             If mode != 'eval', additionally contains:
-            labels: (batch_size, max_cands_per_query) tensor of labels, th format of which depends on `label_format`
+            labels: (batch_size, max_cands_per_query) tensor of labels, the format of which depends on `label_format`
     """
     start_collation_time = time.perf_counter()
     batch_size = len(batch_samples)
@@ -699,7 +719,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
     data = {"query_token_ids": pack_tensor_2D(query_token_ids, default=pad_token_id, length=max_query_length, dtype=torch.int32),
             "query_mask": pack_tensor_2D(query_masks, default=0, length=max_query_length, dtype=torch.bool)}
 
-    if num_random_neg:  # only in 'train' mode
+    if num_random_neg:  # only in 'train' mode. Will include *random* (i.e. not retrieved) negatives
         # In this case, the doc embeddings are not packed here, but inside the model (on the GPU), in order
         # to avoid transferring replicas of document embeddings corresponding to in-batch negatives and thus spare GPU mem. bandwidth.
         # For this purpose, we pass a smaller local doc embedding matrix containing emb. vectors of all documents
@@ -748,7 +768,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
 
     max_cands_per_query = min(max_candidates, max(len(cands) for cands in doc_ids))  # length used for padding
 
-    if num_random_neg == 0:
+    if num_random_neg == 0: # Will only use retrieved candidates (either as negatives or for evaluation)
         # Pack 3D tensors: candidate embeddings and corresponding padding mask
         # Tensors are padded NOT to a standard length (transformer input length), but to the max_len in the batch
         data['doc_emb'], data['doc_padding_mask'] = pack_candidate_embeddings(doc_ids, emb_collection, batch_size, max_cands_per_query)
@@ -762,7 +782,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
             labels = pack_tensor_2D(rel_scores, default=float('-inf'), dtype=torch.float32, length=max_cands_per_query)
             labels[labels < relevant_at_level] = float('-inf')
             data['labels'] = labels
-        else:
+        else:  # 'indices'
             if qrels is None:
                 # faster variant (shortcut)
                 # valid when: (mode == "train" or inject_ground_truth) AND (relevant_at_level == include_at_level)
@@ -811,7 +831,7 @@ def prepare_ind_labels(qids, doc_ids, qrels, relevance_level=1):
     Prepare relevance labels for `label_format` == 'indices' (used for max margin losses).
     This is necessary when mode == 'dev' and not `inject_ground_truth` - otherwise:
         labels = [list(range(len(rd))) for rd in rel_scores]
-    :return: list, each item is a list of index locations within doc_ids corresponding to g.t. relevant candidates
+    :return: list, each item is a list of index locations (not necessarily sorted!) within doc_ids corresponding to g.t. relevant candidates.
     """
     labels = []
     for i in range(len(qids)):
@@ -889,7 +909,7 @@ def pack_candidate_embeddings(cand_ids, emb_collection, batch_size, max_len):
 #     return doc_emb_tensor, doc_emb_mask
 
 
-# TODO: only used by RepBERT! (consider removing)
+# NOTE: only used by RepBERT! (consider removing)
 class MSMARCODataset(Dataset):
     def __init__(self, mode, msmarco_dir,
                  collection_memmap_dir, queries_tokenids_path,
@@ -929,7 +949,7 @@ class MSMARCODataset(Dataset):
                 # self.candidates.get_qid_to_ind_mapping(self.qids)
         return
 
-    def get_collate_function(self, n_gpu=1):  # TODO n_gpu is not handled in the function
+    def get_collate_function(self, n_gpu=1):  # WARNING: n_gpu is not handled in the function! (must be updated for n_gpu>1)
         def collate_function(batch):
             input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]
             token_type_ids_lst = [[0] * len(x["query_input_ids"]) + [1] * len(x["doc_input_ids"]) for x in batch]

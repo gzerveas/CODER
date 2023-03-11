@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 import argparse
 import json
+import pickle
 
 import torch
 import numpy as np
@@ -92,7 +93,7 @@ class ReciprocalNearestNeighbors(object):
     
     def __init__(self, query_embedding_dir, doc_embedding_dir, embedding_dim, candidates_path, 
                  qrels_path=None, query_ids_path=None, 
-                 compute_only_for_qrels=True, inject_ground_truth=False, relevance_thr=1.0,
+                 compute_only_for_qrels=True, inject_ground_truth=False, relevance_thr=1.0, rel_type='int',
                  device='cpu', save_memory=False) -> None:
         """
         :param query_embedding_dir: _description_
@@ -104,6 +105,7 @@ class ReciprocalNearestNeighbors(object):
         :param compute_only_for_qrels: _description_, defaults to True
         :param inject_ground_truth: _description_, defaults to False
         :param relevance_thr: _description_, defaults to 1.0
+        :param rel_type: str, data type of relevance scores (int or float). Unfortunately, int is *required* by pytrec_eval
         :param device: PyTorch device to run the computation. By default CPU.
         :param save_memory: _description_, defaults to False
         """
@@ -121,6 +123,7 @@ class ReciprocalNearestNeighbors(object):
         self.embedding_dim = embedding_dim
         self.inject_ground_truth = inject_ground_truth
         self.relevance_thr = relevance_thr
+        self.rel_type = rel_type
         
         self.load_from_files()
             
@@ -155,12 +158,12 @@ class ReciprocalNearestNeighbors(object):
             
         logger.info("Loading candidate documents per query from: '{}'".format(self.candidates_path))
         self.qid_to_candidate_passages = load_ranked_candidates(self.candidates_path, qid_set=self.query_ids)
-        self.query_ids = self.qid_to_candidate_passages.keys()
+        self.query_ids = self.qid_to_candidate_passages.keys() # potentially a subset of `qid_set`, in case some queries don't exist in file `self.candidates_path`
         logger.info("{} queries found".format(len(self.query_ids)))
 
         if self.qrels_path:
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(self.qrels_path))
-            self.qrels = utils.load_qrels(self.qrels_path, relevance_level=self.relevance_thr, score_mapping=None)  # dict: {qID: {passageid: g.t. relevance}}
+            self.qrels = utils.load_qrels(self.qrels_path, relevance_level=self.relevance_thr, score_mapping=None, rel_type=self.rel_type)  # dict: {qID: {passageid: g.t. relevance}}
             
             if self.compute_only_for_qrels:
                 intersection = self.query_ids & self.qrels.keys()
@@ -171,10 +174,7 @@ class ReciprocalNearestNeighbors(object):
                     self.query_ids = intersection
         else:
             self.qrels = None
-
-
             
-        
         logger.info("Total queries to evaluate: {}".format(len(self.query_ids)))
         
         return
@@ -285,7 +285,7 @@ class ReciprocalNearestNeighbors(object):
     # TODO: consider whether similarities with respect to the query should also be taken into account when building new labels
     def compute_smooth_labels(self, query_ids, hit=1000, 
                               normalization='None', k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3,
-                              rel_aggregation='mean', redistribute='fully', redistr_prt=0.2):
+                              rel_aggregation='mean', redistribute='fully', redistr_prt=0.2, norm_relevances='None', boost_factor=1.0):
         """
         Extends existing ground-truth relevant judgements by using  *within the context of the query* each g.t. relevant document
         as a probe to find its reciprocal nearest neighbors and compute its similarity to those as a combination between 
@@ -329,6 +329,8 @@ class ReciprocalNearestNeighbors(object):
         :param redistr_prt: float in [0, 1], the max. proportion of original label weight that may be redistributed among candidates based on
                                          their computed similarities w.r.t. the original ground-truth documents.
                                          Ignored when `redistribute == 'radically'`.
+        :param norm_relevances: str, how to normalize the final relevance scores. Options: 'None', 'max', 'maxmin', 'std'.
+        :param boost_factor: float, the final relevances of the original g.t. positives will be multiplied by this factor.
         :return smooth_labels: recomputed labels dict: {qID: dict{passageid: relevance}}
         """
         
@@ -350,7 +352,8 @@ class ReciprocalNearestNeighbors(object):
             final_sims = combine_similarities(pwise_sims[relevant_inds, :], jaccard_sims, orig_coef=orig_coef)  # (num_relevant, num_cands+1) 
             
             orig_relevances = torch.tensor(list(self.qrels[qid].values()), dtype=torch.float32)  # (num_relevant,) g.t. relevance score for each g.t. relevant document
-            new_relevances = self.recompute_relevances(final_sims, orig_relevances, rel_aggregation, redistribute, redistr_prt).cpu().numpy()  # (num_cands,) recomputed relevances
+            new_relevances = self.recompute_relevances(final_sims, orig_relevances, 
+                                                       rel_aggregation, redistribute, redistr_prt, norm_relevances, boost_factor).cpu().numpy()  # (num_cands,) recomputed relevances
             
             smooth_labels[qid] = dict((docid, float(new_relevances[i])) for i, docid in enumerate(doc_ids))
             
@@ -360,7 +363,7 @@ class ReciprocalNearestNeighbors(object):
         return smooth_labels
 
     # TODO: consider whether similarities with respect to the query should also be taken into account when building new labels
-    def recompute_relevances(self, similarities, orig_relevances, rel_aggregation='mean', redistribute='fully', redistr_prt=0.2):
+    def recompute_relevances(self, similarities, orig_relevances, rel_aggregation='mean', redistribute='fully', redistr_prt=0.2, normalize='None', boost_factor=1.0):
         """
         Ground-truth relevant judgements are recomputed for a single query on the basis of the similarity of each candidate 
         *within the context of the query* to each g.t. relevant document. The provided similarity vectors
@@ -392,6 +395,8 @@ class ReciprocalNearestNeighbors(object):
         :param redistr_prt: float in [0, 1], the max. proportion of original label weight that may be redistributed among candidates based on
                                          their computed similarities w.r.t. the original ground-truth documents.
                                          Ignored when `redistribute == 'radically'`.
+        :param normalize: str, how to normalize the final relevance scores. Options: 'None', 'max', 'maxmin', 'std'.
+        :param boost_factor: float, as a final step, the relevances of the original g.t. positives will be multiplied by this factor.
         :return: # (num_cands,) tensor of recomputed relevances for a single query
         """
         
@@ -405,7 +410,7 @@ class ReciprocalNearestNeighbors(object):
 
         
         if rel_aggregation == 'mean':
-            agg_relevances = torch.sum(agg_relevances, dim=0) / original_weight
+            agg_relevances = torch.sum(agg_relevances, dim=0) / num_relevant
         elif rel_aggregation == 'sum':
             agg_relevances = torch.sum(agg_relevances, dim=0)
         elif rel_aggregation == 'max':
@@ -442,10 +447,24 @@ class ReciprocalNearestNeighbors(object):
         
         # print("new_relevances: ", new_relevances)
         
-        # Normalize to sum to 1. This is supposed to help dealing with the variety of score ranges resulting from different hyperparameter combinations.
-        new_relevances = new_relevances / torch.sum(new_relevances)
+        # Normalization is supposed to help dealing with the variety of score ranges resulting from different hyperparameter combinations.
+        # Ultimately, a KL divergence between the model-predicted score distribution and the target relevance distribution will be computed,
+        # and the target rel. dist. will be obtained by applying a softmax (with temperature) on relevances computed here.
+        if normalize == 'max':  # in [0, 1]. May result in fairly flat "distribution" close to 1.
+            new_relevances = new_relevances / torch.max(new_relevances)
+        elif normalize == 'maxmin':  # increases dynamic range for "uniform" initial scores, while still in [0, 1]
+            min_relev = torch.min(new_relevances)
+            new_relevances = (new_relevances - min_relev) / (torch.max(new_relevances) - min_relev)
+        elif normalize == 'std': # even wider dynamic range for "uniform" initial scores, but in [0, f], with f > 1
+            relev_std = torch.std(new_relevances)
+            new_relevances = (new_relevances - torch.min(new_relevances)) / relev_std
+        elif normalize != 'None':  # 'None' results in arbitrary range of scores, with potentially flat "distribution".
+            raise ValueError(f"Unknown relevance score normalization option '{normalize}'")
         
         # print("normalized new_relevances: ", new_relevances)
+        
+        # Multiply g.t. relevances by the boost factor. Relies on the fact that in the original `similarities`, the g.t. indices are 1, 2, ..., num_relevant+1
+        new_relevances[:num_relevant] *= boost_factor
         
         return new_relevances
     
@@ -459,7 +478,7 @@ def recip_NN_rerank(args):
     
     recipn = ReciprocalNearestNeighbors(args.query_embedding_dir, args.doc_embedding_dir, args.embedding_dim, args.candidates_path,
                                               args.qrels_path, args.query_ids_path, args.compute_only_for_qrels, args.inject_ground_truth, args.relevance_thr,
-                                              args.device, args.save_memory)
+                                              rel_type='int', device=args.device, save_memory=args.save_memory)
     
     logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
@@ -469,15 +488,19 @@ def recip_NN_rerank(args):
                                              args.normalize, args.k, args.trust_factor, args.k_exp, 
                                              args.weight_func, args.weight_func_param, args.sim_mixing_coef)
     
-    if args.write_scores_to_file:
-        # Write new ranks to file
-        with open(args.out_filepath, 'w') as out_rankfile:
-            start_time = time.perf_counter()
-            for qid, doc2score in reranked_scores.items():
-                for i, (docid, score) in enumerate(doc2score.items()):
-                    out_rankfile.write(f"{qid}\t{docid}\t{i+1}\t{score}\n")
-                global write_results_times
-                write_results_times.update(time.perf_counter() - start_time)
+    # Write new ranks to file
+    if args.write_to_file:
+        logger.info(f"Writing ranks to {args.out_filepath} ...")
+        start_time = time.perf_counter()
+        with open(args.out_filepath, args.mode) as out_file:
+            if args.write_to_file == 'pickle':
+                pickle.dump(reranked_scores, out_file, protocol=pickle.HIGHEST_PROTOCOL)
+            else:
+                for qid, doc2score in reranked_scores.items():
+                    for i, (docid, score) in enumerate(doc2score.items()):
+                        out_file.write(f"{qid}\t{docid}\t{i+1}\t{score}\n")
+        global write_results_times
+        write_results_times.update(time.perf_counter() - start_time)
 
     perf_metrics = None
     if args.qrels_path:
@@ -512,15 +535,15 @@ def extend_relevances(args):
     qrels_path = args.qrels_path
     if qrels_path is None:
         raise ValueError("Argument `qrels_path` must be defined to specify original ground truth relevances.")
-    compute_only_for_qrels = True
-    inject_ground_truth = True
+    compute_only_for_qrels = True  # relevances are recomputed based on existing labels
+    inject_ground_truth = True  # required because relevances are recomputed based on existing labels
     
     start_time = time.time()
     logger.info("Initializing Reciprocal Nearest Neighbors ...")
     recipn = ReciprocalNearestNeighbors(args.query_embedding_dir, args.doc_embedding_dir, args.embedding_dim, 
                                         args.candidates_path, qrels_path, args.query_ids_path, 
                                         compute_only_for_qrels, inject_ground_truth, args.relevance_thr,
-                                        args.device, args.save_memory)
+                                        device=args.device, save_memory=args.save_memory)
     
     logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
@@ -529,23 +552,26 @@ def extend_relevances(args):
     recomputed_labels = recipn.compute_smooth_labels(recipn.query_ids, args.hit,
                                                      args.normalize, args.k, args.trust_factor, args.k_exp, 
                                                      args.weight_func, args.weight_func_param, args.sim_mixing_coef,
-                                                     args.rel_aggregation, args.redistribute, args.redistr_prt)
+                                                     args.rel_aggregation, args.redistribute, args.redistr_prt, 
+                                                     args.norm_relevances, args.boost_factor)
     
     total_runtime = time.time() - start_time
     logger.info("Total runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(total_runtime)))
     logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
     
-    if args.write_scores_to_file:
+    if args.write_to_file:
         logger.info(f"Writing recomputed labels to {args.out_filepath} ...")
-        # Write new (recomputed/smoothened) labels to file
-        with open(args.out_filepath, 'w') as out_file:
-            start_time = time.perf_counter()
-            for qid, doc2score in recomputed_labels.items():
-                for i, (docid, score) in enumerate(doc2score.items()):
-                    out_file.write(f"{qid}\tQ0\t{docid}\t{score:.8f}\n")
-                global write_results_times
-                write_results_times.update(time.perf_counter() - start_time)
+        start_time = time.perf_counter()
+        with open(args.out_filepath, args.mode) as out_file:
+            if args.write_to_file == 'pickle':
+                pickle.dump(recomputed_labels, out_file, protocol=pickle.HIGHEST_PROTOCOL)
+            else:
+                for qid, doc2score in recomputed_labels.items():
+                    for i, (docid, score) in enumerate(doc2score.items()):
+                        out_file.write(f"{qid}\tQ0\t{docid}\t{score:.8f}\n")
+        global write_results_times
+        write_results_times.update(time.perf_counter() - start_time)
         
     return recomputed_labels
 
@@ -580,10 +606,15 @@ def setup(args):
     logger.info("Stored configuration file in '{}'".format(output_dir))
     
     args = utils.dict2obj(config)
-    suffix = '_labels' if config['task'] == 'smooth_labels' else ''
-    args.out_filepath = os.path.join(output_dir, args.out_name + f'_top{args.hit}' + suffix + '.tsv')
     
     # Rest of setup (no need to store in configuration file)
+    suffix = '_labels' if config['task'] == 'smooth_labels' else ''
+    if args.write_to_file:
+        args.out_filepath = os.path.join(output_dir, args.out_name + f'_top{args.hit}' + suffix + '.' + args.write_to_file)
+        args.mode = 'wb' if args.write_to_file == 'pickle' else 'w'
+    args.formatted_timestamp = formatted_timestamp
+    
+
     # Setup CUDA, GPU 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     n_gpu = torch.cuda.device_count()
@@ -630,7 +661,7 @@ def run_parse_args():
                         help="If true, and a `qrels_path` is provided, then scores will be computed only for queries which also exist "
                         "in the qrels file")
     parser.add_argument("--inject_ground_truth", action='store_true',
-                        help="If true, the ground truth document(s) will be injected into the set of documents "
+                        help="Reranking: If true, the ground truth document(s) will be injected into the set of documents "
                              "to be reranked, even if they weren't part of the original candidates.")
     
     # I/O
@@ -639,7 +670,7 @@ def run_parse_args():
                     
     parser.add_argument('--records_file', default='./records.xls', 
                         help='Excel file keeping best records of all experiments')
-    parser.add_argument("--write_scores_to_file", type=bool, default=True,
+    parser.add_argument("--write_to_file", type=str, choices=['tsv', 'pickle'], default=None,
                         help="If set, predictions (scores per document for each query) will be written to a .tsv file")
     parser.add_argument("--doc_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to document embeddings.")
@@ -701,6 +732,10 @@ def run_parse_args():
                         help="in [0, 1], the max. proportion of original label weight that may be redistributed among candidates based on "
                              "their computed similarities w.r.t. the original ground-truth documents. "
                              "Ignored when `redistribute == 'radically'`.")
+    parser.add_argument('--norm_relevances', type=str, choices=['None', 'max', 'maxmin', 'std'], default='None',
+                        help="How to normalize the final relevance scores. Supposed to increase dynamic range and/or limit absolute range.")
+    parser.add_argument('--boost_factor', type=float, default=1.0,
+                        help="The final relevances of the original g.t. positives will be multiplied by this factor.")
 
     args = parser.parse_args()
     
