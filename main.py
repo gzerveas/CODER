@@ -14,6 +14,7 @@ from datetime import datetime
 import string
 from collections import OrderedDict
 import bisect
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ from dataset import MYMARCO_Dataset, MSMARCODataset
 from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
 from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiScheduler
 import utils
-from utils import calculate_metrics, get_relevances, rank_docs
+from utils import calculate_metrics, get_relevances, rank_docs, get_retrieval_metrics
 from inspect_pipeline import inspect
 from fair_retrieval.metrics_FaiRR import FaiRRMetric, FaiRRMetricHelper
 
@@ -137,11 +138,13 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     best_steps = []  # list containing the global step number corresponding to best_values
     running_metrics = []  # (for validation) list of lists: for every evaluation, stores metrics like loss, MRR, MAP, ...
 
-    logger.info("\n\n***** Initial evaluation on dev set *****".format(global_step))
-    val_metrics, best_values, best_steps = validate(args, model, val_dataloader, tb_writer, best_values, best_steps, global_step, fairrmetric=fairrmetric)
+    logger.info("\n\n***** Initial evaluation on dev set ***** (step {})".format(global_step))
+    val_metrics, best_values, best_steps, orig_predictions = validate(args, model, val_dataloader, tb_writer, best_values, best_steps, global_step, fairrmetric=fairrmetric)
     best_metrics = val_metrics.copy()  # dict of all monitored metrics at the step with the best args.key_metric
     metrics_names, metrics_values = zip(*val_metrics.items())
     running_metrics.append(list(metrics_values))
+    ranked_filepath = os.path.join(args.pred_dir, 'original_top1000.dev.' + args.write_predictions)
+    utils.write_predictions(ranked_filepath, orig_predictions, format=args.write_predictions)
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
@@ -236,10 +239,19 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                 if (args.validation_steps and (global_step % args.validation_steps == 0)) or global_step == total_training_steps:
 
                     logger.info("\n\n***** Running evaluation of step {} on dev set *****".format(global_step))
-                    val_metrics, best_values, best_steps = validate(args, model, val_dataloader, tb_writer,
-                                                                    best_values, best_steps, global_step, fairrmetric=fairrmetric)
-                    if len(best_steps) and (best_steps[0] == global_step):
+                    val_metrics, best_values, best_steps, predictions = validate(args, model, val_dataloader, tb_writer,
+                                                                                 best_values, best_steps, global_step, fairrmetric=fairrmetric)
+                    if len(best_steps) and (best_steps[0] == global_step):  # if achieved best performance so far
                         best_metrics = val_metrics.copy()
+                        try:
+                            utils.plot_rank_histogram(val_dataloader.dataset.qrels, predictions,
+                                                      base_pred_scores=orig_predictions,
+                                                      relevance_thr=args.relevant_at_level,
+                                                      save_as=os.path.join(args.output_dir, "best_rank_historgram.pdf"))
+                        except:
+                            logger.error('Histogram not possible!')
+                        ranked_filepath = os.path.join(args.pred_dir, 'best_ranked_top1000.dev.' + args.write_predictions)
+                        utils.write_predictions(ranked_filepath, predictions, format=args.write_predictions)
                     metrics_names, metrics_values = zip(*val_metrics.items())
                     running_metrics.append(list(metrics_values))
 
@@ -298,7 +310,7 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_
 
     model.eval()
     eval_start_time = time.time()
-    val_metrics, ranked_df = evaluate(args, model, val_dataloader, fairrmetric=fairrmetric)
+    val_metrics, predictions = evaluate(args, model, val_dataloader, fairrmetric=fairrmetric)
     eval_runtime = time.time() - eval_start_time
     model.train()
     logger.info("Validation runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(eval_runtime)))
@@ -317,6 +329,13 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_
         tensorboard_writer.add_scalar('dev/{}'.format(k), v, global_step)
         print_str += '{}: {:8f} | '.format(k, v)
     logger.info(print_str)
+    
+    if global_step == 0:
+        try:
+            save_as = os.path.join(args.pred_dir, "initial_rank_historgram.pdf")
+            utils.plot_rank_histogram()
+        except:
+            logger.error('Histogram not possible!')
 
     val_metrics["global_step"] = global_step
     if args.key_metric == 'F1_fairness':
@@ -327,7 +346,8 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_
         ind = bisect.bisect_right(best_values, metric_value)  # index where to insert in sorted list in ascending order
     else:
         ind = utils.reverse_bisect_right(best_values, metric_value)  # index where to insert in sorted list in descending order
-    condition = (ind < args.num_keep_best) and (global_step > STEP_THRESHOLD)  # NOTE: the second condition is because fairness is always bad initially but performance at its best
+    
+    condition = (ind < args.num_keep_best) and (global_step > STEP_THRESHOLD)  # NOTE: the second condition is because fairness is initially always bad but performance at its best
     if condition:
         best_values.insert(ind, metric_value)
         best_steps.insert(ind, global_step)
@@ -337,16 +357,12 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_
             os.remove(os.path.join(args.save_dir, 'model_best_{}.pth'.format(best_steps[-1])))
             best_values = best_values[:args.num_keep_best]
             best_steps = best_steps[:args.num_keep_best]
-
-        if not args.no_predictions:
-            ranked_filepath = os.path.join(args.pred_dir, 'best.ranked.dev.tsv')
-            ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
-
+        
         # Export metrics to a file accumulating best records from the current experiment
         rec_filepath = os.path.join(args.pred_dir, 'training_session_records.xls')
         utils.register_record(rec_filepath, args.initial_timestamp, args.experiment_name, val_metrics)
 
-    return val_metrics, best_values, best_steps
+    return val_metrics, best_values, best_steps, predictions
 
 
 def evaluate(args, model, dataloader, fairrmetric=None):
@@ -356,15 +372,15 @@ def evaluate(args, model, dataloader, fairrmetric=None):
     such as MRR, MAP etc will be additionally computed.
     :return:
         eval_metrics: dict containing metrics (at least 1, batch processing time)
-        rank_df: dataframe with indexed by qID (shared by multiple rows) and columns: PID, rank, score
+        scores: dict {str(qID): dict{str(passageid): rel_score}}, predicted relevance scores per query and document
     """
     qrels = dataloader.dataset.qrels  # dict{qID: dict{pID: relevance}}
     labels_exist = qrels is not None
 
     # num_docs is the (potentially variable) number of candidates per query
-    relevances = []  # (total_num_queries) list of (num_docs) lists with non-zeros at the indices corresponding to actually relevant passages
-    num_relevant = []  # (total_num_queries) list of number of ground truth relevant documents per query
-    df_chunks = []  # (total_num_queries) list of dataframes, each with index a single qID and corresponding (num_docs) columns PID, rank, score
+    # relevances = []  # (total_num_queries) list of (num_docs) lists with non-zeros at the indices corresponding to actually relevant passages
+    # num_relevant = []  # (total_num_queries) list of number of ground truth relevant documents per query
+    scores = {}  # dict {str(qID): dict{str(passageid): rel_score}}  # string IDs required for pytrec_eval
     query_time = 0  # average time for the model to score candidates for a single query
     total_loss = 0  # total loss over dataset
 
@@ -404,21 +420,20 @@ def evaluate(args, model, dataloader, fairrmetric=None):
                 # (batch_size) iterables of docIDs and scores per query, in order of descending relevance score
                 ranksorted_docs, sorted_scores = zip(*(map(rank_docs, docids, rel_scores)))
 
-            # extend by batch_size elements
-            df_chunks.extend(pd.DataFrame(data={"PID": ranksorted_docs[i],
-                                                "rank": list(range(1, len(docids[i]) + 1)),
-                                                "score": sorted_scores[i]},
-                                          index=[qids[i]] * len(docids[i])) for i in range(len(qids)))
+            # extend results dictionary by batch_size elements
+            scores.update({str(qids[i]): {str(ranksorted_docs[i][j]): sorted_scores[i][j] for j in range(len(ranksorted_docs))} for i in range(len(qids))})
 
-            if labels_exist:
-                relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i], relevant_at_level=dataloader.dataset.relevant_at_level) for i in range(len(qids)))
-                # number of g.t. positives in entire dataset for each query
-                num_relevant.extend(len([candid for candid in qrels[qid]
-                                         if qrels[qid][candid] >= dataloader.dataset.relevant_at_level]) for qid in qids)
+            # if labels_exist:
+            #     relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i], relevant_at_level=dataloader.dataset.relevant_at_level) for i in range(len(qids)))
+            #     # number of g.t. positives in entire dataset for each query
+            #     num_relevant.extend(len([candid for candid in qrels[qid]
+            #                              if qrels[qid][candid] >= dataloader.dataset.relevant_at_level]) for qid in qids)
 
     if labels_exist:
         try:
-            eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k)  # aggr. metrics for the entire dataset
+            eval_metrics = get_retrieval_metrics(scores, qrels=dataloader.dataset.reformatted_qrels, cutoff_values=(5, args.metrics_k), 
+                                                 relevance_level=dataloader.dataset.relevant_at_level)  # {metric_name: metric_value}
+            # eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k) # aggregate metrics for the entire dataset
         except:
             logger.error('Metrics calculation failed!')
             eval_metrics = OrderedDict()
@@ -426,36 +441,18 @@ def evaluate(args, model, dataloader, fairrmetric=None):
     else:
         eval_metrics = OrderedDict()
     eval_metrics['query_time'] = query_time / len(dataloader.dataset)  # average over samples
-    ranked_df = pd.concat(df_chunks, copy=False)  # index: qID (shared by multiple rows), columns: PID, rank, score
 
     # Evaluate fairness  # TODO: split into separate function
     if fairrmetric is not None:
         try:
-            _retrievalresults = {}
-            for _item in df_chunks:
-                _qid = _item.index[0]
-                _retrievalresults[_qid] = _item['PID'].tolist()
-
-            eval_FaiRR, eval_NFaiRR = fairrmetric.calc_FaiRR_retrievalresults(retrievalresults=_retrievalresults)
+            eval_FaiRR, eval_NFaiRR = fairrmetric.calc_FaiRR_retrievalresults(retrievalresults=scores)
 
             for _cutoff in eval_FaiRR:
                 eval_metrics['NFaiRR_cutoff_%d' % _cutoff] = eval_NFaiRR[_cutoff]
         except:
             logger.error('Fairness metrics calculation failed!')
 
-    if labels_exist and (args.debug or args.task != 'train'):
-        try:
-            rs = (np.nonzero(r)[0] for r in relevances)
-            ranks = [1 + int(r[0]) if r.size else 1e10 for r in rs]  # for each query, what was the rank of the rel. doc
-            freqs, bin_edges = np.histogram(ranks, bins=[1, 5, 10, 20, 30] + list(range(50, 1050, 50)))
-            bin_labels = ["[{}, {})".format(bin_edges[i], bin_edges[i + 1])
-                          for i in range(len(bin_edges) - 1)] + ["[{}, inf)".format(bin_edges[-1])]
-            logger.info('\nHistogram of ranks for the ground truth documents:\n')
-            utils.ascii_bar_plot(bin_labels, freqs, width=50, logger=logger)
-        except:
-            logger.error('Not possible!')
-
-    return eval_metrics, ranked_df
+    return eval_metrics, scores
 
 
 # Very inefficient. Used by RepBERT only.
@@ -608,9 +605,9 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
         if args.task == 'inspect':
             # Interactive inspection mode
             logger.info("Interactive inspection mode")
-            eval_metrics, ranked_df = inspect(args, model, eval_dataloader)
+            eval_metrics, predictions = inspect(args, model, eval_dataloader)
         else:
-            eval_metrics, ranked_df = evaluate(args, model, eval_dataloader, fairrmetric=fairrmetric)
+            eval_metrics, predictions = evaluate(args, model, eval_dataloader, fairrmetric=fairrmetric)
         eval_runtime = time.time() - eval_start_time
         logger.info("Evaluation runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(eval_runtime)))
         print()
@@ -618,6 +615,11 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
         for k, v in eval_metrics.items():
             print_str += '{}: {:8f} | '.format(k, v)
         logger.info(print_str)
+        
+        try:
+            utils.plot_rank_histogram(eval_dataloader.dataset.qrels, pred_scores=predictions, save_as=os.path.join(args.pred_dir, "rank_historgram.pdf"))
+        except:
+            logger.error('Histogram not possible!')
 
         if args.inject_ground_truth:
             logger.warning("Ground truth documents were injected among candidates! This may cause inflated metrics!")

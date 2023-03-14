@@ -1,9 +1,47 @@
 """
-Adapted from:
+Adapted by gzerveas from:
 https://gist.github.com/bwhite/3726239
 """
 
 import numpy as np
+from typing import List, Tuple, Dict
+
+
+def mrr(qrels, results, k_values, relevance_level=1, verbose=False) -> Tuple[Dict[str, float]]:
+    """Aggregate (mean) MRR calculation at multiple cut-offs given ground truth and prediction dictionaries.
+
+    :param qrels: Dict[query_id, Dict[pasasge_id, relevance_score]] ground truth
+    :param results: Dict[query_id, Dict[pasasge_id, relevance_score]] predictions
+    :param k_values: iterable of integer cut-off thresholds
+    :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant
+    :return: Dict[str, float] value for each metric (determined by `k_values`) 
+    """
+    
+    MRR = {}
+    
+    for k in k_values:
+        MRR[f"MRR@{k}"] = 0.0
+    
+    k_max, top_hits = max(k_values), {}
+    
+    for query_id, doc_scores in results.items():
+        top_hits[query_id] = sorted(doc_scores.items(), key=lambda item: item[1], reverse=True)[0:k_max]   
+    
+    for query_id in top_hits:
+        query_relevant_docs = set([doc_id for doc_id in qrels[query_id] if qrels[query_id][doc_id] >= relevance_level])    
+        for k in k_values:
+            for rank, hit in enumerate(top_hits[query_id][0:k]):
+                if hit[0] in query_relevant_docs:
+                    MRR[f"MRR@{k}"] += 1.0 / (rank + 1)
+                    break
+    
+    if verbose: print('\n')
+    for k in k_values:
+        MRR[f"MRR@{k}"] = round(MRR[f"MRR@{k}"]/len(qrels), 5)
+        if verbose:
+            print("MRR@{}: {:.4f}".format(k, MRR[f"MRR@{k}"]))
+
+    return MRR
 
 
 def reciprocal_rank(ground_truth, pred, max_docs=None):

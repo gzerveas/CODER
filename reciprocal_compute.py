@@ -490,15 +490,9 @@ def recip_NN_rerank(args):
     
     # Write new ranks to file
     if args.write_to_file:
-        logger.info(f"Writing ranks to {args.out_filepath} ...")
         start_time = time.perf_counter()
-        with open(args.out_filepath, args.mode) as out_file:
-            if args.write_to_file == 'pickle':
-                pickle.dump(reranked_scores, out_file, protocol=pickle.HIGHEST_PROTOCOL)
-            else:
-                for qid, doc2score in reranked_scores.items():
-                    for i, (docid, score) in enumerate(doc2score.items()):
-                        out_file.write(f"{qid}\t{docid}\t{i+1}\t{score}\n")
+        logger.info(f"Writing ranks to {args.out_filepath} ...")
+        utils.write_predictions(args.out_filepath, reranked_scores, args.write_to_file)
         global write_results_times
         write_results_times.update(time.perf_counter() - start_time)
 
@@ -591,11 +585,11 @@ def setup(args):
     initial_timestamp = datetime.now()
     formatted_timestamp = initial_timestamp.strftime("%Y-%m-%d_%H-%M-%S")
     rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
-    config['out_name'] = formatted_timestamp + "_" + rand_suffix
+    config['out_name'] = '' if config['no_prefix'] else formatted_timestamp + "_" + rand_suffix + '_'
     if config['exp_name']:
-        config['out_name'] += "_{}".format(config['exp_name'])
+        config['out_name'] += f"{config['exp_name']}" + '_'
     candidates_origin_name = os.path.splitext(os.path.basename(config['candidates_path']))[0]
-    config['out_name'] += f"_{config['task']}_" + candidates_origin_name
+    config['out_name'] += f"{config['task']}_" + candidates_origin_name
     
     output_dir = os.path.join(output_dir, config['out_name'])
     os.makedirs(output_dir, exist_ok=True)
@@ -645,6 +639,8 @@ def run_parse_args():
 
     # Experiment & System
     parser.add_argument("--task", choices=['rerank', 'smooth_labels'], default='rerank')
+    parser.add_argument("--no_prefix", action='store_true',
+                        help="If set, the output directory/file names will not contain timestamp/random prefix.")
     parser.add_argument("--exp_name", type=str, default=None,
                         help="Characteristic string describing the experiment. "
                              " This is going to be appended after the timestamp and random prefix, and before the original filename.")

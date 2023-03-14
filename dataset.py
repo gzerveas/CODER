@@ -281,7 +281,7 @@ def load_qrels(filepath, relevance_thr=1, score_mapping=None):
         (after potential mapping)
     :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 1 -> 0.03)
     :return:
-        qid2relevance (dict): dictionary mapping from query_id (int) to passages with g.t. relevance judgement (dict {passageid : relevance})
+        qid2relevance (dict): dictionary mapping from int query_id to int passage IDs with g.t. relevance judgement (dict {passageid : relevance})
     """
     qid2relevance = defaultdict(dict)
     with open(filepath, 'r') as f:
@@ -437,7 +437,9 @@ class MYMARCO_Dataset(Dataset):
                 qrels_path = os.path.join(qrels_path, "qrels.{}.tsv".format(mode))
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
             # relevance level for qrels can be different from the one used for injection (and metrics evaluation)
-            self.qrels = load_qrels(qrels_path, relevance_thr=include_at_level, score_mapping=relevance_labels_mapping)  # dict{qID: dict{pID: relevance}}
+            self.qrels = load_qrels(qrels_path, relevance_thr=include_at_level, score_mapping=relevance_labels_mapping)  # dict{int qID: dict{int pID: float relevance}}
+            # pytrec_eval requires conversion to *str IDs* and *int relevance* for qrels
+            self.reformatted_qrels = {str(qid): {str(pid): int(score) for pid, score in pdict.items()} for qid, pdict in self.qrels.items()}
             extra_qids = set(self.qids) - set(self.qrels.keys())
             if len(extra_qids) > 0:  # fail early if there are missing labels
                 err_str = "{} query IDs in the specified '{}' dataset do not exist in '{}'!".format(len(extra_qids), mode, qrels_path)

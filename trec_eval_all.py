@@ -60,6 +60,8 @@ for filename in filepaths:
     
     print(perf_metrics)
     
+    perf_metrics['time'] = '-'
+    
     WEIGHT_FUNC = '-'
     WEIGHT_FUNC_PARAM = '-'
     NORMALIZATION = '-'

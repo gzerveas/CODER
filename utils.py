@@ -11,6 +11,9 @@ from copy import deepcopy
 import traceback
 import resource
 import time
+import pickle
+from matplotlib import pyplot as plt
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -18,7 +21,8 @@ import xlrd
 import xlwt
 import xlutils.copy
 import psutil
-from beir.retrieval.evaluation import EvaluateRetrieval
+import pytrec_eval
+# from beir.retrieval.evaluation import EvaluateRetrieval
 
 import metrics
 
@@ -58,18 +62,41 @@ def get_relevances(gt_relevant, candidates, max_docs=None, relevant_at_level=1):
     return [gt_relevant[candid] if (candid in gt_relevant) and gt_relevant[candid] >= relevant_at_level else 0 for candid in candidates[:max_docs]]
 
 
+# NOTE: except for MRR, metrics differ from official TREC. Use get_retrieval_metrics instead.
 def calculate_metrics(relevances, num_relevant, k):
     eval_metrics = OrderedDict([('MRR', metrics.mean_reciprocal_rank(relevances)),
                                 ('MRR@{}'.format(k), metrics.mean_reciprocal_rank(relevances, k)),
-                                ('MAP', metrics.mean_average_precision(relevances)),
-                                ('MAP@{}'.format(k), metrics.mean_average_precision(relevances, k)),
-                                ('MAP@R', metrics.mean_average_precision_at_r(relevances, num_relevant)),
-                                ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
-                                ('nDCG', np.mean([metrics.ndcg_at_k(rel) for rel in relevances])),
-                                ('nDCG@{}'.format(k), np.mean([metrics.ndcg_at_k(rel, k) for rel in relevances]))])
+                                # ('MAP', metrics.mean_average_precision(relevances)),
+                                # ('MAP@{}'.format(k), metrics.mean_average_precision(relevances, k)),
+                                # ('MAP@R', metrics.mean_average_precision_at_r(relevances, num_relevant)),
+                                # ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
+                                # ('nDCG', np.mean([metrics.ndcg_at_k(rel) for rel in relevances])),
+                                # ('nDCG@{}'.format(k), np.mean([metrics.ndcg_at_k(rel, k) for rel in relevances]))
+                                ])
     return eval_metrics
 
 
+def write_predictions(filepath, predictions, format='tsv'):
+    """Writes score and rank predictions to an output file of specified format.
+
+    :param filepath: output file path
+    :param predictions: dict of method's predictions per query, {str qID: {str pID: float score}}
+    :param format: 'pickle' or 'tsv'.
+    """
+    if format == 'tsv':
+        with open(filepath, 'w') as out_file:
+            for qid, doc2score in predictions.items():
+                for i, (docid, score) in enumerate(doc2score.items()):
+                    out_file.write(f"{qid}\t{docid}\t{i+1}\t{score}\n")
+    elif format == 'pickle':
+        with open(filepath, 'wb') as out_file:
+            pickle.dump(predictions, out_file, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        logger.debug("format '{}'; will not write output file")
+    return
+
+
+# DEPRECATED
 def generate_rank(input_path, output_path):
     """
     Reads a file with scored candidate documents for each query, and writes a new file
@@ -87,6 +114,7 @@ def generate_rank(input_path, output_path):
                 outFile.write("{}\t{}\t{}\n".format(query_id, para_id, rank_idx + 1))
 
 
+# DEPRECATED
 def eval_results(run_file_path,
                  eval_script="./ms_marco_eval.py",
                  qrels="./data/msmarco-passage/qrels.dev.small.tsv"):
@@ -322,6 +350,70 @@ def ascii_bar_plot(labels, values, width=30, logger=None):
         print(out_str)
 
 
+def get_ranks_of_top(qrels, score_dict, hit=1000):
+    """For each query, returns the rank (starting from 1) of the highest-ranking ground truth document.
+    If more than one g.t. documents per query exist, they will be ignored.
+    Thus, this estimates an upper bound of performance that reflects mainly MRR and not nDCG"""
+    nonzero_score_indices = (np.nonzero(get_relevances(qrels[qid], list(score_dict[qid].keys()), max_docs=hit))[0] for qid in score_dict)
+    ranks_top = np.array([1 + int(r[0]) if r.size else hit+1 for r in nonzero_score_indices])  # for each query, what was the rank of the highest-ranked rel. document
+    return ranks_top
+
+
+def get_ranks_of_all_relevant(qrels, score_dict, relevance_thr=1):
+    """For each query, returns the ranks (starting from 1) of all corresponding ground-truth documents (or -1, if not found) as a list.
+    Thus, the returned object is a list of lists."""
+    
+    def find(iterable, target):
+        """Returns first index of target within iterable; if not found, returns -1"""
+        for i, item in enumerate(iterable):
+            if target == item:
+                return i
+        return -1
+    
+    return [[int(1 + find(score_dict[qid].keys(), docid)) for docid in qrels[qid] if qrels[qid][docid] >= relevance_thr] for qid in score_dict]
+
+
+def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', relevance_thr=1, save_as='ranks.pdf'):
+    """
+    Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved 
+    based on the predicted model scores in `pred_scores`.
+
+    :param qrels: dict {qID : {pID: score}, g.t. relevance
+    :param pred_scores: dict {qID : {pID: score}, model predictions
+    :param base_pred_scores: Optional dict {qID : {pID: score}. If given, it will be superimposed on the plot for reference
+    :param include_ground_truth: if 'all', the histogram will include the ranks of all g.t. documents per query
+        (naturally, only one of them can have rank 1). If 'top', the histogram will only include the ranks of the top-scored g.t. document.
+    :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant 
+    :param save_as: _description_, defaults to 'ranks.pdf'
+    """
+    
+    if include_ground_truth == 'all':
+        title_str = 'Ranks of all ground-truth documents per query'
+        pred_ranks = get_ranks_of_all_relevant(qrels, pred_scores, relevance_thr=relevance_thr)
+        if base_pred_scores:
+            base_pred_ranks = get_ranks_of_all_relevant(qrels, base_pred_scores, relevance_thr=relevance_thr)
+    else:
+        title_str= 'Ranks of highest-ranking ground-truth document per query'
+        pred_ranks = get_ranks_of_top(qrels, pred_scores)
+        if base_pred_scores:
+            base_pred_ranks = get_ranks_of_top(qrels, base_pred_scores)
+    
+    bins=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30] + list(range(50, 1050, 50))
+    # bin_labels = ["[{}, {})".format(bins[i], bins[i + 1]) for i in range(len(bins) - 1)] + ["[{}, inf)".format(bins[-1])]
+    
+    plt.figure(figsize=(20, 6))
+    if base_pred_scores:
+        plt.hist(base_pred_ranks, bins=bins, alpha=0.2, color='red', edgecolor='gray', label='Original')
+    plt.hist(pred_ranks, bins=bins, alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
+    plt.xticks(rotation='vertical')
+    plt.xlabel('Rank')
+    plt.ylabel('Counts')
+    plt.legend()
+    plt.title(title_str)
+    plt.savefig(save_as)
+    return
+
+
 class Obj(object):
     def __init__(self, dict_):
         self.__dict__.update(dict_)
@@ -477,12 +569,99 @@ def register_record(filepath, timestamp, experiment_name, best_metrics, final_me
     logger.info("Exported performance record to '{}'".format(os.path.realpath(filepath)))
 
 
-def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)):
+#from https://github.com/beir-cellar/beir/blob/main/beir/retrieval/evaluation.py
+class EvaluateRetrieval:
+    
+    @staticmethod
+    def evaluate(qrels: Dict[str, Dict[str, int]], 
+                 results: Dict[str, Dict[str, float]], 
+                 k_values: List[int],
+                 relevance_level=1,
+                 ignore_identical_ids: bool=True) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
+        """
+        :param qrels: Dict[query_id, Dict[pasasge_id, relevance_score]] ground truth
+        :param results: Dict[query_id, Dict[pasasge_id, relevance_score]] predictions
+        :param k_values: iterable of integer cut-off thresholds
+        :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant
+        :param ignore_identical_ids: ignore identical query and document ids (default)
+        :return: Dict[str, float] value for each metric (determined by `k_values`) 
+        """
+        
+        if ignore_identical_ids:
+            # logging.info('For evaluation, we ignore identical query and document ids (default), please explicitly set ``ignore_identical_ids=False`` to ignore this.')
+            popped = []
+            for qid, rels in results.items():
+                for pid in list(rels):
+                    if qid == pid:
+                        results[qid].pop(pid)
+                        popped.append(pid)
+
+        ndcg = {}
+        _map = {}
+        recall = {}
+        precision = {}
+        
+        for k in k_values:
+            ndcg[f"NDCG@{k}"] = 0.0
+            _map[f"MAP@{k}"] = 0.0
+            recall[f"Recall@{k}"] = 0.0
+            precision[f"P@{k}"] = 0.0
+        
+        map_string = "map_cut." + ",".join([str(k) for k in k_values])
+        ndcg_string = "ndcg_cut." + ",".join([str(k) for k in k_values])
+        recall_string = "recall." + ",".join([str(k) for k in k_values])
+        precision_string = "P." + ",".join([str(k) for k in k_values])
+        evaluator = pytrec_eval.RelevanceEvaluator(qrels, {map_string, ndcg_string, recall_string, precision_string}, relevance_level=relevance_level)
+        scores = evaluator.evaluate(results)
+        
+        for query_id in scores.keys():
+            for k in k_values:
+                ndcg[f"NDCG@{k}"] += scores[query_id]["ndcg_cut_" + str(k)]
+                _map[f"MAP@{k}"] += scores[query_id]["map_cut_" + str(k)]
+                recall[f"Recall@{k}"] += scores[query_id]["recall_" + str(k)]
+                precision[f"P@{k}"] += scores[query_id]["P_"+ str(k)]
+        
+        for k in k_values:
+            ndcg[f"NDCG@{k}"] = round(ndcg[f"NDCG@{k}"]/len(scores), 5)
+            _map[f"MAP@{k}"] = round(_map[f"MAP@{k}"]/len(scores), 5)
+            recall[f"Recall@{k}"] = round(recall[f"Recall@{k}"]/len(scores), 5)
+            precision[f"P@{k}"] = round(precision[f"P@{k}"]/len(scores), 5)
+        
+        for eval in [ndcg, _map, recall, precision]:
+            logging.info("\n")
+            for k in eval.keys():
+                logging.info("{}: {:.4f}".format(k, eval[k]))
+
+        return ndcg, _map, recall, precision
+    
+    @staticmethod
+    def evaluate_custom(qrels: Dict[str, Dict[str, int]], 
+                 results: Dict[str, Dict[str, float]], 
+                 k_values: List[int], 
+                 metric: str,
+                 relevance_level=1) -> Tuple[Dict[str, float]]:
+        
+        if metric.lower() in ["mrr", "mrr@k", "mrr_cut"]:
+            return metrics.mrr(qrels, results, k_values, relevance_level=relevance_level)
+        else:
+            raise NotImplementedError(f"Metric '{metric}' not implemented")
+        # elif metric.lower() in ["recall_cap", "r_cap", "r_cap@k"]:
+        #     return recall_cap(qrels, results, k_values)
+        
+        # elif metric.lower() in ["hole", "hole@k"]:
+        #     return hole(qrels, results, k_values)
+        
+        # elif metric.lower() in ["acc", "top_k_acc", "accuracy", "accuracy@k", "top_k_accuracy"]:
+        #     return top_k_accuracy(qrels, results, k_values)
+
+
+def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000), relevance_level=1, verbose=True):
     """Compute retrieval performance metrics with parity to the official TREC implementation. 
 
     :param results: dict of method's predictions per query, {str qID: {str pID: float score}}
     :param qrels: dict of ground truth relevance judgements per query, {str qID: {str pID: int relevance}}
     :param cutoff_values: interable of @k cut-offs for metrics calculation, defaults to (1, 3, 5, 10, 100, 1000)
+    :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant
     :return: dict of aggregate metrics, {"metric@k": avg. metric value}
     """
     
@@ -497,10 +676,10 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     
     logger.info("Computing metrics ...")
     start_time = time.perf_counter()
-    # Evaluate using BEIR (which relies on pytrec_eval) for comparison with BEIR benchmarks
+    # Evaluate using pytrec_eval for comparison with BEIR benchmarks
     # Returns dictionaries with metrics for each cut-off value, e.g. ndcg["NDCG@{k}".format(cutoff_values[0])] == 0.3
-    metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values)  # tuple of metrics dicts (ndct, ...)
-    mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR')
+    metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values, relevance_level=relevance_level, verbose=verbose)  # tuple of metrics dicts (ndct, ...)
+    mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR', relevance_level=relevance_level, verbose=verbose)
     metrics_time = time.perf_counter() - start_time
     logger.info("Time to calculate performance metrics: {:.3f} s".format(metrics_time))
     

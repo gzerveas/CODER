@@ -88,7 +88,7 @@ if __name__ == '__main__':
         study_name = 'recipNN_smooth_labels_study'  # This name is shared across jobs/processes
         objective = recipNN_rerank_objective
 
-    storage = 'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_TripClick_optuna.db'
+    storage = 'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_MSMARCO_optuna.db' #'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_TripClick_optuna.db'
     
     n_trials = 200
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())

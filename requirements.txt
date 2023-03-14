@@ -10,3 +10,4 @@ xlrd==2.0.1
 xlutils==2.0.0
 xlwt==1.3.0
 beir
+matplotlib

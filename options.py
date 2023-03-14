@@ -152,9 +152,9 @@ def run_parse_args():
     parser.add_argument("--load_collection_to_memory", action='store_true',
                         help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
                         "Needs ~26GB for MSMARCO (~50GB project total), but is faster.")
-    parser.add_argument("--no_predictions", action='store_true',
-                        help="If true, will not write predictions (ranking of candidates in evaluation set) to disk. "
-                             "Used to save storage, e.g. when optimizing hyperparameters. (~300MB for 10k queries)")
+    parser.add_argument("--write_predictions", choices=['pickle', 'tsv', 'None'], default='pickle',
+                        help="If not 'None', will write predictions (ranking of candidates in evaluation set) to disk in the specified format. "
+                             "Used to save storage, e.g. when optimizing hyperparameters. (tsv takes ~300MB for 10k queries)")
 
     ## Training process
     parser.add_argument("--per_gpu_eval_batch_size", default=32, type=int)
@@ -215,7 +215,7 @@ def run_parse_args():
     ## Model
     parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer'], default='mdstransformer',
                         help="""Type of the entire (end-to-end) information retrieval model""")
-    parser.add_argument("--query_aggregation", type=str, choices=['mean', 'first'], default='mean',
+    parser.add_argument("--query_aggregation", type=str, choices=['mean', 'first'], default='first',
                         help="""How to aggregate the individual final encoder embeddings corresponding to query tokens into 
                         a single vector.""")
     # parser.add_argument('--token_type_ids', action='store_true',
@@ -260,7 +260,7 @@ def run_parse_args():
     parser.add_argument('--temperature', default=None,
                         help="A float parameter by which to divide the final scores. If set to 'learnable', will be learned during training.")
     parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier'},
-                        default='multilabelmargin', help='Loss applied to document scores')
+                        default='listent', help='Loss applied to document scores')
     parser.add_argument('--aux_loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier', None},
                         default=None,
                         help='Auxiliary loss (optional). If specified, it will be multiplied by `aux_loss_coeff` and '
