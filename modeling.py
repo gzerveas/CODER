@@ -386,8 +386,6 @@ class RelevanceCrossEntropyLoss(BaseLoss):
 
         return loss
 
-
-# TODO: implement a learnable Temperature parameter
 class RelevanceListnetLoss(BaseLoss):
     """
     KL-divergence loss

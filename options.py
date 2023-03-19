@@ -138,7 +138,7 @@ def run_parse_args():
 
     ## System
     parser.add_argument('--debug', action='store_true', help="Activate debug mode (displays more information)")
-    parser.add_argument('--gpu_id', action='store', dest='cuda_ids', type=str, default="0",
+    parser.add_argument('--cuda_ids', action='store', dest='cuda_ids', type=str, default="0",
                         help="Optional cuda device ids for single/multi gpu setting, like '0' or '0,1,2,3' ", required=False)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument("--data_num_workers", default=0, type=int,

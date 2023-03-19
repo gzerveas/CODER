@@ -4,6 +4,7 @@ import glob
 import argparse
 import logging
 from collections import OrderedDict
+import pickle
 
 logger = logging.getLogger()
 
@@ -12,7 +13,7 @@ import utils
 
 # METRICS = ['ndcg_cut_10', 'ndcg_cut_100', 'recip_rank', 'recall_10', 'recall_100', 'recall_1000']
 
-parser = argparse.ArgumentParser("Evaluate a set of prediction (ranking) files according to pattern, and report and tabulate TREC metrics")
+parser = argparse.ArgumentParser("Evaluate a set of prediction/ranking files (in '.tsv' or '.pickle' format) according to pattern, and report and tabulate TREC metrics")
 parser.add_argument("--pred_path", type=str, default="/users/gzerveas/data/gzerveas/RecipNN/predictions/MS_MARCO/*.tsv",
                     help="Glob pattern used to select prediction/ranking files for evaluation. Can also be a single file path.")
 parser.add_argument("--qrels_path", type=str, default="/users/gzerveas/data/MS_MARCO/qrels",
@@ -20,6 +21,8 @@ parser.add_argument("--qrels_path", type=str, default="/users/gzerveas/data/MS_M
 parser.add_argument("--auto_qrels", action='store_true',
                     help="If set, will use `qrels_path` as a prefix and append the trailing part of files matched by `pred_path` "
                     "(e.g. '.dev.small.tsv', hence automatically generating the corresponding qrel paths.")
+parser.add_argument("--relevance_level", type=int, default=1,
+                    help="A document with this score level and above will be considered relevant.")
 parser.add_argument("--write_to_json", action='store_true',
                     help="If set, will write metrics to JSON files whose path will match `pred_path`, but with a different extension."
                     "(e.g. '.dev.small.tsv', hence automatically generating the corresponding qrel paths.")
@@ -31,6 +34,7 @@ filepaths = glob.glob(args.pred_path)
 
 logger.info(f"Will evaluate {len(filepaths)} file(s)")
 
+old_qrels_filename = None
 for filename in filepaths:
     filename_parts = filename.split('.')  # e.g. /my/pa.th/method_par0.444_descr.dev.small.tsv
     qrels_filename = args.qrels_path
@@ -44,12 +48,22 @@ for filename in filepaths:
         trailing_part = '.'.join(filename_parts[-num_trailing_parts:])  # e.g. "dev.small.tsv"
         
         qrels_filename += '.' + trailing_part
-        
     
-    logger.info(f"Evaluating '{filename}' using '{qrels_filename}' ...")
+    logger.info(f"Evaluating '{filename}' using '{qrels_filename}' :")
     
-    results = utils.load_predictions(filename)
-    qrels = utils.load_qrels(qrels_filename)
+    if qrels_filename != old_qrels_filename:
+        logger.info(f"Loading qrels from '{qrels_filename}' ...")
+        qrels = utils.load_qrels(qrels_filename, relevance_level=args.relevance_level)
+        old_qrels_filename = qrels_filename    
+    
+    logger.info("Reading scores from {} ...".format(filename))
+    if filename.endswith('.tsv'):
+        results = utils.load_predictions(filename)
+    elif filename.endswith('.pickle'):    
+        with open(filename, 'rb') as f:
+            results = pickle.load(f)  # dict{qID: dict{pID: relevance}}
+    else:
+        raise ValueError(f"Unknown file format: {filename}")
     
     perf_metrics = utils.get_retrieval_metrics(results, qrels)
     

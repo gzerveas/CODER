@@ -1,3 +1,4 @@
+from itertools import chain
 import re
 import random
 from collections import defaultdict, OrderedDict
@@ -14,7 +15,9 @@ import time
 import pickle
 from matplotlib import pyplot as plt
 from typing import Dict, List, Tuple
+import csv
 
+from tqdm import tqdm
 import numpy as np
 import torch
 import xlrd
@@ -76,18 +79,24 @@ def calculate_metrics(relevances, num_relevant, k):
     return eval_metrics
 
 
-def write_predictions(filepath, predictions, format='tsv'):
-    """Writes score and rank predictions to an output file of specified format.
+def write_predictions(filepath, predictions, format='tsv', score_type=builtins.float, is_qrels=False):
+    """Writes score and rank predictions (or a qrels format with a column 'Q0' and no rank) to an output file of specified format.
 
     :param filepath: output file path
     :param predictions: dict of method's predictions per query, {str qID: {str pID: float score}}
-    :param format: 'pickle' or 'tsv'.
+    :param format: 'pickle' or 'tsv'
+    :param score_type: Only for format 'tsv': the type of the written scores (int or float).
+    :param is_qrels: Only for format 'tsv': if True, will write 'tsv' file in qrels format with a column 'Q0' and no rank.
     """
     if format == 'tsv':
+        if is_qrels:
+            format_str = lambda qid, docid, rank, s: f"{qid}\tQ0\t{docid}\t{s}\n"
+        else:
+            format_str = lambda qid, docid, rank, s: f"{qid}\t{docid}\t{rank}\t{s}\n"
         with open(filepath, 'w') as out_file:
             for qid, doc2score in predictions.items():
                 for i, (docid, score) in enumerate(doc2score.items()):
-                    out_file.write(f"{qid}\t{docid}\t{i+1}\t{score}\n")
+                    out_file.write(format_str(qid, docid, i+1, score_type(score)))
     elif format == 'pickle':
         with open(filepath, 'wb') as out_file:
             pickle.dump(predictions, out_file, protocol=pickle.HIGHEST_PROTOCOL)
@@ -373,46 +382,142 @@ def get_ranks_of_all_relevant(qrels, score_dict, relevance_thr=1):
     return [[int(1 + find(score_dict[qid].keys(), docid)) for docid in qrels[qid] if qrels[qid][docid] >= relevance_thr] for qid in score_dict]
 
 
-def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', relevance_thr=1, save_as='ranks.pdf'):
+def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', bins=None, relevance_thr=1, save_as='ranks.pdf'):
     """
     Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved 
     based on the predicted model scores in `pred_scores`.
 
     :param qrels: dict {qID : {pID: score}, g.t. relevance
     :param pred_scores: dict {qID : {pID: score}, model predictions
-    :param base_pred_scores: Optional dict {qID : {pID: score}. If given, it will be superimposed on the plot for reference
+    :param base_pred_scores: Optional: either dict {qID : {pID: score}, or tuple (freqs, bin_edges).
+        If given, it will be superimposed on the plot for reference.
     :param include_ground_truth: if 'all', the histogram will include the ranks of all g.t. documents per query
         (naturally, only one of them can have rank 1). If 'top', the histogram will only include the ranks of the top-scored g.t. document.
     :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant 
     :param save_as: _description_, defaults to 'ranks.pdf'
+    :return: (freqs, bin_edges) tuple of counts/frequencies and bin edges of pred_scores historgram
     """
     
     if include_ground_truth == 'all':
         title_str = 'Ranks of all ground-truth documents per query'
-        pred_ranks = get_ranks_of_all_relevant(qrels, pred_scores, relevance_thr=relevance_thr)
-        if base_pred_scores:
-            base_pred_ranks = get_ranks_of_all_relevant(qrels, base_pred_scores, relevance_thr=relevance_thr)
+        pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_all_relevant(qrels, pred_scores, relevance_thr=relevance_thr))), dtype=np.int16)
+        if type(base_pred_scores) is dict:
+            base_pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_all_relevant(qrels, base_pred_scores, relevance_thr=relevance_thr))), dtype=np.int16)
     else:
         title_str= 'Ranks of highest-ranking ground-truth document per query'
-        pred_ranks = get_ranks_of_top(qrels, pred_scores)
-        if base_pred_scores:
-            base_pred_ranks = get_ranks_of_top(qrels, base_pred_scores)
+        pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, pred_scores))), dtype=np.int16)
+        if type(base_pred_scores) is dict:
+            base_pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, base_pred_scores))), dtype=np.int16)
     
-    bins=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30] + list(range(50, 1050, 50))
+    bins= list(range(50)) + list(range(50, 1050, 50))
     # bin_labels = ["[{}, {})".format(bins[i], bins[i + 1]) for i in range(len(bins) - 1)] + ["[{}, inf)".format(bins[-1])]
-    
-    plt.figure(figsize=(20, 6))
-    if base_pred_scores:
-        plt.hist(base_pred_ranks, bins=bins, alpha=0.2, color='red', edgecolor='gray', label='Original')
-    plt.hist(pred_ranks, bins=bins, alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
+    plt.figure(figsize=(30, 10))
+    if type(base_pred_scores) is dict:
+        plt.hist(base_pred_ranks, bins=bins, alpha=0.2, color='red', label='Original')
+    elif type(base_pred_scores) is tuple:
+        freqs, bin_edges = base_pred_scores
+        plt.hist(bin_edges[:-1], bins=bin_edges, weights=freqs, alpha=0.2, color='red', label='Original')
+    freqs, bin_edges, _ = plt.hist(pred_ranks, bins=bins, alpha=0.2, color='blue', label='Reranked')
     plt.xticks(rotation='vertical')
     plt.xlabel('Rank')
     plt.ylabel('Counts')
     plt.legend()
     plt.title(title_str)
     plt.savefig(save_as)
-    return
+    return freqs, bin_edges
 
+
+def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', bins=None, relevance_thr=1, save_as='ranks.pdf'):
+    """
+    Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved 
+    based on the predicted model scores in `pred_scores`. The difference with `plot_rank_histogram` is that
+    the histogram is plotted as a horizontal barplot (i.e. bar the width is not proportional to the actual bin widths), 
+    with the y-axis being the rank and the x-axis being the frequency.
+
+    :param qrels: dict {qID : {pID: score}, g.t. relevance
+    :param pred_scores: dict {qID : {pID: score}, model predictions
+    :param base_pred_scores: Optional: either dict {qID : {pID: score}, or tuple (freqs, bin_edges).
+        If given, it will be superimposed on the plot for reference.
+    :param include_ground_truth: if 'all', the histogram will include the ranks of all g.t. documents per query
+        (naturally, only one of them can have rank 1). If 'top', the histogram will only include the ranks of the top-scored g.t. document.
+    :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant 
+    :param save_as: _description_, defaults to 'ranks.pdf'
+    :return: (freqs, bin_edges) tuple of counts/frequencies and bin edges of pred_scores historgram
+    """
+    
+    if include_ground_truth == 'all':
+        title_str = 'Ranks of all ground-truth documents per query'
+        pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_all_relevant(qrels, pred_scores, relevance_thr=relevance_thr))), dtype=np.int16)
+        if type(base_pred_scores) is dict:
+            base_pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_all_relevant(qrels, base_pred_scores, relevance_thr=relevance_thr))), dtype=np.int16)
+    else:
+        title_str= 'Ranks of highest-ranking ground-truth document per query'
+        pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, pred_scores))), dtype=np.int16)
+        if type(base_pred_scores) is dict:
+            base_pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, base_pred_scores))), dtype=np.int16)
+    
+    bins = list(range(1, 50)) + list(range(50, 1050, 50))
+    bin_labels = ["[{}, {})".format(bins[i], bins[i + 1]) for i in range(len(bins) - 1)] #+ ["[{}, inf)".format(bins[-1])]
+    
+    fig, ax = plt.subplots(figsize=(10, 30))
+    
+    # plt.figure(figsize=(10, 30))
+    if base_pred_scores is not None:
+        if type(base_pred_scores) is dict:
+            freqs, bin_edges = np.histogram(base_pred_ranks, bins=bins)
+        elif type(base_pred_scores) is tuple:
+            freqs, bin_edges = base_pred_scores
+        orig_freqs = freqs
+        # plt.hist(bin_edges[:-1], bins=bin_edges, weights=freqs, alpha=0.2, color='red', edgecolor='gray', label='Original')
+        ax.barh(np.arange(len(freqs)), freqs, height=1, align='edge', alpha=0.2, color='red', edgecolor='gray', label='Original')
+    
+    freqs, bin_edges = np.histogram(pred_ranks, bins=bins)
+    # plt.hist(bin_edges[:-1], bins=bin_edges, weights=freqs, alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
+    y_pos = np.arange(len(freqs))
+    rects = ax.barh(y_pos, freqs, height=1, align='edge', alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(bin_labels)
+    ax.invert_yaxis()  # labels read top-to-bottom
+    ax.set_xlabel('Counts')
+    ax.set_title(title_str)
+
+    # Label with specially formatted floats
+    if base_pred_scores is None:
+        labels = [str(f) for f in freqs]
+        # ax.bar_label(hbars, fmt='%d', padding=5)  # Requires matplotlib 3.4.0+
+        xlim = max(freqs)
+    else:
+        labels=['{}'.format(d) for d in (freqs - orig_freqs)]
+        # ax.bar_label(hbars, fmt='%d', labels=labels, padding=10)
+        xlim = max(max(freqs), max(orig_freqs))
+    
+    # Put labels on top of bars
+    # rects = ax.patches    
+    for rect, label in zip(rects, labels):
+        width = rect.get_width()
+        color = 'red' if label < 0 else 'blue'
+        ax.text(width + 0.1*xlim, rect.get_y() + rect.get_height() / 2, label, ha="center", va="center", color=color)
+    
+    ax.set_xlim(right=1.2*xlim)  # adjust xlim to fit labels
+    ax.legend()
+    
+    plt.savefig(save_as)
+    return freqs, bin_edges
+
+
+def write_columns_to_csv(filename, columns, header=None, delimiter=','):
+    """Writes the given columns (iterable of iterables of same length) to a csv file by making use of the CSV writer module.
+    If header is not None, it is written as the first line."""
+    
+    rows = zip(*columns)
+    
+    with open(filename, 'w') as f:
+        csvwriter = csv.writer(f, dialect='excel', delimiter=delimiter)
+        if header is not None:
+            csvwriter.writerow(header)
+        csvwriter.writerows(rows)
+    return
+            
 
 class Obj(object):
     def __init__(self, dict_):
@@ -576,14 +681,16 @@ class EvaluateRetrieval:
     def evaluate(qrels: Dict[str, Dict[str, int]], 
                  results: Dict[str, Dict[str, float]], 
                  k_values: List[int],
-                 relevance_level=1,
-                 ignore_identical_ids: bool=True) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
+                #  relevance_level=1,
+                 ignore_identical_ids: bool=True,
+                 verbose=True) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
         """
         :param qrels: Dict[query_id, Dict[pasasge_id, relevance_score]] ground truth
         :param results: Dict[query_id, Dict[pasasge_id, relevance_score]] predictions
         :param k_values: iterable of integer cut-off thresholds
-        :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant
+        # :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant
         :param ignore_identical_ids: ignore identical query and document ids (default)
+        :param verbose: it True, will use logger config to print metrics
         :return: Dict[str, float] value for each metric (determined by `k_values`) 
         """
         
@@ -611,7 +718,7 @@ class EvaluateRetrieval:
         ndcg_string = "ndcg_cut." + ",".join([str(k) for k in k_values])
         recall_string = "recall." + ",".join([str(k) for k in k_values])
         precision_string = "P." + ",".join([str(k) for k in k_values])
-        evaluator = pytrec_eval.RelevanceEvaluator(qrels, {map_string, ndcg_string, recall_string, precision_string}, relevance_level=relevance_level)
+        evaluator = pytrec_eval.RelevanceEvaluator(qrels, {map_string, ndcg_string, recall_string, precision_string}) #relevance_level=relevance_level) aparrently gives error
         scores = evaluator.evaluate(results)
         
         for query_id in scores.keys():
@@ -626,11 +733,12 @@ class EvaluateRetrieval:
             _map[f"MAP@{k}"] = round(_map[f"MAP@{k}"]/len(scores), 5)
             recall[f"Recall@{k}"] = round(recall[f"Recall@{k}"]/len(scores), 5)
             precision[f"P@{k}"] = round(precision[f"P@{k}"]/len(scores), 5)
-        
-        for eval in [ndcg, _map, recall, precision]:
-            logging.info("\n")
-            for k in eval.keys():
-                logging.info("{}: {:.4f}".format(k, eval[k]))
+
+        if verbose:
+            for eval in [ndcg, _map, recall, precision]:
+                logging.info("\n")
+                for k in eval.keys():
+                    logging.info("{}: {:.4f}".format(k, eval[k]))
 
         return ndcg, _map, recall, precision
     
@@ -639,10 +747,11 @@ class EvaluateRetrieval:
                  results: Dict[str, Dict[str, float]], 
                  k_values: List[int], 
                  metric: str,
-                 relevance_level=1) -> Tuple[Dict[str, float]]:
+                 relevance_level=1,
+                 verbose=True) -> Tuple[Dict[str, float]]:
         
         if metric.lower() in ["mrr", "mrr@k", "mrr_cut"]:
-            return metrics.mrr(qrels, results, k_values, relevance_level=relevance_level)
+            return metrics.mrr(qrels, results, k_values, relevance_level=relevance_level, verbose=verbose)
         else:
             raise NotImplementedError(f"Metric '{metric}' not implemented")
         # elif metric.lower() in ["recall_cap", "r_cap", "r_cap@k"]:
@@ -661,7 +770,7 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     :param results: dict of method's predictions per query, {str qID: {str pID: float score}}
     :param qrels: dict of ground truth relevance judgements per query, {str qID: {str pID: int relevance}}
     :param cutoff_values: interable of @k cut-offs for metrics calculation, defaults to (1, 3, 5, 10, 100, 1000)
-    :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant
+    :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant. Only for MRR
     :return: dict of aggregate metrics, {"metric@k": avg. metric value}
     """
     
@@ -678,14 +787,14 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     start_time = time.perf_counter()
     # Evaluate using pytrec_eval for comparison with BEIR benchmarks
     # Returns dictionaries with metrics for each cut-off value, e.g. ndcg["NDCG@{k}".format(cutoff_values[0])] == 0.3
-    metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values, relevance_level=relevance_level, verbose=verbose)  # tuple of metrics dicts (ndct, ...)
+    #metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values, ignore_identical_ids=False, verbose=verbose)  # tuple of metrics dicts (ndct, ...) #TODO: RESTORE
     mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR', relevance_level=relevance_level, verbose=verbose)
     metrics_time = time.perf_counter() - start_time
     logger.info("Time to calculate performance metrics: {:.3f} s".format(metrics_time))
     
     # Merge all dicts into a single OrderedDict and sort by k for guaranteed consistency
     perf_metrics = OrderedDict()  # to also work with Python 3.6
-    for met_dict in (mrr, ) + metric_dicts:
+    for met_dict in (mrr, ):#+ metric_dicts: #TODO: RESTORE
         perf_metrics.update(sorted(met_dict.items(), key=lambda x: 0 if not '@' in x[0] else int(x[0].split('@')[1])))
 
     return perf_metrics
@@ -823,37 +932,36 @@ class Timer(object):
             return None
 
 
-def load_qrels(filepath, relevance_level=1, score_mapping=None, rel_type='int'):
-    """Load ground truth relevant passages from file. Can handle several levels of relevance.
+def load_qrels(filepath, relevance_level=1, score_mapping=None, rel_type=builtins.int, id_type=builtins.str):
+    """Load ground truth relevant passages (or scores per passage) from file. Can handle several levels of relevance.
     Assumes that if a passage is not listed for a query, it is non-relevant.
-    :param filepath: path to file of ground truth relevant passages in the following format:
+    :param filepath: path to file of ground truth relevant passages in the following format ('Q0' can be missing):
         "qID1 \t Q0 \t pID1 \t 2\n
          qID1 \t Q0 \t pID2 \t 0\n
          qID1 \t Q0 \t pID3 \t 1\n..."
     :param relevance_level: only include candidates which have at least the specified relevance score
         (after potential mapping)
     :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 2 -> 0.3)
+    :param rel_type: type of relevance scores (int or float)
+    :param id_type: type of query and passage IDs (int or str)
     :return:
         qid2relevance (dict): dictionary mapping from query_id to relevant passages (dict {passageid : relevance})
     """
     
-    if rel_type == 'int':
-        typefunc = builtins.int
-    elif rel_type == 'float':
-        typefunc = builtins.float
-    else:
-        raise ValueError(f"Unknown rel_type {rel_type}")
-    
     qid2relevance = defaultdict(dict)
     with open(filepath, 'r') as f:
-        for line in f:
+        for line in tqdm(f, desc="Line: "):
             try:
-                qid, _, pid, relevance = line.strip().split()
-                relevance = typefunc(relevance)
+                fields = line.strip().split()
+                if len(fields) == 4:
+                    qid, _, pid, relevance = fields
+                else:
+                    qid, pid, relevance = fields
+                relevance = rel_type(relevance)
                 if (score_mapping is not None) and (relevance in score_mapping):
                     relevance = score_mapping[relevance]  # map score to new value
                 if relevance >= relevance_level:  # include only if score >= specified relevance level
-                    qid2relevance[qid][pid] = relevance
+                    qid2relevance[id_type(qid)][id_type(pid)] = relevance
             except Exception as x:
                 print(x)
                 raise IOError("'{}' is not valid format".format(line))

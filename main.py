@@ -14,10 +14,9 @@ from datetime import datetime
 import string
 from collections import OrderedDict
 import bisect
-import pickle
+import ipdb
 
 import numpy as np
-import pandas as pd
 from tqdm import tqdm, trange
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -41,7 +40,7 @@ val_times = utils.Timer()  # stores measured validation times
 
 STEP_THRESHOLD = 0  #4000 # Used for fairness regularization; checkpoints corresponding to best performance before STEP_THRESHOLD steps will be ignored
 
-# TODO: here and in evaluation, options add the target_scores, and make sure label_format == 'scores'
+
 def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=None):
     """
     Prepare training dataset, train the model and handle results.
@@ -139,12 +138,15 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     running_metrics = []  # (for validation) list of lists: for every evaluation, stores metrics like loss, MRR, MAP, ...
 
     logger.info("\n\n***** Initial evaluation on dev set ***** (step {})".format(global_step))
-    val_metrics, best_values, best_steps, orig_predictions = validate(args, model, val_dataloader, tb_writer, best_values, best_steps, global_step, fairrmetric=fairrmetric)
+    val_metrics, best_values, best_steps, predictions = validate(args, model, val_dataloader, tb_writer, best_values, best_steps, global_step, fairrmetric=fairrmetric)
     best_metrics = val_metrics.copy()  # dict of all monitored metrics at the step with the best args.key_metric
     metrics_names, metrics_values = zip(*val_metrics.items())
     running_metrics.append(list(metrics_values))
     ranked_filepath = os.path.join(args.pred_dir, 'original_top1000.dev.' + args.write_predictions)
-    utils.write_predictions(ranked_filepath, orig_predictions, format=args.write_predictions)
+    utils.write_predictions(ranked_filepath, predictions, format=args.write_predictions)
+    freqs_orig, bins_orig = utils.plot_rank_barplot(val_dataloader.dataset.reformatted_qrels, predictions,
+                                relevance_thr=args.relevant_at_level,
+                                save_as=os.path.join(args.output_dir, "orig_rank_historgram.pdf"))
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
@@ -214,6 +216,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         tb_writer.add_scalar('learn_rate{}'.format(s), scheduler.get_last_lr()[s][0], global_step)
                     cur_loss = (train_loss - logging_loss) / args.logging_steps  # mean loss over last args.logging_steps (smoothened "current loss")
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
+                    avg_batch_time = batch_times.get_average()
+                    tb_writer.add_scalar('train/batch time', avg_batch_time, global_step)
                     if model.score_cands.temperature is not None:
                         tb_writer.add_scalar('train/temperature', model.score_cands.temperature, global_step) 
 
@@ -229,7 +233,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         logger.debug("Average prep. docids time: {} s /samp".format(prep_docids_times.get_average()))
                         logger.debug("Average sample fetching time: {} s /samp".format(sample_fetching_times.get_average()))
                         logger.debug("Average collation time: {} s /batch".format(collation_times.get_average()))
-                        logger.debug("Average total batch processing time: {} s /batch".format(batch_times.get_average()))
+                    logger.info("Average total batch processing time: {} s /batch".format(avg_batch_time))
 
                         # logger.debug("Score parameters: {}".format(score_params))  # TODO: DEBUG
 
@@ -244,12 +248,17 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                     if len(best_steps) and (best_steps[0] == global_step):  # if achieved best performance so far
                         best_metrics = val_metrics.copy()
                         try:
-                            utils.plot_rank_histogram(val_dataloader.dataset.qrels, predictions,
-                                                      base_pred_scores=orig_predictions,
+                            freqs_best, _ = utils.plot_rank_barplot(val_dataloader.dataset.reformatted_qrels, predictions,
+                                                      base_pred_scores=(freqs_orig, bins_orig),
                                                       relevance_thr=args.relevant_at_level,
                                                       save_as=os.path.join(args.output_dir, "best_rank_historgram.pdf"))
                         except:
                             logger.error('Histogram not possible!')
+                        # Export histogram of ranks of relevant documents
+                        utils.write_columns_to_csv(os.path.join(args.output_dir, "rank_histogram.csv"), 
+                                                   columns=(bins_orig, freqs_orig, freqs_best),
+                                                   header=('rank', 'Original', 'Reranked'))
+                        # Export predictions per query and document
                         ranked_filepath = os.path.join(args.pred_dir, 'best_ranked_top1000.dev.' + args.write_predictions)
                         utils.write_predictions(ranked_filepath, predictions, format=args.write_predictions)
                     metrics_names, metrics_values = zip(*val_metrics.items())
@@ -329,13 +338,6 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_
         tensorboard_writer.add_scalar('dev/{}'.format(k), v, global_step)
         print_str += '{}: {:8f} | '.format(k, v)
     logger.info(print_str)
-    
-    if global_step == 0:
-        try:
-            save_as = os.path.join(args.pred_dir, "initial_rank_historgram.pdf")
-            utils.plot_rank_histogram()
-        except:
-            logger.error('Histogram not possible!')
 
     val_metrics["global_step"] = global_step
     if args.key_metric == 'F1_fairness':
@@ -417,11 +419,11 @@ def evaluate(args, model, dataloader, fairrmetric=None):
                 ranksorted_docs = np.take_along_axis(docids_array, inds, axis=1)
                 sorted_scores = np.take_along_axis(rel_scores, inds, axis=1)
             else:
-                # (batch_size) iterables of docIDs and scores per query, in order of descending relevance score
+                # len(batch_size) list of lists: docIDs and scores per query, in order of descending relevance score
                 ranksorted_docs, sorted_scores = zip(*(map(rank_docs, docids, rel_scores)))
 
-            # extend results dictionary by batch_size elements
-            scores.update({str(qids[i]): {str(ranksorted_docs[i][j]): sorted_scores[i][j] for j in range(len(ranksorted_docs))} for i in range(len(qids))})
+            # extend results dictionary by batch_size elements. Indexing works both for np.arrays and list of lists formats for _docs and_scores
+            scores.update({str(qids[i]): {str(ranksorted_docs[i][j]): sorted_scores[i][j] for j in range(len(ranksorted_docs[i]))} for i in range(len(qids))})
 
             # if labels_exist:
             #     relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i], relevant_at_level=dataloader.dataset.relevant_at_level) for i in range(len(qids)))
@@ -430,13 +432,16 @@ def evaluate(args, model, dataloader, fairrmetric=None):
             #                              if qrels[qid][candid] >= dataloader.dataset.relevant_at_level]) for qid in qids)
 
     if labels_exist:
-        try:
-            eval_metrics = get_retrieval_metrics(scores, qrels=dataloader.dataset.reformatted_qrels, cutoff_values=(5, args.metrics_k), 
-                                                 relevance_level=dataloader.dataset.relevant_at_level)  # {metric_name: metric_value}
-            # eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k) # aggregate metrics for the entire dataset
-        except:
-            logger.error('Metrics calculation failed!')
-            eval_metrics = OrderedDict()
+        # try:
+        eval_metrics = get_retrieval_metrics(scores, qrels=dataloader.dataset.reformatted_qrels, cutoff_values=(5, args.metrics_k), 
+                                                 relevance_level=dataloader.dataset.relevant_at_level, verbose=False)  # {metric_name: metric_value}
+        #     # eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k) # aggregate metrics for the entire dataset
+        # except Exception as x:
+        #     print(x)
+        #     traceback.print_stack()
+        #     ipdb.post_mortem()
+        #     logger.error('Metrics calculation failed!')
+        #     eval_metrics = OrderedDict()
         eval_metrics['loss'] = total_loss / len(dataloader.dataset)  # average over samples
     else:
         eval_metrics = OrderedDict()
@@ -453,7 +458,6 @@ def evaluate(args, model, dataloader, fairrmetric=None):
             logger.error('Fairness metrics calculation failed!')
 
     return eval_metrics, scores
-
 
 # Very inefficient. Used by RepBERT only.
 def evaluate_slow(args, model, dataloader, mode, prefix='model'):
@@ -617,7 +621,7 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
         logger.info(print_str)
         
         try:
-            utils.plot_rank_histogram(eval_dataloader.dataset.qrels, pred_scores=predictions, save_as=os.path.join(args.pred_dir, "rank_historgram.pdf"))
+            freqs, bins = utils.plot_rank_barplot(eval_dataloader.dataset.qrels, pred_scores=predictions, save_as=os.path.join(args.pred_dir, "rank_historgram.pdf"))
         except:
             logger.error('Histogram not possible!')
 
@@ -629,11 +633,16 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
             filename = filename[:filename.find('_memmap')] + '.tsv'  # it "eats" the last character if not '_memmap'
         ranked_filepath = os.path.join(args.pred_dir, filename)
         logger.info("Writing predicted ranking to: {} ...".format(ranked_filepath))
-        ranked_df.to_csv(ranked_filepath, header=False, sep='\t')
+        utils.write_predictions(ranked_filepath, predictions, format=args.write_predictions)
 
         # Export record metrics to a file accumulating records from all experiments
         utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
                               eval_metrics, comment=args.comment)
+        
+        # Export histogram of ranks of relevant documents to a file
+        utils.write_columns_to_csv(os.path.join(args.output_dir, "rank_histogram.csv"), 
+                               columns=(bins, freqs),
+                               header=('rank', 'Counts'))
 
         return eval_metrics
 

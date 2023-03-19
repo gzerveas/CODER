@@ -18,6 +18,8 @@ model checkpoints, performance metrics per epoch, the experiment configuration, 
 [We recommend creating and activating a `conda` or other Python virtual environment (e.g. `virtualenv`) to 
 install packages and avoid conflicting package requirements; otherwise, to run `pip`, the flag `--user` or `sudo` privileges will be necessary.]
 
+This code has been tested with Python 3.6, so you can create an Anaconda environment with: `conda create -n CODER python=3.6`
+
 `pip install -r coder/requirements.txt`
 
 

@@ -8,6 +8,7 @@ from operator import itemgetter
 import time
 import sys
 import pickle
+import ipdb
 
 import numpy as np
 from tqdm import tqdm
@@ -379,6 +380,26 @@ class MYMARCO_Dataset(Dataset):
             If that is also not provided, the IDs inside `queries_tokenids_path` will be used.
         """
         self.mode = mode  # "train", "dev", "eval"
+        
+        logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+        logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
+        if target_scores_path is not None: # TODO: RESTORE!
+            if self.mode != 'train':
+                raise ValueError("Continuous target scores are not supposed to used for evaluation, only for training")
+            logger.info("Loading target scores (training labels) for documents from '{}' ...".format(target_scores_path))
+            if target_scores_path.endswith('.pickle'):
+                with open(target_scores_path, 'rb') as f:
+                    self.target_scores = pickle.load(f)  # dict{qID: dict{pID: relevance}} continuous (float) label scores used for training
+            else:
+                self.target_scores = load_qrels(target_scores_path, relevance_thr=include_at_level)
+            logger.info("Size of target scores: {} MB".format(int(round(sys.getsizeof(self.target_scores)/1024**2))))
+            logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+            logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+        
+        else:
+            self.target_scores = None
+
 
         self.inject_ground_truth = inject_ground_truth  # if True, during evaluation the ground truth relevant documents will be always part of the candidate documents
         if self.inject_ground_truth:
@@ -430,6 +451,9 @@ class MYMARCO_Dataset(Dataset):
             if not self.dynamic_candidates and self.mode != 'train':
                 raise ValueError("Evaluation set was initialized with random candidates!")
 
+        logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+        logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
         self.limit_dataset_size(limit_size)  # Potentially trims self.qids, self.candidates
 
         if mode != 'eval':
@@ -438,8 +462,19 @@ class MYMARCO_Dataset(Dataset):
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
             # relevance level for qrels can be different from the one used for injection (and metrics evaluation)
             self.qrels = load_qrels(qrels_path, relevance_thr=include_at_level, score_mapping=relevance_labels_mapping)  # dict{int qID: dict{int pID: float relevance}}
+            logger.info("Size of g.t. labels (qrels): {} MB".format(int(round(sys.getsizeof(self.qrels)/1024**2))))
+           
+            logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+            logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+           
             # pytrec_eval requires conversion to *str IDs* and *int relevance* for qrels
+            logger.info('Making a reformatted copy of qrels ...')
             self.reformatted_qrels = {str(qid): {str(pid): int(score) for pid, score in pdict.items()} for qid, pdict in self.qrels.items()}
+            logger.info("Size of reformatted qrels: {} MB".format(int(round(sys.getsizeof(self.reformatted_qrels)/1024**2))))
+            
+            logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+            logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+            
             extra_qids = set(self.qids) - set(self.qrels.keys())
             if len(extra_qids) > 0:  # fail early if there are missing labels
                 err_str = "{} query IDs in the specified '{}' dataset do not exist in '{}'!".format(len(extra_qids), mode, qrels_path)
@@ -449,16 +484,21 @@ class MYMARCO_Dataset(Dataset):
         else:
             self.qrels = None
 
-        if target_scores_path is not None:
-            if self.mode != 'train':
-                raise ValueError("Continuous target scores are not supposed to used for evaluation, only for training")
-            if target_scores_path.endswith('.pickle'):
-                with open(target_scores_path, 'rb') as f:
-                    self.target_sores = pickle.load(f)  # dict{qID: dict{pID: relevance}} continuous (float) label scores used for training
-            else:
-                self.target_scores = load_qrels(target_scores_path, relevance_thr=include_at_level)
-        else:
-            self.target_scores = None
+        logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+        logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
+        # if target_scores_path is not None:
+        #     if self.mode != 'train':
+        #         raise ValueError("Continuous target scores are not supposed to used for evaluation, only for training")
+        #     logger.info("Loading target scores (training labels) for documents from '{}' ...".format(target_scores_path))
+        #     if target_scores_path.endswith('.pickle'):
+        #         with open(target_scores_path, 'rb') as f:
+        #             self.target_scores = pickle.load(f)  # dict{qID: dict{pID: relevance}} continuous (float) label scores used for training
+        #     else:
+        #         self.target_scores = load_qrels(target_scores_path, relevance_thr=include_at_level)
+        #     logger.info("Size of target scores: {} MB".format(int(round(sys.getsizeof(self.target_scores)/1024**2))))
+        # else:
+        #     self.target_scores = None
 
         self.include_at_level = include_at_level
         self.relevant_at_level = relevant_at_level
@@ -563,7 +603,7 @@ class MYMARCO_Dataset(Dataset):
             # while ensuring that they are only included once.
             # because of sorting, g.t. positives may be excluded when target_scores are provided, if their score is not high enough to receive a rank < max_inj_relevant
             # rel_cands, rel_scores = zip(*[(docid, score) for docid, score in sorted(label_source[qid].items(), key=itemgetter(1), reverse=True) if score >= self.include_at_level])
-            rel_cands, rel_scores = zip(*[sorted(((docid, score) for docid, score in label_source[qid].items() if score >= self.include_at_level), key=itemgetter(1), reverse=True)])
+            rel_cands, rel_scores = zip(*sorted(((docid, score) for docid, score in label_source[qid].items() if score >= self.include_at_level), key=itemgetter(1), reverse=True))
             # We can limit the number of injected documents from the label source, to allow space for negatives (e.g. dynamic)
             rel_cands = list(rel_cands[:self.max_inj_relevant])
             rel_scores = list(rel_scores[:self.max_inj_relevant])

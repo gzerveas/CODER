@@ -5,6 +5,9 @@ https://gist.github.com/bwhite/3726239
 
 import numpy as np
 from typing import List, Tuple, Dict
+import logging
+logging.basicConfig(format='%(asctime)s | %(levelname)s : %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def mrr(qrels, results, k_values, relevance_level=1, verbose=False) -> Tuple[Dict[str, float]]:
@@ -39,7 +42,7 @@ def mrr(qrels, results, k_values, relevance_level=1, verbose=False) -> Tuple[Dic
     for k in k_values:
         MRR[f"MRR@{k}"] = round(MRR[f"MRR@{k}"]/len(qrels), 5)
         if verbose:
-            print("MRR@{}: {:.4f}".format(k, MRR[f"MRR@{k}"]))
+            logger.info("MRR@{}: {:.4f}".format(k, MRR[f"MRR@{k}"]))
 
     return MRR
 

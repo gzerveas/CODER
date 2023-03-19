@@ -81,15 +81,17 @@ def smooth_labels_objective(trial):
 if __name__ == '__main__':
     
     task = 'rerank'  # 'smooth_labels'
+    dataset = 'MSMARCO'  # 'TripClick'
+    
     if task == 'rerank':
         study_name = 'recipNN_postprocess_reranking_study_normalization'  # This name is shared across jobs/processes
         objective = recipNN_rerank_objective
+        storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{dataset}_optuna.db'
     elif task == 'smooth_labels':
         study_name = 'recipNN_smooth_labels_study'  # This name is shared across jobs/processes
-        objective = recipNN_rerank_objective
+        objective = smooth_labels_objective
+        storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{task}_{dataset}_optuna.db'
 
-    storage = 'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_MSMARCO_optuna.db' #'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_TripClick_optuna.db'
-    
     n_trials = 200
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())
     direction = 'minimize' if OPTIM_METRIC in NEG_METRICS else 'maximize'

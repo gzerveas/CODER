@@ -12,6 +12,7 @@ from datetime import datetime
 import argparse
 import json
 import pickle
+import builtins
 
 import torch
 import numpy as np
@@ -93,7 +94,7 @@ class ReciprocalNearestNeighbors(object):
     
     def __init__(self, query_embedding_dir, doc_embedding_dir, embedding_dim, candidates_path, 
                  qrels_path=None, query_ids_path=None, 
-                 compute_only_for_qrels=True, inject_ground_truth=False, relevance_thr=1.0, rel_type='int',
+                 compute_only_for_qrels=True, inject_ground_truth=False, relevance_thr=1.0, rel_type=builtins.int,
                  device='cpu', save_memory=False) -> None:
         """
         :param query_embedding_dir: _description_
@@ -105,7 +106,7 @@ class ReciprocalNearestNeighbors(object):
         :param compute_only_for_qrels: _description_, defaults to True
         :param inject_ground_truth: _description_, defaults to False
         :param relevance_thr: _description_, defaults to 1.0
-        :param rel_type: str, data type of relevance scores (int or float). Unfortunately, int is *required* by pytrec_eval
+        :param rel_type: data type of relevance scores (int or float). Unfortunately, int is *required* by pytrec_eval
         :param device: PyTorch device to run the computation. By default CPU.
         :param save_memory: _description_, defaults to False
         """
@@ -285,7 +286,7 @@ class ReciprocalNearestNeighbors(object):
     # TODO: consider whether similarities with respect to the query should also be taken into account when building new labels
     def compute_smooth_labels(self, query_ids, hit=1000, 
                               normalization='None', k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3,
-                              rel_aggregation='mean', redistribute='fully', redistr_prt=0.2, norm_relevances='None', boost_factor=1.0):
+                              rel_aggregation='mean', redistribute='fully', redistr_prt=0.2, norm_relevances='None', boost_factor=1.0, return_top=None):
         """
         Extends existing ground-truth relevant judgements by using  *within the context of the query* each g.t. relevant document
         as a probe to find its reciprocal nearest neighbors and compute its similarity to those as a combination between 
@@ -354,6 +355,11 @@ class ReciprocalNearestNeighbors(object):
             orig_relevances = torch.tensor(list(self.qrels[qid].values()), dtype=torch.float32)  # (num_relevant,) g.t. relevance score for each g.t. relevant document
             new_relevances = self.recompute_relevances(final_sims, orig_relevances, 
                                                        rel_aggregation, redistribute, redistr_prt, norm_relevances, boost_factor).cpu().numpy()  # (num_cands,) recomputed relevances
+            
+            if return_top is not None:
+                new_relevances, top_indices = torch.topk(new_relevances, k=return_top, largest=True)
+                doc_ids = doc_ids[top_indices.cpu()]
+                new_relevances = new_relevances.cpu().numpy()
             
             smooth_labels[qid] = dict((docid, float(new_relevances[i])) for i, docid in enumerate(doc_ids))
             
@@ -478,7 +484,7 @@ def recip_NN_rerank(args):
     
     recipn = ReciprocalNearestNeighbors(args.query_embedding_dir, args.doc_embedding_dir, args.embedding_dim, args.candidates_path,
                                               args.qrels_path, args.query_ids_path, args.compute_only_for_qrels, args.inject_ground_truth, args.relevance_thr,
-                                              rel_type='int', device=args.device, save_memory=args.save_memory)
+                                              rel_type=builtins.int, device=args.device, save_memory=args.save_memory)
     
     logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
@@ -547,7 +553,7 @@ def extend_relevances(args):
                                                      args.normalize, args.k, args.trust_factor, args.k_exp, 
                                                      args.weight_func, args.weight_func_param, args.sim_mixing_coef,
                                                      args.rel_aggregation, args.redistribute, args.redistr_prt, 
-                                                     args.norm_relevances, args.boost_factor)
+                                                     args.norm_relevances, args.boost_factor, args.return_top)
     
     total_runtime = time.time() - start_time
     logger.info("Total runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(total_runtime)))
@@ -659,6 +665,9 @@ def run_parse_args():
     parser.add_argument("--inject_ground_truth", action='store_true',
                         help="Reranking: If true, the ground truth document(s) will be injected into the set of documents "
                              "to be reranked, even if they weren't part of the original candidates.")
+    parser.add_argument("--return_top", type=int, default=None,
+                        help="If set, only the top `return_top` documents based on recomputed relevance "
+                        "with respect to the g.t. document(s) will be returned for each query.")
     
     # I/O
     parser.add_argument("--output_dir", type=str, default='.',
