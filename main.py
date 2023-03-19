@@ -61,6 +61,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                                     emb_collection=val_dataloader.dataset.emb_collection,
                                     relevance_labels_mapping=args.relevance_labels_mapping,
                                     include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level,
+                                    max_inj_relevant=args.max_inj_relevant,
                                     collection_neutrality_path=args.collection_neutrality_path)
     collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu,
                                                 label_format=model.loss_module.formatting)
@@ -491,17 +492,126 @@ def evaluate_slow(args, model, dataloader, mode, prefix='model'):
         return mrr
 
 
-def main(config, trial=None):  # trial is an Optuna hyperparameter optimization object
+def get_dataset(args, eval_mode, tokenizer):
+    """Initialize and return evaluation dataset object based on args"""
+
+    if args.model_type == 'repbert':
+        return MSMARCODataset(eval_mode, args.msmarco_dir, args.collection_memmap_dir, args.tokenized_path,
+                              args.max_query_length, args.max_doc_length, limit_size=args.eval_limit_size)
+    else:
+        return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.eval_query_tokens_path,
+                               args.eval_candidates_path, qrels_path=args.qrels_path, query_ids_path=args.eval_query_ids,
+                               tokenizer=tokenizer, max_query_length=args.max_query_length,
+                               num_candidates=None,  # Always use ALL candidates for evaluation
+                               limit_size=args.eval_limit_size,
+                               load_collection_to_memory=args.load_collection_to_memory,
+                               inject_ground_truth=args.inject_ground_truth,
+                               relevance_labels_mapping=args.relevance_labels_mapping,
+                               include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level)
+
+
+def get_query_encoder(query_encoder_from, query_encoder_config):
+    """Initialize and return query encoder model object based on args"""
+
+    if os.path.exists(query_encoder_from):
+        logger.info("Will load pre-trained query encoder from: {}".format(query_encoder_from))
+    else:
+        logger.warning("Will initialize standard HuggingFace '{}' as a query encoder!".format(query_encoder_from))
+    start_time = time.time()
+    encoder = AutoModel.from_pretrained(query_encoder_from, config=query_encoder_config)
+    logger.info("Query encoder loaded in {} s".format(time.time() - start_time))
+    return encoder
+
+
+def get_model(args, doc_emb_dim=None):
+    """Initialize and return end-to-end model object based on args"""
+
+    query_encoder = get_query_encoder(args.query_encoder_from, args.query_encoder_config)
+
+    if args.model_type == 'mdstransformer':
+
+        loss_module = get_loss_module(args.loss_type, args)
+        aux_loss_module = None
+        if args.aux_loss_type is not None:
+            aux_loss_module = get_loss_module(args.aux_loss_type, args)  # instantiate auxiliary loss module
+
+        return CODER(custom_encoder=query_encoder,
+                     d_model=args.d_model,
+                     num_heads=args.num_heads,
+                     num_decoder_layers=args.num_layers,
+                     dim_feedforward=args.dim_feedforward,
+                     dropout=args.dropout,
+                     activation=args.activation,
+                     normalization=args.normalization_layer,
+                     doc_emb_dim=doc_emb_dim,
+                     scoring_mode=args.scoring_mode,
+                     temperature=args.temperature,
+                     query_emb_aggregation=args.query_aggregation,
+                     loss_module=loss_module,
+                     aux_loss_module=aux_loss_module,
+                     aux_loss_coeff=args.aux_loss_coeff,
+                     selfatten_mode=args.selfatten_mode,
+                     no_decoder=args.no_decoder,
+                     no_dec_crossatten=args.no_dec_crossatten,
+                     bias_regul_coeff=args.bias_regul_coeff,
+                     bias_regul_cutoff=args.bias_regul_cutoff)
+    else:
+        raise NotImplementedError('Unknown model type')
+
+
+def get_tokenizer(args):
+    """Initialize and return tokenizer object based on args"""
+
+    if args.tokenizer_from is None:  # use same config as specified for the query encoder model
+        return AutoTokenizer.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
+    else:
+        return AutoTokenizer.from_pretrained(args.tokenizer_from)
+
+
+def setup(args):
+    """Prepare training session: read configuration from file (takes precedence), create directories.
+    Input:
+        args: arguments object from argparse
+    Returns:
+        config: configuration dictionary
+    """
+
+    config = utils.load_config(args)  # configuration dictionary
+    config = options.check_args(config)  # check validity of settings and make necessary conversions
+
+    # Create output directory and subdirectories
+    initial_timestamp = datetime.now()
+    output_dir = config['output_dir']
+    if not os.path.isdir(output_dir):
+        raise IOError(
+            "Root directory '{}', where the directory of the experiment will be created, must exist".format(output_dir))
+
+    output_dir = os.path.join(output_dir, config['experiment_name'])
+
+    formatted_timestamp = initial_timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+    if (not config['no_timestamp']) or (len(config['experiment_name']) == 0):
+        rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
+        output_dir += "_" + formatted_timestamp + "_" + rand_suffix
+    config['output_dir'] = output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save configuration as a (pretty) json file
+    with open(os.path.join(output_dir, 'configuration.json'), 'w') as fp:
+        json.dump(config, fp, indent=4, sort_keys=True)
+    logger.info("Stored configuration file in '{}'".format(output_dir))
+    
+    # Rest of configuration (does not need to be saved as a JSON config file)
+    info_dict = {'initial_timestamp': formatted_timestamp,
+                'save_dir': os.path.join(output_dir, 'checkpoints'),
+                'pred_dir': os.path.join(output_dir, 'predictions'),
+                'tensorboard_dir': os.path.join(output_dir, 'tb_summaries')}
+    config.update(info_dict)
+    
     args = utils.dict2obj(config)  # Convert config dict to args object
-
-    if args.debug:
-        logger.setLevel('DEBUG')
-    # Add file logging besides stdout
-    file_handler = logging.FileHandler(os.path.join(args.output_dir, 'output.log'))
-    logger.addHandler(file_handler)
-
-    logger.info('Running:\n{}\n'.format(' '.join(sys.argv)))  # command used to run
-
+    
+    # Create subdirectories
+    utils.create_dirs([args.save_dir, args.pred_dir, args.tensorboard_dir])
+    
     # Setup CUDA, GPU
     args.n_gpu = len(args.cuda_ids)
     if torch.cuda.is_available():
@@ -511,13 +621,49 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
             args.device = torch.device("cuda:%d" % args.cuda_ids[0])
     else:
         args.device = torch.device("cpu")
+        
+    # Add file logging besides stdout
+    file_handler = logging.FileHandler(os.path.join(args.output_dir, 'output.log'))
+    logger.addHandler(file_handler)
 
     # Log current hardware setup
     logger.info("Device: %s, n_gpu: %s", args.device, args.n_gpu)
     if args.device.type == 'cuda':
         logger.info("Device: {}".format(torch.cuda.get_device_name(0)))
-        total_mem = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
-        logger.info("Total memory: {} MB".format(np.ceil(total_mem)))
+        total_mem_mb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
+        total_mem_mb = int(np.ceil(total_mem_mb))
+        logger.info("Total memory: {} MB".format(total_mem_mb))
+
+    # Store additional configuration, code version and environment info
+    info_dict['device'] = str(args.device)
+    info_dict['n_gpu'] = args.n_gpu
+    if args.device.type == 'cuda':
+        info_dict['cuda device'] = torch.cuda.get_device_name(0)
+        info_dict['cuda memory'] = total_mem_mb
+    
+    info_dict['Git hash'] = utils.get_git_revision_short_hash()
+    git_diff = utils.get_git_diff()
+    if len(git_diff) > 0:
+        info_dict['Git diff'] = "See file 'git_diff.txt'"
+        with open(os.path.join(args.output_dir, 'git_diff.txt'), 'w', encoding="utf-8") as f:
+            f.write(git_diff)
+    else:
+        info_dict['Git diff'] = "No changes"
+    info_dict['experiment_name'] = args.experiment_name
+    
+    utils.write_columns_to_csv(os.path.join(output_dir, "info.txt"), rows=info_dict.items(), delimiter='\t')
+    
+    utils.write_conda_env(os.path.join(output_dir, "conda_env.txt"))
+
+    return args
+
+
+def main(args, trial=None):  # trial is an Optuna hyperparameter optimization object
+
+    if args.debug:
+        logger.setLevel('DEBUG')
+
+    logger.info('Running:\n{}\n'.format(' '.join(sys.argv)))  # command used to run the script
 
 
     # ##### TODO: HACK TO DEBUG hyperparam_optim
@@ -647,132 +793,11 @@ def main(config, trial=None):  # trial is an Optuna hyperparameter optimization 
         return eval_metrics
 
 
-def setup(args):
-    """Prepare training session: read configuration from file (takes precedence), create directories.
-    Input:
-        args: arguments object from argparse
-    Returns:
-        config: configuration dictionary
-    """
-
-    config = utils.load_config(args)  # configuration dictionary
-    config = options.check_args(config)  # check validity of settings and make necessary conversions
-
-    # Create output directory and subdirectories
-    initial_timestamp = datetime.now()
-    output_dir = config['output_dir']
-    if not os.path.isdir(output_dir):
-        raise IOError(
-            "Root directory '{}', where the directory of the experiment will be created, must exist".format(output_dir))
-
-    output_dir = os.path.join(output_dir, config['experiment_name'])
-
-    formatted_timestamp = initial_timestamp.strftime("%Y-%m-%d_%H-%M-%S")
-    if (not config['no_timestamp']) or (len(config['experiment_name']) == 0):
-        rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
-        output_dir += "_" + formatted_timestamp + "_" + rand_suffix
-    config['output_dir'] = output_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Save configuration as a (pretty) json file
-    with open(os.path.join(output_dir, 'configuration.json'), 'w') as fp:
-        json.dump(config, fp, indent=4, sort_keys=True)
-    logger.info("Stored configuration file in '{}'".format(output_dir))
-
-    # Create subdirectories and store additional configuration info
-    info_dict = {'initial_timestamp': formatted_timestamp,
-                 'save_dir': os.path.join(output_dir, 'checkpoints'),
-                 'pred_dir': os.path.join(output_dir, 'predictions'),
-                 'tensorboard_dir': os.path.join(output_dir, 'tb_summaries')}
-    utils.create_dirs([info_dict['save_dir'], info_dict['pred_dir'], info_dict['tensorboard_dir']])
-    with open(os.path.join(output_dir, 'info.txt'), 'w') as fp:
-        json.dump(info_dict, fp)
-    config.update(info_dict)
-
-    return config
-
-
-def get_dataset(args, eval_mode, tokenizer):
-    """Initialize and return evaluation dataset object based on args"""
-
-    if args.model_type == 'repbert':
-        return MSMARCODataset(eval_mode, args.msmarco_dir, args.collection_memmap_dir, args.tokenized_path,
-                              args.max_query_length, args.max_doc_length, limit_size=args.eval_limit_size)
-    else:
-        return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.eval_query_tokens_path,
-                               args.eval_candidates_path, qrels_path=args.qrels_path, query_ids_path=args.eval_query_ids,
-                               tokenizer=tokenizer, max_query_length=args.max_query_length,
-                               num_candidates=None,  # Always use ALL candidates for evaluation
-                               limit_size=args.eval_limit_size,
-                               load_collection_to_memory=args.load_collection_to_memory,
-                               inject_ground_truth=args.inject_ground_truth,
-                               relevance_labels_mapping=args.relevance_labels_mapping,
-                               include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level)
-
-
-def get_query_encoder(query_encoder_from, query_encoder_config):
-    """Initialize and return query encoder model object based on args"""
-
-    if os.path.exists(query_encoder_from):
-        logger.info("Will load pre-trained query encoder from: {}".format(query_encoder_from))
-    else:
-        logger.warning("Will initialize standard HuggingFace '{}' as a query encoder!".format(query_encoder_from))
-    start_time = time.time()
-    encoder = AutoModel.from_pretrained(query_encoder_from, config=query_encoder_config)
-    logger.info("Query encoder loaded in {} s".format(time.time() - start_time))
-    return encoder
-
-
-def get_model(args, doc_emb_dim=None):
-    """Initialize and return end-to-end model object based on args"""
-
-    query_encoder = get_query_encoder(args.query_encoder_from, args.query_encoder_config)
-
-    if args.model_type == 'mdstransformer':
-
-        loss_module = get_loss_module(args.loss_type, args)
-        aux_loss_module = None
-        if args.aux_loss_type is not None:
-            aux_loss_module = get_loss_module(args.aux_loss_type, args)  # instantiate auxiliary loss module
-
-        return CODER(custom_encoder=query_encoder,
-                     d_model=args.d_model,
-                     num_heads=args.num_heads,
-                     num_decoder_layers=args.num_layers,
-                     dim_feedforward=args.dim_feedforward,
-                     dropout=args.dropout,
-                     activation=args.activation,
-                     normalization=args.normalization_layer,
-                     doc_emb_dim=doc_emb_dim,
-                     scoring_mode=args.scoring_mode,
-                     temperature=args.temperature,
-                     query_emb_aggregation=args.query_aggregation,
-                     loss_module=loss_module,
-                     aux_loss_module=aux_loss_module,
-                     aux_loss_coeff=args.aux_loss_coeff,
-                     selfatten_mode=args.selfatten_mode,
-                     no_decoder=args.no_decoder,
-                     no_dec_crossatten=args.no_dec_crossatten,
-                     bias_regul_coeff=args.bias_regul_coeff,
-                     bias_regul_cutoff=args.bias_regul_cutoff)
-    else:
-        raise NotImplementedError('Unknown model type')
-
-
-def get_tokenizer(args):
-    """Initialize and return tokenizer object based on args"""
-
-    if args.tokenizer_from is None:  # use same config as specified for the query encoder model
-        return AutoTokenizer.from_pretrained(args.query_encoder_from, config=args.query_encoder_config)
-    else:
-        return AutoTokenizer.from_pretrained(args.tokenizer_from)
-
-
 if __name__ == "__main__":
     total_start_time = time.time()
     args = run_parse_args()
-    config = setup(args)  # Setup experiment session
-    main(config)
+    args = setup(args)  # Setup experiment session
+    main(args)
     logger.info("All done!")
     total_runtime = time.time() - total_start_time
     logger.info("Total runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(total_runtime)))

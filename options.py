@@ -132,6 +132,8 @@ def run_parse_args():
                              "in order to be considered relevant in training and evaluation (incl. metrics calculation)."
                              " Below this level, the target relev. prob. will be 0."
                              "Should be at least as high as `include_at`, and is typically > 0.")
+    parser.add_argument('--max_inj_relevant', type=int, default=1000,
+                        help="Maximum number of 'relevant' candidates to inject per query when training (whether they come from qrels or target scores)")    
     parser.add_argument("--relevance_labels_mapping", type=str, default=None,
                         help="Optional: A string used to define a dictionary used to override/map relevance scores as "
                              "given in `qrels_path` to a new value, e.g. {1: 0.333}")

@@ -374,6 +374,8 @@ class MYMARCO_Dataset(Dataset):
         :param include_at_level: candidate with a score >= this level will be included in qrels and injected candidates
         :param relevant_at_level: candidate with a score >= this level will be included in injected candidates and
             keep their respective scores as target scores (if `label_format` is `scores`).
+        :param max_inj_relevant: maximum number of 'relevant' candidates to inject per query when training
+            (whether they come from qrels or target scores)
         :param collection_neutrality_path: path to file containing neutrality scores, in the format: docID \t score\n
         :param query_ids_path: Path to a file containing the query IDs to be used for this dataset, 1 in each line.
             If not provided, the IDs in the memmap inside `candidates_path` will be used.

@@ -34,6 +34,28 @@ logging.basicConfig(format='%(asctime)s | %(levelname)s : %(message)s', level=lo
 logger = logging.getLogger(__name__)
 
 
+def get_git_revision_short_hash():
+    """
+    Returns the short Git revision hash of the current working directory.
+    """
+    gitpath = os.path.join(os.path.dirname(__file__), '.git')
+    return subprocess.check_output(['git', '--git-dir', gitpath, 'rev-parse', '--short', 'HEAD']).strip().decode('utf-8')
+
+
+def get_git_diff():
+    """
+    Returns the Git diff of the current working directory from HEAD revision.
+    """
+    gitpath = os.path.join(os.path.dirname(__file__), '.git')
+    return subprocess.check_output(['git', '--git-dir', gitpath, 'diff', 'HEAD']).strip().decode('utf-8')
+
+
+def write_conda_env(filepath):
+    """Exports the packages installed in the current conda environment to a file."""
+    subprocess.check_output(['conda', 'env', 'export', '-n', 'base', '-f', filepath])
+    return
+
+
 def rank_docs(docids, scores, shuffle=True):
     """Given a list of document IDs and a (potentially longer due to padding) 1D array of their scores, sort both scores
     and coresponding document IDs in the order of descending scores."""
@@ -483,20 +505,20 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
 
     # Label with specially formatted floats
     if base_pred_scores is None:
-        labels = [str(f) for f in freqs]
+        label_vals = freqs
         # ax.bar_label(hbars, fmt='%d', padding=5)  # Requires matplotlib 3.4.0+
         xlim = max(freqs)
     else:
-        labels=['{}'.format(d) for d in (freqs - orig_freqs)]
+        label_vals = freqs - orig_freqs
         # ax.bar_label(hbars, fmt='%d', labels=labels, padding=10)
         xlim = max(max(freqs), max(orig_freqs))
     
     # Put labels on top of bars
     # rects = ax.patches    
-    for rect, label in zip(rects, labels):
+    for rect, label_val in zip(rects, label_vals):
         width = rect.get_width()
-        color = 'red' if label < 0 else 'blue'
-        ax.text(width + 0.1*xlim, rect.get_y() + rect.get_height() / 2, label, ha="center", va="center", color=color)
+        color = 'red' if label_val < 0 else 'blue'
+        ax.text(width + 0.1*xlim, rect.get_y() + rect.get_height() / 2, str(label_val), ha="center", va="center", color=color)
     
     ax.set_xlim(right=1.2*xlim)  # adjust xlim to fit labels
     ax.legend()
@@ -505,11 +527,17 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
     return freqs, bin_edges
 
 
-def write_columns_to_csv(filename, columns, header=None, delimiter=','):
-    """Writes the given columns (iterable of iterables of same length) to a csv file by making use of the CSV writer module.
+def write_columns_to_csv(filename, columns=None, rows=None, header=None, delimiter=','):
+    """Writes the given columns (iterable of iterables of same length) XOR rows (iterable of iterables of arbitrary length) 
+    to a csv file by making use of the CSV writer module.
     If header is not None, it is written as the first line."""
     
-    rows = zip(*columns)
+    if columns is not None:
+        if rows is not None:
+            logger.warning('Both columns and rows were specified. Ignoring rows!')
+        rows = zip(*columns)
+    else:
+        assert rows is not None, 'Either columns or rows must be specified!'
     
     with open(filename, 'w') as f:
         csvwriter = csv.writer(f, dialect='excel', delimiter=delimiter)
