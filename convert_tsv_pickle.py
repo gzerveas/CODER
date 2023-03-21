@@ -51,8 +51,8 @@ def convert_tsv_to_pickle(input_path, output_path, score_type, id_type, num_top=
         for qid in scores:
             scores[qid] = dict(sorted(scores[qid].items(), key=itemgetter(1), reverse=True)[:num_top])
             # TODO: to remove boost factor from first passage score. RESTORE BY REMOVING BELOW!
-            first_docid = next(iter(scores[qid].items()))[0]
-            scores[qid][first_docid] /= 2
+            # first_docid = next(iter(scores[qid].items()))[0]
+            # scores[qid][first_docid] /= 2
         
     logger.info("Writing labels/scores to {} ...".format(output_path))
     utils.write_predictions(output_path, scores, format="pickle")

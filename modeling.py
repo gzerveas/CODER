@@ -248,6 +248,9 @@ class DotProductScorer(Scorer):
     # (e.g. normalization, temperature, pre-activation function) would have to be replicated 
     # when using the model for dense retrieval, i.e. outside of reranking. However, linear transformations don't affect rankings.
     """
+    
+    TEMP_INIT = 0  # initial temperature value. Expects exponentiation of temperature parameter!
+    
     def __init__(self, scoring_mode='', pre_activation=None, normalize=False, aggregation='mean', temperature: Union[str,float,None]=None):
         """
         :param scoring_mode: string, same as the option used to initialize `CODER`. At this point, the string
@@ -272,9 +275,11 @@ class DotProductScorer(Scorer):
         self.normalize = normalize
         
         if temperature == 'learnable':
-            self.temperature = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=True)
-        elif temperature is not None and temperature > 0:
-            self.temperature = nn.Parameter(torch.full(1, temperature, dtype=torch.float32), requires_grad=False)
+            self.temperature = nn.Parameter(torch.full((1,), self.TEMP_INIT, dtype=torch.float32), requires_grad=True)
+            self.b = nn.Parameter(torch.full((1,), 0, dtype=torch.float32), requires_grad=True)
+        elif temperature is not None: #and temperature > 0:
+            self.temperature = nn.Parameter(torch.full((1,), temperature, dtype=torch.float32), requires_grad=False)
+            self.b = 0
         else:
             self.temperature = None
         return
@@ -303,7 +308,7 @@ class DotProductScorer(Scorer):
             scores = torch.matmul(output_emb, agg_query_emb[:, :, None]).squeeze()  # to disable scaling
             
         if self.temperature:
-            scores = scores / self.temperature
+            scores = scores / torch.exp(self.temperature) + self.b
 
         return scores
 

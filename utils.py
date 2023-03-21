@@ -52,8 +52,8 @@ def get_git_diff():
 
 def write_conda_env(filepath):
     """Exports the packages installed in the current conda environment to a file."""
-    subprocess.check_output(['conda', 'env', 'export', '-n', 'base', '-f', filepath])
-    return
+    # Also: os.system('conda list')
+    return subprocess.check_output(['conda', 'env', 'export', '-f', filepath])
 
 
 def rank_docs(docids, scores, shuffle=True):
@@ -513,8 +513,7 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
         # ax.bar_label(hbars, fmt='%d', labels=labels, padding=10)
         xlim = max(max(freqs), max(orig_freqs))
     
-    # Put labels on top of bars
-    # rects = ax.patches    
+    # Put labels on the right side of bars    
     for rect, label_val in zip(rects, label_vals):
         width = rect.get_width()
         color = 'red' if label_val < 0 else 'blue'

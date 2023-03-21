@@ -653,7 +653,7 @@ def setup(args):
     
     utils.write_columns_to_csv(os.path.join(output_dir, "info.txt"), rows=info_dict.items(), delimiter='\t')
     
-    utils.write_conda_env(os.path.join(output_dir, "conda_env.txt"))
+    utils.write_conda_env(os.path.join(output_dir, "conda_env.yml"))
 
     return args
 
