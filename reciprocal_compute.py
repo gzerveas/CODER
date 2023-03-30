@@ -14,6 +14,7 @@ import json
 import pickle
 import builtins
 
+import h5py
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -498,7 +499,7 @@ def recip_NN_rerank(args):
     if args.write_to_file:
         start_time = time.perf_counter()
         logger.info(f"Writing ranks to {args.out_filepath} ...")
-        utils.write_predictions(args.out_filepath, reranked_scores, args.write_to_file)
+        utils.write_predictions(args.out_filepath, reranked_scores, format=args.write_to_file)
         global write_results_times
         write_results_times.update(time.perf_counter() - start_time)
 
@@ -561,12 +562,17 @@ def extend_relevances(args):
     logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
     
     if args.write_to_file:
+        del recipn
         logger.info(f"Writing recomputed labels to {args.out_filepath} ...")
         start_time = time.perf_counter()
-        with open(args.out_filepath, args.mode) as out_file:
-            if args.write_to_file == 'pickle':
+        if args.write_to_file == 'hdf5':
+            with h5py.File(args.out_filepath, args.mode) as out_file:
+                utils.write_dict_hdf5(out_file, recomputed_labels, dtype='float16')
+        elif args.write_to_file == 'pickle':
+            with open(args.out_filepath, args.mode) as out_file:
                 pickle.dump(recomputed_labels, out_file, protocol=pickle.HIGHEST_PROTOCOL)
-            else:
+        else:
+            with open(args.out_filepath, args.mode) as out_file:
                 for qid, doc2score in recomputed_labels.items():
                     for i, (docid, score) in enumerate(doc2score.items()):
                         out_file.write(f"{qid}\tQ0\t{docid}\t{score:.8f}\n")
@@ -608,7 +614,12 @@ def setup(args):
     args = utils.dict2obj(config)
     
     # Rest of setup (no need to store in configuration file)
-    suffix = '_labels' if config['task'] == 'smooth_labels' else ''
+    suffix = ''  # part of filename that is added to output file
+    if args.task == 'smooth_labels':
+        suffix = '_labels'
+        if args.write_to_file is None:
+            args.write_to_file = 'hdf5' # force writing to file, otherwise task is meaningless
+    
     if args.write_to_file:
         args.out_filepath = os.path.join(output_dir, args.out_name + f'_top{args.hit}' + suffix + '.' + args.write_to_file)
         args.mode = 'wb' if args.write_to_file == 'pickle' else 'w'
@@ -675,8 +686,8 @@ def run_parse_args():
                     
     parser.add_argument('--records_file', default='./records.xls', 
                         help='Excel file keeping best records of all experiments')
-    parser.add_argument("--write_to_file", type=str, choices=['tsv', 'pickle'], default=None,
-                        help="If set, predictions (scores per document for each query) will be written to a .tsv file")
+    parser.add_argument("--write_to_file", type=str, choices=['hdf5', 'tsv', 'pickle'], default=None,
+                        help="If set, predictions (scores per document for each query) will be written to a file of the specified format")
     parser.add_argument("--doc_embedding_dir", type=str,
                         help="Directory containing the memmap files corresponding to document embeddings.")
     parser.add_argument("--query_embedding_dir", type=str,

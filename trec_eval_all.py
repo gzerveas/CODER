@@ -26,7 +26,7 @@ parser.add_argument("--relevance_level", type=int, default=1,
 parser.add_argument("--write_to_json", action='store_true',
                     help="If set, will write metrics to JSON files whose path will match `pred_path`, but with a different extension."
                     "(e.g. '.dev.small.tsv', hence automatically generating the corresponding qrel paths.")
-parser.add_argument('--records_file', default='./records.xlsx', help="Excel file keeping records of all experiments. If 'None', will not export results to an excel sheet.")
+parser.add_argument('--records_file', default='./records.xls', help="Excel file keeping records of all experiments. If 'None', will not export results to an excel sheet.")
 args = parser.parse_args()
 
 
@@ -74,19 +74,22 @@ for filename in filepaths:
     
     print(perf_metrics)
     
-    perf_metrics['time'] = '-'
-    
-    WEIGHT_FUNC = '-'
-    WEIGHT_FUNC_PARAM = '-'
-    NORMALIZATION = '-'
-    parameters = OrderedDict()
-    parameters['sim_mixing_coef'] = '-'
-    parameters['k'] = '-'
-    parameters['trust_factor'] = '-'
-    parameters['k_exp'] = '-'
-    parameters['normalize'] = NORMALIZATION
-    parameters['weight_func'] = WEIGHT_FUNC
-    parameters['weight_func_param'] = WEIGHT_FUNC_PARAM
+    if False:
+        perf_metrics['time'] = '-'
+        
+        WEIGHT_FUNC = '-'
+        WEIGHT_FUNC_PARAM = '-'
+        NORMALIZATION = '-'
+        parameters = OrderedDict()
+        parameters['sim_mixing_coef'] = '-'
+        parameters['k'] = '-'
+        parameters['trust_factor'] = '-'
+        parameters['k_exp'] = '-'
+        parameters['normalize'] = NORMALIZATION
+        parameters['weight_func'] = WEIGHT_FUNC
+        parameters['weight_func_param'] = WEIGHT_FUNC_PARAM
+    else:
+        parameters = None
         
     # Export record metrics to a file accumulating records from all experiments
     if args.records_file != 'None':

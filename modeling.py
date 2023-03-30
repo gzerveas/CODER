@@ -3,10 +3,11 @@ import logging
 from typing import Optional, Any, Dict, Union
 
 import torch
-import numpy as np
 from torch import nn, Tensor
 import torch.nn.functional as F
 from transformers import BertModel, BertPreTrainedModel, AutoModel
+
+import dataset
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ def _mask_both_directions(valid_mask, token_type_ids):
 
 class RepBERT_Train(BertPreTrainedModel):
     """
-    Instead of bi-encoder, a single encoder is used, and token_type_ids with attention masking is applied to separate
+    NOTE(GEO): Instead of bi-encoder, a single encoder is used, and token_type_ids with attention masking is applied to separate
     query self-attention and doc self-attention. There is no query-doc token interaction in self-attention calculations.
     Based on HF BERT implementation, this may be inefficient: attention masks (apparently) are just added, instead
     of preventing computations altogether. This means that the full O(seq_len^2) cost is there, and is therefore worse
@@ -249,14 +250,14 @@ class DotProductScorer(Scorer):
     # when using the model for dense retrieval, i.e. outside of reranking. However, linear transformations don't affect rankings.
     """
     
-    TEMP_INIT = 0  # initial temperature value. Expects exponentiation of temperature parameter!
+    TEMP_INIT = 1 #0  # initial temperature value. Expects exponentiation of temperature parameter!
     
     def __init__(self, scoring_mode='', pre_activation=None, normalize=False, aggregation='mean', temperature: Union[str,float,None]=None):
         """
         :param scoring_mode: string, same as the option used to initialize `CODER`. At this point, the string
             must start with "doc_product" or "cosine", but the suffix can specify a (non)linear transformation to be used on scores
         :param pre_activation: activation function to use on representations BEFORE computing the inner product
-        :param normalize: if True, will divide product by vector norms, i.e. will compute the cosine similarity
+        :param normalize: if True, will divide product by vector L2-norms, i.e. will compute the cosine similarity
         :param aggregation: defines how to aggregate final query token representations to obtain a single vector
             representation for the query. 'mean' will average, 'first' will simply select the first vector.
             'None' will not aggregate token representations
@@ -308,14 +309,14 @@ class DotProductScorer(Scorer):
             scores = torch.matmul(output_emb, agg_query_emb[:, :, None]).squeeze()  # to disable scaling
             
         if self.temperature:
-            scores = scores / torch.exp(self.temperature) + self.b
+            scores = (scores * self.temperature) + self.b  #torch.exp(self.temperature)
 
         return scores
 
 
 class BaseLoss(nn.Module):
 
-    def __init__(self, formatting='scores'):
+    def __init__(self, formatting='scores', **kwargs):
         """
         :param formatting: 'indices' or 'scores'.
             If 'scores', assumes that `labels` have the same formatting as `predictions`:
@@ -393,8 +394,26 @@ class RelevanceCrossEntropyLoss(BaseLoss):
 
 class RelevanceListnetLoss(BaseLoss):
     """
-    KL-divergence loss
+    KL-divergence between the model-predicted score distribution (possibly tempered by temperature) and the target relevance distribution
     """
+
+    def __init__(self, formatting='scores', normalization=None):
+        """
+        :param formatting: 'indices' or 'scores'.
+            If 'scores', assumes that `labels` have the same formatting as `predictions`:
+                each element corresponds to the g.t. relevance score of the respective document (in the order of `predictions`), 
+                with -Inf for non-relevant and padding, e.g. [2.0 1.0 1.0 -Inf ... -Inf]
+            If 'indices', assumes num_relevant integer indices of relevant documents and is padded with -1,
+                e.g. [0, 1, 2, -1, ..., -1]
+        :param normalization: how to normalize scores used as targets (labels): None, 'max', 'maxmin', 'std'. 
+            If None, no normalization is performed; this results in arbitrary range of scores, with potentially flat pre-softmax "distribution".
+            Normalization is supposed to help dealing with the variety of relevance score ranges resulting from different hyperparameter combinations.
+            Ultimately, a KL divergence between the model-predicted score distribution (possibly tempered by temperature)
+            and the target relevance distribution will be computed, which will be obtained by applying a softmax on relevances computed here.
+        """
+        super(RelevanceListnetLoss, self).__init__()
+        self.formatting = formatting
+        self.normalization = normalization
 
     def forward(self, predictions, labels, padding_mask=None):
         """
@@ -412,18 +431,58 @@ class RelevanceListnetLoss(BaseLoss):
             _labels_values[is_padding] = float("-Inf")
         else:
             _labels_values = labels
+            
+        if self.normalization is not None:
+            _labels_values = dataset.normalize_batch(_labels_values, norm_type=self.normalization)
 
         # NOTE: _labels_values = _labels_values / torch.sum(is_relevant, dim=1).unsqueeze(dim=1)
         # is equivalent but interestingly much slower than setting -Inf and computing Softmax; maybe due to CUDA Softmax code
         labels_probs = torch.nn.Softmax(dim=1)(_labels_values)
 
         if padding_mask is not None:
+            # labels don't need to be masked, since they already get -Inf for padding in collate_fn
             predictions[padding_mask] = float("-Inf")
 
         predictions_logprobs = torch.nn.LogSoftmax(dim=1)(predictions)  # (batch, num_cands) log-distribution over docs
         # KLDivLoss expects predictions ('inputs') as log-probabilities and 'targets' as probabilities
         loss = torch.nn.KLDivLoss(reduction='batchmean')(predictions_logprobs, labels_probs)
 
+        return loss
+
+
+class BiasRegularizationLoss(BaseLoss):
+    """KL-divergence between the model-predicted relevance score distribution (possibly tempered by temperature) 
+    and the target neutrality distribution. Essentially the same as RelevanceListnetLoss, 
+    but with a cutoff on the number of considered documents (i.e. the number of documents used to compute the KL-divergence)."""
+    
+    def __init__(self, formatting='indices', bias_regul_cutoff=10):
+        super().__init__(formatting=formatting)
+        self.bias_regul_cutoff = bias_regul_cutoff
+        
+    def forward(self, predictions, labels, padding_mask=None):
+        """
+        :param predictions: (batch_size, num_candidates) relevance scores (arb. range) for each candidate and query.
+        :param labels: (batch_size, num_candidates) tensor of target scores (here, neutrality scores)
+        :param padding_mask: (batch_size, num_candidates) boolean mask. 1 where element is padding, 0 where valid
+        :return: loss: scalar tensor. Mean loss per query
+        """
+        
+        cutoff = min(self.bias_regul_cutoff, labels.shape[1])
+
+        indices_sorted = torch.argsort(predictions, dim=1, descending=True)
+        allow_inds = indices_sorted[:, :cutoff]  # (batch_size, cutoff) indices of `scores` to take into consideration (top-cutoff docs)
+        
+        indices_mask = torch.full_like(predictions, float('-Inf'), dtype=torch.float32)
+        indices_mask[torch.arange(indices_mask.shape[0])[:, None], allow_inds] = 0
+        
+        if padding_mask is not None:
+            # Most likely not necessary, since cut-off will almost certainly exclude padding (that may result from some queries having fewer than num_candidates docs)
+            indices_mask += padding_mask * float('-Inf')
+
+        label_probs = torch.nn.Softmax(dim=1)(labels + indices_mask)
+        prediction_logprobs = torch.nn.LogSoftmax(dim=1)(predictions + indices_mask)
+
+        loss = torch.nn.KLDivLoss(reduction='batchmean')(prediction_logprobs, label_probs)
         return loss
 
 
@@ -530,9 +589,9 @@ class MultiTierLoss(BaseLoss):
                     start_inds.append(new_ind)
         return start_inds
 
-    def forward(self, scores, labels, padding_mask=None):
+    def forward(self, predictions, labels, padding_mask=None):
         """
-        :param scores: (batch_size, num_cands) relevance scores for each candidate document and query.
+        :param predictions: (batch_size, num_cands) relevance scores for each candidate document and query.
         :param labels: (batch_size, num_cands) int tensor which for each query (row) contains the indices (positions) of the
                 relevant documents within its corresponding pool of candidates (cand_inds). If n relevant documents exist,
                 then labels[0:n] are the positions of these documents inside `cand_inds`, and labels[n:] == -1,
@@ -547,22 +606,22 @@ class MultiTierLoss(BaseLoss):
         # is_relevant = (labels > -1)
         # num_relevant = is_relevant.sum(dim=1)  # total number of relevant documents in the batch
         # num_negatives = scores.shape[1] - num_relevant
-        num_negatives = scores.shape[1]  # this is approximately correct; we hereby include the g.t. relevant in tier 1
+        num_negatives = predictions.shape[1]  # this is approximately correct; we hereby include the g.t. relevant in tier 1
         start_inds = self.get_tier_inds(num_negatives)
 
         # Treating as "positives" the documents within each tier, the loss compares
         # their scores to the scores of documents in all lower tiers (and the ones in-between lower tiers)
         # complexity O(num_tiers)
-        loss = torch.zeros(scores.shape[0], dtype=torch.float32, device=scores.device)  # (batch_size,) loss for each query
+        loss = torch.zeros(predictions.shape[0], dtype=torch.float32, device=predictions.device)  # (batch_size,) loss for each query
         for t in range(self.num_tiers - 1):
             # variant to compare with immediately lower tier: inds2 = range(start_inds[t+1], start_inds[t+1] + self.tier_size)
-            loss += self.compute_diffs(scores, range(start_inds[t], start_inds[t] + self.tier_size),
-                                       range(start_inds[t + 1], scores.shape[1]))
+            loss += self.compute_diffs(predictions, range(start_inds[t], start_inds[t] + self.tier_size),
+                                       range(start_inds[t + 1], predictions.shape[1]))
 
         if self.gt_function is not None:
             # in this case a special loss component will be computed from ground truth relevant documents versus
             # all other candidates using the provided function, added with a scaling factor of `self.gt_factor`
-            gt_loss = self.gt_function(scores, labels)
+            gt_loss = self.gt_function(predictions, labels)
             loss = loss + self.gt_factor * gt_loss
 
         if self.reduction == 'mean':
@@ -584,7 +643,7 @@ def get_loss_module(loss_type, args):
     elif loss_type == 'crossentropy':
         return RelevanceCrossEntropyLoss(formatting='indices')
     elif loss_type == 'listnet':
-        return RelevanceListnetLoss(formatting='scores')
+        return RelevanceListnetLoss(formatting='scores', normalization=None)
     elif loss_type == 'multitier':
         return MultiTierLoss(formatting='indices',
                              num_tiers=args.num_tiers, tier_size=args.tier_size, tier_distance=args.tier_distance,
@@ -834,7 +893,7 @@ class CODER(nn.Module):
             over the sequence of query term embeddings in the output of the query encoder
         :param transform_doc_emb: if set, document embeddings will be linearly projected to match `d_model`
         :param bias_regul_coeff: coefficient for bias regularization term in the total loss
-        :param bias_regul_cutoff:
+        :param bias_regul_cutoff: how many top-scored documents to consider for bias regularization
         """
         super(CODER, self).__init__()
 
@@ -904,7 +963,7 @@ class CODER(nn.Module):
         self.aux_loss_coeff = aux_loss_coeff
         
         self.bias_regul_coeff = bias_regul_coeff
-        self.bias_regul_cutoff = bias_regul_cutoff
+        self.bias_regul_module = BiasRegularizationLoss(bias_regul_cutoff=bias_regul_cutoff)
 
     def get_scoring_module(self, scoring_mode, query_emb_aggregation, temperature):
 
@@ -945,7 +1004,7 @@ class CODER(nn.Module):
         :param  doc_attention_mat_mask: (num_docs, num_docs) float additive mask for the decoder sequence (optional).
                     This is for causality, and if FloatTensor, can be directly added on top of the attention matrix.
                     If BoolTensor, positions with ``True`` are ignored, while ``False`` values will be considered.
-        :param  doc_neutscore: (batch_size, num_docs) sequence of document neutrality scores to calculate fairness.
+        :param  doc_neutscore: (batch_size, num_docs) tensor of document neutrality scores to calculate fairness.
         :param  labels: (batch_size, num_docs) optional tensor, if provided, the loss will be computed. 
             Depends on `self.loss_module.formatting`: 'indices' or 'scores'.
             If 'scores', it is a float tensor with the same formatting as predictions: for each row, each position 
@@ -1003,31 +1062,19 @@ class CODER(nn.Module):
         else:
             rel_scores = predictions.squeeze()  # (batch_size, num_docs) relevance scores
             
-        # Fairness regularization term  # TODO: wrap in a separate function
-        bias_regul_term = None
-        if doc_neutscore is not None:
-
-            _cutoff = np.min([self.bias_regul_cutoff, doc_neutscore.shape[1]])
-
-            _indices_sorted = torch.argsort(rel_scores, dim=1, descending=True)
-            _indices_sorted[_indices_sorted < _cutoff] = -1
-            _indices_sorted[_indices_sorted != -1] = 0
-            _indices_sorted[_indices_sorted == -1] = 1
-            _indices_mask = doc_neutscore.new_zeros(doc_neutscore.shape)    
-            _indices_mask[_indices_sorted == 0] = float("-Inf")
-
-            doc_neutscore_probs = torch.nn.Softmax(dim=1)(doc_neutscore + _indices_mask)
-            rel_scores_logprobs = torch.nn.LogSoftmax(dim=1)(rel_scores + _indices_mask)
-
-            bias_regul_term = torch.nn.KLDivLoss(reduction='batchmean')(rel_scores_logprobs, doc_neutscore_probs)
 
         # Compute loss
         if labels is not None:
             loss = self.loss_module(rel_scores, labels, padding_mask=~doc_padding_mask)  # loss is scalar tensor
-
-            if self.aux_loss_module is not None and (self.aux_loss_coeff > 0):  # add auxiliary loss, if specified
+            # add auxiliary loss, if specified
+            if self.aux_loss_module is not None and (self.aux_loss_coeff > 0):
                 loss += self.aux_loss_coeff * self.aux_loss_module(rel_scores, labels, padding_mask=~doc_padding_mask)
-            if bias_regul_term is not None:
+            
+            # add fairness regularization term, if specified
+            if doc_neutscore is not None:
+                
+                bias_regul_term = self.bias_regul_module(rel_scores, labels=doc_neutscore, padding_mask=~doc_padding_mask)
+                
                 if self.bias_regul_coeff < 0:
                     loss = rel_scores.new([0])[0]
                     loss += - self.bias_regul_coeff * bias_regul_term

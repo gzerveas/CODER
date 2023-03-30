@@ -16,10 +16,12 @@ import pickle
 from matplotlib import pyplot as plt
 from typing import Dict, List, Tuple
 import csv
+import glob
 
 from tqdm import tqdm
 import numpy as np
 import torch
+import h5py
 import xlrd
 import xlwt
 import xlutils.copy
@@ -87,14 +89,14 @@ def get_relevances(gt_relevant, candidates, max_docs=None, relevant_at_level=1):
     return [gt_relevant[candid] if (candid in gt_relevant) and gt_relevant[candid] >= relevant_at_level else 0 for candid in candidates[:max_docs]]
 
 
-# NOTE: except for MRR, metrics differ from official TREC. Use get_retrieval_metrics instead.
+# NOTE: except for MRR and Recall, metrics differ from official TREC. Use get_retrieval_metrics instead.
 def calculate_metrics(relevances, num_relevant, k):
     eval_metrics = OrderedDict([('MRR', metrics.mean_reciprocal_rank(relevances)),
                                 ('MRR@{}'.format(k), metrics.mean_reciprocal_rank(relevances, k)),
                                 # ('MAP', metrics.mean_average_precision(relevances)),
                                 # ('MAP@{}'.format(k), metrics.mean_average_precision(relevances, k)),
                                 # ('MAP@R', metrics.mean_average_precision_at_r(relevances, num_relevant)),
-                                # ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
+                                ('Recall@{}'.format(k), metrics.recall_at_k(relevances, num_relevant, k)),
                                 # ('nDCG', np.mean([metrics.ndcg_at_k(rel) for rel in relevances])),
                                 # ('nDCG@{}'.format(k), np.mean([metrics.ndcg_at_k(rel, k) for rel in relevances]))
                                 ])
@@ -106,7 +108,7 @@ def write_predictions(filepath, predictions, format='tsv', score_type=builtins.f
 
     :param filepath: output file path
     :param predictions: dict of method's predictions per query, {str qID: {str pID: float score}}
-    :param format: 'pickle' or 'tsv'
+    :param format: 'pickle', 'tsv' or 'hdf5'
     :param score_type: Only for format 'tsv': the type of the written scores (int or float).
     :param is_qrels: Only for format 'tsv': if True, will write 'tsv' file in qrels format with a column 'Q0' and no rank.
     """
@@ -122,9 +124,45 @@ def write_predictions(filepath, predictions, format='tsv', score_type=builtins.f
     elif format == 'pickle':
         with open(filepath, 'wb') as out_file:
             pickle.dump(predictions, out_file, protocol=pickle.HIGHEST_PROTOCOL)
+    elif format == 'hdf5':
+        with h5py.File(filepath, 'w') as out_file:
+            write_dict_hdf5(out_file, predictions, dtype='float16')
     else:
         logger.debug("format '{}'; will not write output file")
     return
+
+
+def write_dict_hdf5(group, d, dtype='float16'):
+    """Write a dictionary to an HDF5 group; `group` starts as a file object,
+    but subgroups will be created if necessary, to recursively write nested dictionaries.
+
+    :param group: HDF5 group object (initially a file object)
+    :param d: the dictionary to be written to disk
+    """
+    for key, value in d.items():
+        if isinstance(value, dict):
+            subgroup = group.create_group(key)
+            write_dict_hdf5(subgroup, value, dtype)
+        else:
+            # group[key] = value  # this is used to write generic nested dictionaries, but doesn't specify dtype
+            group.create_dataset(key, data=value, dtype=dtype)
+    return
+
+
+def read_dict_hdf5(group):
+    """Read a dictionary from an HDF5 group; `group` starts as a file object,
+    but existing subgroups will be extracted, to recursively read nested dictionaries.
+
+    :param group: HDF5 group object (initially a file object)
+    :return: the dictionary holding the data
+    """
+    d = {}
+    for key, value in group.items():
+        if isinstance(value, h5py.Group):
+            d[key] = read_dict_hdf5(value)
+        else:
+            d[key] = value[()]
+    return d
 
 
 # DEPRECATED
@@ -449,7 +487,7 @@ def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_groun
     return freqs, bin_edges
 
 
-def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', bins=None, relevance_thr=1, save_as='ranks.pdf'):
+def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', bins=None, relevance_thr=1, orient_bars='vertical', save_as='ranks.pdf'):
     """
     Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved 
     based on the predicted model scores in `pred_scores`. The difference with `plot_rank_histogram` is that
@@ -462,8 +500,10 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
         If given, it will be superimposed on the plot for reference.
     :param include_ground_truth: if 'all', the histogram will include the ranks of all g.t. documents per query
         (naturally, only one of them can have rank 1). If 'top', the histogram will only include the ranks of the top-scored g.t. document.
+    :param bins: iterable of length 69; the bins to use for the histogram. If None, the default bins will be used.
     :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant 
-    :param save_as: _description_, defaults to 'ranks.pdf'
+    :param orient_bars: orientation of bars; 'vertical' or 'horizontal', defaults to 'vertical'.
+    :param save_as: filepath to save figure, defaults to 'ranks.pdf'
     :return: (freqs, bin_edges) tuple of counts/frequencies and bin edges of pred_scores historgram
     """
     
@@ -478,12 +518,15 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
         if type(base_pred_scores) is dict:
             base_pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, base_pred_scores))), dtype=np.int16)
     
-    bins = list(range(1, 50)) + list(range(50, 1050, 50))
+    if bins is None:
+        bins = list(range(1, 50)) + list(range(50, 1050, 50))
     bin_labels = ["[{}, {})".format(bins[i], bins[i + 1]) for i in range(len(bins) - 1)] #+ ["[{}, inf)".format(bins[-1])]
     
-    fig, ax = plt.subplots(figsize=(10, 30))
+    if orient_bars == 'horizontal':
+        fig, ax = plt.subplots(figsize=(10, 30))
+    else:
+        fig, ax = plt.subplots(figsize=(30, 10))
     
-    # plt.figure(figsize=(10, 30))
     if base_pred_scores is not None:
         if type(base_pred_scores) is dict:
             freqs, bin_edges = np.histogram(base_pred_ranks, bins=bins)
@@ -491,37 +534,56 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
             freqs, bin_edges = base_pred_scores
         orig_freqs = freqs
         # plt.hist(bin_edges[:-1], bins=bin_edges, weights=freqs, alpha=0.2, color='red', edgecolor='gray', label='Original')
-        ax.barh(np.arange(len(freqs)), freqs, height=1, align='edge', alpha=0.2, color='red', edgecolor='gray', label='Original')
+        if orient_bars == 'horizontal':
+            ax.barh(np.arange(len(freqs)), freqs, height=1, align='edge', alpha=0.2, color='red', edgecolor='gray', label='Original')
+        else:
+            ax.bar(np.arange(len(freqs)), freqs, width=1, align='edge', alpha=0.2, color='red', edgecolor='gray', label='Original')
     
     freqs, bin_edges = np.histogram(pred_ranks, bins=bins)
     # plt.hist(bin_edges[:-1], bins=bin_edges, weights=freqs, alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
-    y_pos = np.arange(len(freqs))
-    rects = ax.barh(y_pos, freqs, height=1, align='edge', alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(bin_labels)
-    ax.invert_yaxis()  # labels read top-to-bottom
-    ax.set_xlabel('Counts')
-    ax.set_title(title_str)
-
-    # Label with specially formatted floats
+    
+    # Prepare labels for the bars
     if base_pred_scores is None:
         label_vals = freqs
         # ax.bar_label(hbars, fmt='%d', padding=5)  # Requires matplotlib 3.4.0+
-        xlim = max(freqs)
+        axis_lim = max(freqs)
     else:
         label_vals = freqs - orig_freqs
-        # ax.bar_label(hbars, fmt='%d', labels=labels, padding=10)
-        xlim = max(max(freqs), max(orig_freqs))
+        # ax.bar_label(hbars, fmt='%d', labels=labels, padding=10)  # Requires matplotlib 3.4.0+
+        axis_lim = max(max(freqs), max(orig_freqs))
     
-    # Put labels on the right side of bars    
-    for rect, label_val in zip(rects, label_vals):
-        width = rect.get_width()
-        color = 'red' if label_val < 0 else 'blue'
-        ax.text(width + 0.1*xlim, rect.get_y() + rect.get_height() / 2, str(label_val), ha="center", va="center", color=color)
+    axis_pos = np.arange(len(freqs))
     
-    ax.set_xlim(right=1.2*xlim)  # adjust xlim to fit labels
+    if orient_bars == 'horizontal':
+        rects = ax.barh(axis_pos, freqs, height=1, align='edge', alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
+        ax.set_yticks(axis_pos)
+        ax.set_yticklabels(bin_labels)
+        ax.invert_yaxis()  # labels read top-to-bottom
+        ax.set_xlabel('Counts')
+
+        # Put labels on the right side of bars    
+        for rect, label_val in zip(rects, label_vals):
+            width = rect.get_width()
+            color = 'red' if label_val < 0 else 'blue'
+            ax.text(width + 0.1*axis_lim, rect.get_y() + rect.get_height() / 2, str(label_val), ha="center", va="center", color=color)
+        
+        ax.set_xlim(right=1.2*axis_lim)  # adjust xlim to fit labels
+    else:
+        rects = ax.bar(axis_pos, freqs, width=1, align='edge', alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
+        ax.set_xticks(axis_pos)
+        ax.set_xticklabels(bin_labels, rotation=90)
+        ax.set_ylabel('Counts')
+        
+        # Put labels on top of bars
+        for rect, label_val in zip(rects, label_vals):
+            height = rect.get_height()
+            color = 'red' if label_val < 0 else 'blue'
+            ax.text(rect.get_x() + rect.get_width() / 2, height + 0.1*axis_lim, str(label_val), ha="center", va="center", color=color)
+        
+        ax.set_ylim(top=1.2*axis_lim)  # adjust ylim to fit labels
+   
     ax.legend()
-    
+    ax.set_title(title_str)
     plt.savefig(save_as)
     return freqs, bin_edges
 
@@ -814,14 +876,14 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     start_time = time.perf_counter()
     # Evaluate using pytrec_eval for comparison with BEIR benchmarks
     # Returns dictionaries with metrics for each cut-off value, e.g. ndcg["NDCG@{k}".format(cutoff_values[0])] == 0.3
-    #metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values, ignore_identical_ids=False, verbose=verbose)  # tuple of metrics dicts (ndct, ...) #TODO: RESTORE
+    metric_dicts = EvaluateRetrieval.evaluate(qrels, results, cutoff_values, ignore_identical_ids=False, verbose=verbose)  # tuple of metrics dicts (ndct, ...) #TODO: RESTORE
     mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR', relevance_level=relevance_level, verbose=verbose)
     metrics_time = time.perf_counter() - start_time
     logger.info("Time to calculate performance metrics: {:.3f} s".format(metrics_time))
     
     # Merge all dicts into a single OrderedDict and sort by k for guaranteed consistency
     perf_metrics = OrderedDict()  # to also work with Python 3.6
-    for met_dict in (mrr, ):#+ metric_dicts: #TODO: RESTORE
+    for met_dict in (mrr, ) + metric_dicts: #TODO: RESTORE
         perf_metrics.update(sorted(met_dict.items(), key=lambda x: 0 if not '@' in x[0] else int(x[0].split('@')[1])))
 
     return perf_metrics
@@ -1021,3 +1083,57 @@ def load_predictions(filepath, seperator=None):
             qid_to_candidate_passages[qid][pid] = score
     
     return qid_to_candidate_passages
+
+
+def merge_qrels_dictionaries(dicts, overwrite_queries=False):
+    """Merge multiple qrel dictionaries, in a way that new documents can be added to existing shared queries,
+    and if for the same query a passage is present in multiple dictionaries, the value from the last will be used.
+    
+    :param dicts: iterable of qrels dictionaries to merge. Each is a dict of the form {qid: {pid: rel}}
+    :param overwrite_queries: if True, queries that are present in multiple dictionaries will be overwritten by the last;
+        otherwise, they will be merged such that new passages can be added to existing queries (and shared passages will be overwritten).
+    """
+    merged = defaultdict(dict)
+    
+    if overwrite_queries:
+        for d in dicts:
+            merged.update(d)
+    else:
+        for d in dicts:
+            for qid, pid2rel in d.items():
+                merged[qid].update(pid2rel)
+    return merged
+
+
+def load_qrels_from_pickles(path_pattern, overwrite_queries=False):
+    """Load qrels dictionaries from multiple pickle files, and merge them into a single dictionary.
+    :param path_pattern: path pattern to pickle files, e.g. "/path/to/qrels/*.pickle"
+    :param overwrite_queries: if True, queries that are present in multiple dictionaries will be overwritten by the last;
+        otherwise, they will be merged such that new passages can be added to existing queries (and shared passages will be overwritten).
+    """
+    qrels = defaultdict(dict)
+    for path in glob.glob(path_pattern):
+        with open(path, 'rb') as f:
+            if overwrite_queries:
+                qrels.update(pickle.load(f))
+            else:
+                for qid, pid2rel in pickle.load(f).items():
+                    qrels[qid].update(pid2rel)
+    return qrels
+
+
+def load_qrels_from_hdf5(path_pattern, overwrite_queries=False):
+    """Load qrels dictionaries from multiple HDF5 files, and merge them into a single dictionary.
+    :param path_pattern: path pattern to HDF5 files, e.g. "/path/to/qrels/*.hdf5"
+    :param overwrite_queries: if True, queries that are present in multiple dictionaries will be overwritten by the last;
+        otherwise, they will be merged such that new passages can be added to existing queries (and shared passages will be overwritten).
+    """
+    qrels = defaultdict(dict)
+    for path in glob.glob(path_pattern):
+        with h5py.File(path, "r") as f:
+            if overwrite_queries:
+                qrels.update(read_dict_hdf5(f))
+            else:
+                for qid, pid2rel in read_dict_hdf5(f).items():
+                    qrels[qid].update(pid2rel)
+    return qrels

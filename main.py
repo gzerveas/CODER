@@ -28,7 +28,7 @@ import optuna
 # Package modules
 from options import *
 from modeling import RepBERT_Train, CODER, get_loss_module
-from dataset import MYMARCO_Dataset, MSMARCODataset
+from dataset import MYMARCO_Dataset
 from dataset import lookup_times, sample_fetching_times, collation_times, retrieve_candidates_times, prep_docids_times
 from optimizers import get_optimizers, MultiOptimizer, get_schedulers, MultiScheduler
 import utils
@@ -64,7 +64,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                                     max_inj_relevant=args.max_inj_relevant,
                                     collection_neutrality_path=args.collection_neutrality_path)
     collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu,
-                                                label_format=model.loss_module.formatting)
+                                                label_format=model.loss_module.formatting, label_normalization=args.label_normalization)
     logger.info("'train' data loaded in {:.3f} sec".format(time.time() - start_time))
 
     utils.write_list(os.path.join(args.output_dir, "train_IDs.txt"), train_dataset.qids)
@@ -220,10 +220,11 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                     avg_batch_time = batch_times.get_average()
                     tb_writer.add_scalar('train/batch time', avg_batch_time, global_step)
                     if model.score_cands.temperature is not None:
-                        tb_writer.add_scalar('train/temperature', model.score_cands.temperature, global_step) 
-
+                        tb_writer.add_scalar('train/temperature', model.score_cands.temperature, global_step)
+                        tb_writer.add_scalar('train/score_bias', model.score_cands.b, global_step) 
+                    
+                    logger.info("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
                     if args.debug:
-                        logger.debug("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
                         for i, s in enumerate(scheduler.get_last_lr()):
                             logger.debug('Learning rate ({}): {}'.format(sstr[i], s))
                         logger.debug("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
@@ -381,8 +382,8 @@ def evaluate(args, model, dataloader, fairrmetric=None):
     labels_exist = qrels is not None
 
     # num_docs is the (potentially variable) number of candidates per query
-    # relevances = []  # (total_num_queries) list of (num_docs) lists with non-zeros at the indices corresponding to actually relevant passages
-    # num_relevant = []  # (total_num_queries) list of number of ground truth relevant documents per query
+    relevances = []  # (total_num_queries) list of (num_docs) lists with non-zeros at the indices corresponding to actually relevant passages
+    num_relevant = []  # (total_num_queries) list of number of ground truth relevant documents per query
     scores = {}  # dict {str(qID): dict{str(passageid): rel_score}}  # string IDs required for pytrec_eval
     query_time = 0  # average time for the model to score candidates for a single query
     total_loss = 0  # total loss over dataset
@@ -426,17 +427,17 @@ def evaluate(args, model, dataloader, fairrmetric=None):
             # extend results dictionary by batch_size elements. Indexing works both for np.arrays and list of lists formats for _docs and_scores
             scores.update({str(qids[i]): {str(ranksorted_docs[i][j]): sorted_scores[i][j] for j in range(len(ranksorted_docs[i]))} for i in range(len(qids))})
 
-            # if labels_exist:
-            #     relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i], relevant_at_level=dataloader.dataset.relevant_at_level) for i in range(len(qids)))
-            #     # number of g.t. positives in entire dataset for each query
-            #     num_relevant.extend(len([candid for candid in qrels[qid]
-            #                              if qrels[qid][candid] >= dataloader.dataset.relevant_at_level]) for qid in qids)
+            if labels_exist:
+                relevances.extend(get_relevances(qrels[qids[i]], ranksorted_docs[i], relevant_at_level=dataloader.dataset.relevant_at_level) for i in range(len(qids)))
+                # number of g.t. positives in entire dataset for each query
+                num_relevant.extend(len([candid for candid in qrels[qid]
+                                         if qrels[qid][candid] >= dataloader.dataset.relevant_at_level]) for qid in qids)
 
     if labels_exist:
         # try:
-        eval_metrics = get_retrieval_metrics(scores, qrels=dataloader.dataset.reformatted_qrels, cutoff_values=(5, args.metrics_k), 
-                                                 relevance_level=dataloader.dataset.relevant_at_level, verbose=False)  # {metric_name: metric_value}
-        #     # eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k) # aggregate metrics for the entire dataset
+        # eval_metrics = get_retrieval_metrics(scores, qrels=dataloader.dataset.reformatted_qrels, cutoff_values=(5, args.metrics_k), 
+        #                                          relevance_level=dataloader.dataset.relevant_at_level, verbose=False)  # {metric_name: metric_value}
+        eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k) # aggregate metrics for the entire dataset
         # except Exception as x:
         #     print(x)
         #     traceback.print_stack()
@@ -507,7 +508,7 @@ def get_dataset(args, eval_mode, tokenizer):
                                load_collection_to_memory=args.load_collection_to_memory,
                                inject_ground_truth=args.inject_ground_truth,
                                relevance_labels_mapping=args.relevance_labels_mapping,
-                               include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level)
+                               include_at_level=args.eval_include_at_level, relevant_at_level=args.eval_relevant_at_level)
 
 
 def get_query_encoder(query_encoder_from, query_encoder_config):
@@ -592,7 +593,6 @@ def setup(args):
     if (not config['no_timestamp']) or (len(config['experiment_name']) == 0):
         rand_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=3))
         output_dir += "_" + formatted_timestamp + "_" + rand_suffix
-    config['output_dir'] = output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     # Save configuration as a (pretty) json file
@@ -601,10 +601,12 @@ def setup(args):
     logger.info("Stored configuration file in '{}'".format(output_dir))
     
     # Rest of configuration (does not need to be saved as a JSON config file)
+    config['output_dir'] = output_dir
     info_dict = {'initial_timestamp': formatted_timestamp,
-                'save_dir': os.path.join(output_dir, 'checkpoints'),
-                'pred_dir': os.path.join(output_dir, 'predictions'),
-                'tensorboard_dir': os.path.join(output_dir, 'tb_summaries')}
+                 'output_dir': output_dir,
+                 'save_dir': os.path.join(output_dir, 'checkpoints'),
+                 'pred_dir': os.path.join(output_dir, 'predictions'),
+                 'tensorboard_dir': os.path.join(output_dir, 'tb_summaries')}
     config.update(info_dict)
     
     args = utils.dict2obj(config)  # Convert config dict to args object
