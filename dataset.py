@@ -58,13 +58,13 @@ def normalize_batch(relevances, norm_type):
     if norm_type.startswith('maxmin'):  # increases inter-document dynamic range for "uniform" initial scores, while still in [0, 1]
         # max is not affected by -inf values
         max_relev = torch.max(relevances, dim=-1).values
-        # to ignore -inf values, we first make a copy of new_relevances where we replace negative values with +inf, and then we take the min along each row
+        # to ignore -inf values, we first make a copy of new_relevances where we replace non-valid values with +inf, and then we take the min along each row
         min_relev = torch.min(torch.where(not_valid, torch.full_like(relevances, float('inf')), relevances), dim=-1).values
         relevances = (relevances - min_relev.unsqueeze(-1)) / (max_relev - min_relev).unsqueeze(-1)
         if norm_type == 'maxminmax':  # even wider dynamic range for "uniform" initial scores, but in [0, mean(row)]
             relevances = max_relev.unsqueeze(-1) * relevances
         elif norm_type == 'maxminbatchmean':  # wide dynamic range for "uniform" initial scores, while reducing variance across queries; in [0, mean(batch)]
-            relevances = torch.nanmean(relevances) * relevances
+            relevances = torch.nanmean(torch.where(not_valid, torch.full_like(relevances, float('nan')), relevances)) * relevances
     elif norm_type == 'std': # even wider dynamic range for "uniform" initial scores, but in [0, f], with f > 1
         # to ignore -inf values for std, we follow the same approach as with min, but use NaN. There is a special torch function ignoring NaN
         min_relev = torch.min(torch.where(not_valid, torch.full_like(relevances, float('inf')), relevances), dim=-1).values
@@ -645,9 +645,9 @@ class MYMARCO_Dataset(Dataset):
             rel_cands, rel_scores = zip(*sorted(((int(docid), score) for docid, score in label_source[qid].items() if score >= self.include_at_level), key=itemgetter(1), reverse=True)[:self.max_inj_relevant])
             rel_cands = list(rel_cands)
             if self.label_normalization is not None:
-                rel_scores = normalize_batch(torch.tensor(rel_scores, dtype=torch.float32), self.label_normalization) # (len(rel_scores),) tensor
+                rel_scores = np.asarray(normalize_batch(torch.tensor(rel_scores, dtype=torch.float16), self.label_normalization), dtype=np.float16) # (len(rel_scores),) tensor
             else:
-                rel_scores = torch.tensor(rel_scores, dtype=torch.float32)
+                rel_scores = np.asarray(rel_scores, dtype=np.float16)
 
             # also covers case of dynamic candidates, in which initially doc_ids = [] and then doc_ids = rel_cands
             new_cand_ids = (rel_cands + [candid for candid in doc_ids if candid not in set(rel_cands)])

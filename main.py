@@ -146,7 +146,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     ranked_filepath = os.path.join(args.pred_dir, 'original_top1000.dev.' + args.write_predictions)
     utils.write_predictions(ranked_filepath, predictions, format=args.write_predictions)
     freqs_orig, bins_orig = utils.plot_rank_barplot(val_dataloader.dataset.reformatted_qrels, predictions,
-                                relevance_thr=args.relevant_at_level,
+                                relevance_thr=args.eval_relevant_at_level,
                                 save_as=os.path.join(args.output_dir, "orig_rank_historgram.pdf"))
 
     # Train
@@ -252,7 +252,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         try:
                             freqs_best, _ = utils.plot_rank_barplot(val_dataloader.dataset.reformatted_qrels, predictions,
                                                       base_pred_scores=(freqs_orig, bins_orig),
-                                                      relevance_thr=args.relevant_at_level,
+                                                      relevance_thr=args.eval_relevant_at_level,
                                                       save_as=os.path.join(args.output_dir, "best_rank_historgram.pdf"))
                         except:
                             logger.error('Histogram not possible!')
@@ -601,7 +601,6 @@ def setup(args):
     logger.info("Stored configuration file in '{}'".format(output_dir))
     
     # Rest of configuration (does not need to be saved as a JSON config file)
-    config['output_dir'] = output_dir
     info_dict = {'initial_timestamp': formatted_timestamp,
                  'output_dir': output_dir,
                  'save_dir': os.path.join(output_dir, 'checkpoints'),
@@ -643,6 +642,7 @@ def setup(args):
         info_dict['cuda device'] = torch.cuda.get_device_name(0)
         info_dict['cuda memory'] = total_mem_mb
     
+    info_dict['Code path'] = os.path.abspath(__file__)
     info_dict['Git hash'] = utils.get_git_revision_short_hash()
     git_diff = utils.get_git_diff()
     if len(git_diff) > 0:
