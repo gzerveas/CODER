@@ -7,12 +7,10 @@ from itertools import chain
 from operator import itemgetter
 import time
 import sys
-import pickle
-import ipdb
+import numbers
 
 import numpy as np
 from tqdm import tqdm
-from transformers import BertTokenizer
 import torch
 from torch.utils.data import Dataset
 
@@ -369,6 +367,32 @@ def load_query_ids(filepath):
     return query_ids
 
 
+class ScoreBooster(object):
+    
+    def __init__(self, boost_mode, boost_factor=1.2):
+        
+        if isinstance(boost_mode, numbers.Number):
+            boost_factor = boost_mode
+            boost_mode = "constant"
+        
+        self.boost_mode = boost_mode
+        self.boost_factor = boost_factor
+        
+        if boost_mode == "constant":
+            self.boost_func = self.constant_boost
+        else:
+            raise ValueError(f"Unknown boost mode: {boost_mode}")
+        
+    def constant_boost(self, scores, pid2relevance):
+        """Boost scores of all relevant passages of a single query by a constant factor
+        :param scores: (num_candidates,) numpy array of target scores for a single query
+        :param pid2relevance: either list of tuples (pid, score) or dict mapping from passage IDs to relevance scores *for a single query*
+        """
+        num_relevant = len(pid2relevance)
+        return scores[:num_relevant] * self.boost_factor
+        
+
+
 class MYMARCO_Dataset(Dataset):
     """
     Used for passages (the terms passage/document used interchangeably in the documentation).
@@ -388,7 +412,7 @@ class MYMARCO_Dataset(Dataset):
                  num_candidates=None, candidate_sampling=None, dynamic_candidates=None,
                  limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False,
                  relevance_labels_mapping=None, include_at_level=1, relevant_at_level=1, max_inj_relevant=1000,
-                 label_normalization=None,
+                 label_normalization=None, boost_relevant=None,
                  collection_neutrality_path=None):
         """
         :param mode: 'train', 'dev' or 'eval'
@@ -421,6 +445,10 @@ class MYMARCO_Dataset(Dataset):
             keep their respective scores as target scores (if `label_format` is `scores`).
         :param max_inj_relevant: maximum number of 'relevant' candidates to inject per query when training
             (whether they come from qrels or target scores)
+        :param label_normalization: if not None, will normalize the target scores according to the specified method:
+            'max', 'maxmin', 'std'.
+        :param boost_relevant: if not None, will boost the target scores of ground-truth relevant candidates by the specified factor.
+            This factor will be applied after normalization, if any.
         :param collection_neutrality_path: path to file containing neutrality scores, in the format: docID \t score\n
         :param query_ids_path: Path to a file containing the query IDs to be used for this dataset, 1 in each line.
             If not provided, the IDs in the memmap inside `candidates_path` will be used.
@@ -449,7 +477,16 @@ class MYMARCO_Dataset(Dataset):
         else:
             self.target_scores = None
 
-        self.label_normalization = label_normalization  # if not None, will normalize *training* labels (usually, self.target_scores) 
+        self.label_normalization = label_normalization  # if not None, will normalize *training* labels (usually, self.target_scores)
+
+        if boost_relevant is not None:
+            self.score_booster = ScoreBooster(boost_relevant)
+        else:
+            self.score_booster = None
+
+        self.include_at_level = include_at_level
+        self.relevant_at_level = relevant_at_level
+        self.max_inj_relevant = max_inj_relevant  # limits the number of documents considered "relevant" that will be injected (e.g. to leave space for dynamic negatives) 
 
         self.inject_ground_truth = inject_ground_truth  # if True, during evaluation the ground truth relevant documents will be always part of the candidate documents
         if self.inject_ground_truth:
@@ -536,11 +573,6 @@ class MYMARCO_Dataset(Dataset):
 
         logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
         logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
-
-        self.include_at_level = include_at_level
-        self.relevant_at_level = relevant_at_level
-        self.max_inj_relevant = max_inj_relevant  # limits the number of documents considered "relevant" that will be injected (e.g. to leave space for dynamic negatives)
-
 
         self.tokenizer = tokenizer
         self.cls_id = tokenizer.cls_token_id
@@ -649,6 +681,11 @@ class MYMARCO_Dataset(Dataset):
             else:
                 rel_scores = np.asarray(rel_scores, dtype=np.float16)
 
+            if self.score_booster is not None:
+                # Applies score boosting function (i.e. a score multiplier) to rel_scores, based on the relevance of the corresponding doc_ids
+                pid2relevance = {pid: relevance for pid, relevance in self.qrels[qid].items() if relevance >= self.relevant_at_level}
+                rel_scores = self.score_booster.boost_func(rel_scores, pid2relevance)
+            
             # also covers case of dynamic candidates, in which initially doc_ids = [] and then doc_ids = rel_cands
             new_cand_ids = (rel_cands + [candid for candid in doc_ids if candid not in set(rel_cands)])
             doc_ids = new_cand_ids  # direct assignment wouldn't work in line above

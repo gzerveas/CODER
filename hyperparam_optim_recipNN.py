@@ -41,7 +41,8 @@ def recipNN_rerank_objective(trial):
     return best_values[OPTIM_METRIC]
 
 
-def smooth_labels_objective(trial):
+def smooth_labels_e2e_objective(trial):
+    """Objective function for end-to-end hyperparameter optimization of recipNN label smooothing and subsequent training."""
     random.seed()  # re-randomize seed (it's fixed inside `main`), because it's needed for dir name suffix
     # Setup label smoothing
     args_rNN = reciprocal_compute.run_parse_args()  # `argsparse` object
@@ -78,9 +79,40 @@ def smooth_labels_objective(trial):
     return best_values[OPTIM_METRIC]
 
 
+def smooth_labels_objective(trial):
+    """Objective function for hyperparameter optimization of training with smooth labels"""
+    random.seed()  # re-randomize seed (it's fixed inside `main`), because it's needed for dir name suffix
+
+    # Run main function hyperparam optimization for training
+    args = options.run_parse_args()  # `argsparse` object for training
+    
+    # Optuna overrides for main training
+    config = utils.load_config(args)  # config dictionary, which potentially comes from a JSON file
+    args = utils.dict2obj(config)  # convert back to args object
+    args.config_filepath = None  # the contents of a JSON file (if specified) have been loaded already, so prevent the `main.setup` from overwriting the Optuna overrides
+    
+    args.boost_relevant = trial.suggest_float("boost_relevant", 1.05, 5, log=False)
+    args.label_normalization = trial.suggest_categorical("label_normalization", ['max', 'minmax', 'maxminmax', 'std', 'None'])
+    args.max_inj_relevant = trial.suggest_int("max_inj_relevant", 3, 100, log=True)
+    
+    # Set name of experiment
+    args.experiment_name = f'AUTO_RNNr67_CODER-TASB-IZc_rboost{args.boost_relevant}_norm-{args.label_normalization}_top{args.max_inj_relevant}'
+
+    if args.label_normalization == 'None':
+        args.label_normalization = None # the actual expected value in the code is None, not 'None'
+
+    config = main.setup(args)  # Setup main training session
+    best_values = main.main(config, trial)  # best metrics found during evaluation
+
+    for name, value in best_values.items():
+        trial.set_user_attr(name, value)  # log in database / study object
+
+    return best_values[OPTIM_METRIC]
+
+
 if __name__ == '__main__':
     
-    task = 'rerank'  # 'smooth_labels'
+    task = 'rerank'  # 'smooth_labels', 'smooth_labels_e2e'
     dataset = 'MSMARCO'  # 'TripClick'
     
     if task == 'rerank':
@@ -90,6 +122,10 @@ if __name__ == '__main__':
     elif task == 'smooth_labels':
         study_name = 'recipNN_smooth_labels_study'  # This name is shared across jobs/processes
         objective = smooth_labels_objective
+        storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{task}_{dataset}_optuna.db'
+    elif task == 'smooth_labels_e2e':
+        study_name = 'recipNN_smooth_labels_e2e_study'  # This name is shared across jobs/processes
+        objective = smooth_labels_e2e_objective
         storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{task}_{dataset}_optuna.db'
 
     n_trials = 200

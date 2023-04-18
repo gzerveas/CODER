@@ -206,7 +206,7 @@ class ReciprocalNearestNeighbors(object):
             new_doc_ids = (list(rel_docs) + [docid for docid in doc_ids if docid not in rel_docs])[:max_candidates]
             doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
 
-        doc_ids = np.array(doc_ids)  # string IDs
+        doc_ids = np.asarray(doc_ids)  # string IDs
 
         doc_embeddings = self.doc_embedding_memmap[[self.did2pos[docid] for docid in doc_ids]]
         doc_embeddings = torch.from_numpy(doc_embeddings).float().to(self.device)  # (num_cands, emb_dim)

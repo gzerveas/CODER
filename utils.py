@@ -49,7 +49,7 @@ def get_git_diff():
     Returns the Git diff of the current working directory from HEAD revision.
     """
     gitpath = os.path.join(os.path.dirname(__file__), '.git')
-    return subprocess.check_output(['git', '--git-dir', gitpath, '--ignore-space-at-eol', 'diff', 'HEAD']).strip().decode('utf-8')
+    return subprocess.check_output(['git', '--git-dir', gitpath,'diff', 'HEAD', '--ignore-space-at-eol']).strip().decode('utf-8')
 
 
 def write_conda_env(filepath):

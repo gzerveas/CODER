@@ -273,6 +273,9 @@ def run_parse_args():
                         help="A float parameter by which to divide the final scores. If set to 'learnable', will be learned during training.")
     parser.add_argument('--label_normalization', choices=['max', 'maxmin', 'maxminmax', 'maxminbatchmean', 'std'], default=None,
                         help='Normalization applied to the ground truth labels (target scores) before computing the loss.')
+    parser.add_argument('--boost_relevant', default=None,
+                        help="If not None, will boost the target scores of ground-truth relevant candidates by the specified factor. "
+                        "This factor will be applied after label normalization, if any.")
     parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier'},
                         default='listent', help='Loss applied to document scores')
     parser.add_argument('--aux_loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier', None},

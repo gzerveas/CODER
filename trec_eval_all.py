@@ -1,3 +1,7 @@
+import logging
+logger = logging.getLogger()
+logger.info("Loading packages...")
+
 import json
 import os
 import glob
@@ -6,8 +10,6 @@ import logging
 from collections import OrderedDict
 import pickle
 
-logger = logging.getLogger()
-
 import utils
 
 
@@ -15,7 +17,7 @@ import utils
 
 parser = argparse.ArgumentParser("Evaluate a set of prediction/ranking files (in '.tsv' or '.pickle' format) according to pattern, and report and tabulate TREC metrics")
 parser.add_argument("--pred_path", type=str, default="/users/gzerveas/data/gzerveas/RecipNN/predictions/MS_MARCO/*.tsv",
-                    help="Glob pattern used to select prediction/ranking files for evaluation. Can also be a single file path.")
+                    help="Glob pattern used to select prediction/ranking files for evaluation (remember to enclose in quotes!). Can also be a single file path.")
 parser.add_argument("--qrels_path", type=str, default="/users/gzerveas/data/MS_MARCO/qrels",
                     help="""Path to qrels (ground truth relevance judgements) as needed by trec_eval""")
 parser.add_argument("--auto_qrels", action='store_true',
@@ -27,11 +29,17 @@ parser.add_argument("--write_to_json", action='store_true',
                     help="If set, will write metrics to JSON files whose path will match `pred_path`, but with a different extension."
                     "(e.g. '.dev.small.tsv', hence automatically generating the corresponding qrel paths.")
 parser.add_argument('--records_file', default='./records.xls', help="Excel file keeping records of all experiments. If 'None', will not export results to an excel sheet.")
+parser.add_argument("--parameters", default=None, type=str,
+                    help="By default, no experiment parameters will be exported to the excel sheet, only metrics. "
+                         "If set to 'empty', it will create parameters columns, which will be empty spaceholders. "
+                         "Otherwise, it should be a string of the form {\"param\": value} that can be parsed to a dictionary.")
 args = parser.parse_args()
 
 
 filepaths = glob.glob(args.pred_path)
 
+if len(filepaths) == 0:
+    raise ValueError(f"No files found for pattern: {args.pred_path}")
 logger.info(f"Will evaluate {len(filepaths)} file(s)")
 
 old_qrels_filename = None
@@ -74,23 +82,29 @@ for filename in filepaths:
     
     print(perf_metrics)
     
-    if False:
-        perf_metrics['time'] = '-'
+    if args.parameters == 'empty':  # parameter columns will be created but empty
+        perf_metrics['time'] = ''
         
-        WEIGHT_FUNC = '-'
-        WEIGHT_FUNC_PARAM = '-'
-        NORMALIZATION = '-'
+        WEIGHT_FUNC = ''
+        WEIGHT_FUNC_PARAM = ''
+        NORMALIZATION = ''
         parameters = OrderedDict()
-        parameters['sim_mixing_coef'] = '-'
-        parameters['k'] = '-'
-        parameters['trust_factor'] = '-'
-        parameters['k_exp'] = '-'
+        parameters['sim_mixing_coef'] = ''
+        parameters['k'] = ''
+        parameters['trust_factor'] = ''
+        parameters['k_exp'] = ''
         parameters['normalize'] = NORMALIZATION
         parameters['weight_func'] = WEIGHT_FUNC
         parameters['weight_func_param'] = WEIGHT_FUNC_PARAM
+    elif args.parameters is None:
+        parameters = None # do not export parameters; columns will be missing
     else:
-        parameters = None
+        try:
+            parameters = eval(args.parameters)  # parse string to dict
+        except:
+            logger.error(f"Could not parse parameters dictionary from string: {args.parameters}")
+            parameters = None
         
     # Export record metrics to a file accumulating records from all experiments
     if args.records_file != 'None':
-        utils.register_record(args.records_file, '-', os.path.basename(filename), perf_metrics, parameters=parameters)
+        utils.register_record(args.records_file, '', os.path.basename(filename), perf_metrics, parameters=parameters)
