@@ -62,7 +62,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                                     relevance_labels_mapping=args.relevance_labels_mapping,
                                     include_at_level=args.include_at_level, relevant_at_level=args.relevant_at_level,
                                     max_inj_relevant=args.max_inj_relevant,
-                                    label_normalization=args.label_normalization, boost_relevant=args.boost_relevant,
+                                    label_normalization=args.label_normalization, boost_relevant=args.boost_relevant, boost_factor=args.boost_factor,
                                     collection_neutrality_path=args.collection_neutrality_path)
     collate_fn = train_dataset.get_collate_func(num_random_neg=args.num_random_neg, n_gpu=args.n_gpu,
                                                 label_format=model.loss_module.formatting, label_normalization=None)

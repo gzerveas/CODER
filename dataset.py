@@ -371,9 +371,11 @@ class ScoreBooster(object):
     
     def __init__(self, boost_mode, boost_factor=1.2):
         
-        if isinstance(boost_mode, numbers.Number):
-            boost_factor = boost_mode
+        try:
+            boost_factor = float(boost_mode)
             boost_mode = "constant"
+        except ValueError:
+            pass
         
         self.boost_mode = boost_mode
         self.boost_factor = boost_factor
@@ -412,7 +414,7 @@ class MYMARCO_Dataset(Dataset):
                  num_candidates=None, candidate_sampling=None, dynamic_candidates=None,
                  limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False,
                  relevance_labels_mapping=None, include_at_level=1, relevant_at_level=1, max_inj_relevant=1000,
-                 label_normalization=None, boost_relevant=None,
+                 label_normalization=None, boost_relevant=None, boost_factor=1.0,
                  collection_neutrality_path=None):
         """
         :param mode: 'train', 'dev' or 'eval'
@@ -480,7 +482,7 @@ class MYMARCO_Dataset(Dataset):
         self.label_normalization = label_normalization  # if not None, will normalize *training* labels (usually, self.target_scores)
 
         if boost_relevant is not None:
-            self.score_booster = ScoreBooster(boost_relevant)
+            self.score_booster = ScoreBooster(boost_relevant, boost_factor)
         else:
             self.score_booster = None
 

@@ -91,15 +91,18 @@ def smooth_labels_objective(trial):
     args = utils.dict2obj(config)  # convert back to args object
     args.config_filepath = None  # the contents of a JSON file (if specified) have been loaded already, so prevent the `main.setup` from overwriting the Optuna overrides
     
-    args.boost_relevant = trial.suggest_float("boost_relevant", 1.05, 5, log=False)
-    args.label_normalization = trial.suggest_categorical("label_normalization", ['max', 'minmax', 'maxminmax', 'std', 'None'])
+    args.boost_relevant = "constant"
+    args.label_normalization = trial.suggest_categorical("label_normalization", ['maxmin', 'maxminmax', 'std', 'None'])
+    if args.label_normalization == 'None':
+        args.label_normalization = None # the actual expected value in the code is None, not 'None'
+        args.boost_factor = trial.suggest_float("boost_factor", 1.0, 1.4, log=True)
+    else:
+        args.boost_factor = trial.suggest_float("boost_factor", 1.0, 2, log=True)
+    
     args.max_inj_relevant = trial.suggest_int("max_inj_relevant", 3, 100, log=True)
     
     # Set name of experiment
-    args.experiment_name = f'AUTO_RNNr67_CODER-TASB-IZc_rboost{args.boost_relevant}_norm-{args.label_normalization}_top{args.max_inj_relevant}'
-
-    if args.label_normalization == 'None':
-        args.label_normalization = None # the actual expected value in the code is None, not 'None'
+    args.experiment_name = f'AUTO_RNNr67_CODER-TASB-IZc_rboost{round(args.boost_factor, 3)}_norm-{args.label_normalization}_top{args.max_inj_relevant}'
 
     config = main.setup(args)  # Setup main training session
     best_values = main.main(config, trial)  # best metrics found during evaluation
@@ -112,7 +115,7 @@ def smooth_labels_objective(trial):
 
 if __name__ == '__main__':
     
-    task = 'rerank'  # 'smooth_labels', 'smooth_labels_e2e'
+    task = 'smooth_labels'  # 'rerank', 'smooth_labels', 'smooth_labels_e2e'
     dataset = 'MSMARCO'  # 'TripClick'
     
     if task == 'rerank':
