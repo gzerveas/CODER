@@ -391,8 +391,8 @@ class ScoreBooster(object):
         :param pid2relevance: either list of tuples (pid, score) or dict mapping from passage IDs to relevance scores *for a single query*
         """
         num_relevant = len(pid2relevance)
-        return scores[:num_relevant] * self.boost_factor
-        
+        scores[:num_relevant] *= self.boost_factor
+        return scores
 
 
 class MYMARCO_Dataset(Dataset):

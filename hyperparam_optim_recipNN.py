@@ -12,8 +12,8 @@ import utils
 
 # Metric for hyperparam optimization.
 # Can be different from "key_metric" of main, which determines the set of "best_values" and saved checkpoints
-OPTIM_METRIC = 'NDCG@10'
-NEG_METRICS = []
+OPTIM_METRIC = 'loss' # 'MRR', 'nDCG@10'
+NEG_METRICS = ['loss']
 
 
 def recipNN_rerank_objective(trial):
