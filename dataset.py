@@ -47,11 +47,11 @@ def normalize_batch(relevances, norm_type):
     :param norm_type: str. One of 'max', 'maxmin', 'std'
     :return: (batch_size, num_candidates) tensor of normalized target relevances
     """
-    
+
     if norm_type == 'max':  # in [0, 1]. May result in fairly flat "distribution" close to 1.
         # max is not affected by -inf values
         return relevances / torch.max(relevances, dim=-1).values.unsqueeze(-1)
-    
+
     not_valid = (relevances == float('-inf'))  # -inf is used as padding
     if norm_type.startswith('maxmin'):  # increases inter-document dynamic range for "uniform" initial scores, while still in [0, 1]
         # max is not affected by -inf values
@@ -368,23 +368,23 @@ def load_query_ids(filepath):
 
 
 class ScoreBooster(object):
-    
+
     def __init__(self, boost_mode, boost_factor=1.2):
-        
+
         try:
             boost_factor = float(boost_mode)
             boost_mode = "constant"
         except ValueError:
             pass
-        
+
         self.boost_mode = boost_mode
         self.boost_factor = boost_factor
-        
+
         if boost_mode == "constant":
             self.boost_func = self.constant_boost
         else:
             raise ValueError(f"Unknown boost mode: {boost_mode}")
-        
+
     def constant_boost(self, scores, pid2relevance):
         """Boost scores of all relevant passages of a single query by a constant factor
         :param scores: (num_candidates,) numpy array of target scores for a single query
@@ -408,7 +408,7 @@ class MYMARCO_Dataset(Dataset):
         4. qrels file of ground truth relevant passages (if used for training or validation)
     """
     def __init__(self, mode,
-                 embedding_memmap_dir, queries_tokenids_path, candidates_path=None, 
+                 embedding_memmap_dir, queries_tokenids_path, candidates_path=None,
                  qrels_path=None, target_scores_path=None, query_ids_path=None,
                  tokenizer=None, max_query_length=64,
                  num_candidates=None, candidate_sampling=None, dynamic_candidates=None,
@@ -457,7 +457,7 @@ class MYMARCO_Dataset(Dataset):
             If that is also not provided, the IDs inside `queries_tokenids_path` will be used.
         """
         self.mode = mode  # "train", "dev", "eval"
-        
+
         logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
         logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
@@ -475,7 +475,7 @@ class MYMARCO_Dataset(Dataset):
             logger.info("Size of target scores: {} MB".format(int(round(sys.getsizeof(self.target_scores)/1024**2))))
             logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
             logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
-        
+
         else:
             self.target_scores = None
 
@@ -488,7 +488,7 @@ class MYMARCO_Dataset(Dataset):
 
         self.include_at_level = include_at_level
         self.relevant_at_level = relevant_at_level
-        self.max_inj_relevant = max_inj_relevant  # limits the number of documents considered "relevant" that will be injected (e.g. to leave space for dynamic negatives) 
+        self.max_inj_relevant = max_inj_relevant  # limits the number of documents considered "relevant" that will be injected (e.g. to leave space for dynamic negatives)
 
         self.inject_ground_truth = inject_ground_truth  # if True, during evaluation the ground truth relevant documents will be always part of the candidate documents
         if self.inject_ground_truth:
@@ -552,18 +552,18 @@ class MYMARCO_Dataset(Dataset):
             # relevance level for qrels can be different from the one used for injection (and metrics evaluation)
             self.qrels = load_qrels(qrels_path, relevance_thr=include_at_level, score_mapping=relevance_labels_mapping)  # dict{int qID: dict{int pID: float relevance}}
             logger.info("Size of g.t. labels (qrels): {} MB".format(int(round(sys.getsizeof(self.qrels)/1024**2))))
-           
+
             logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
             logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
-           
+
             # pytrec_eval requires conversion to *str IDs* and *int relevance* for qrels
             logger.info('Making a reformatted copy of qrels ...')
             self.reformatted_qrels = {str(qid): {str(pid): int(score) for pid, score in pdict.items()} for qid, pdict in self.qrels.items()}
             logger.info("Size of reformatted qrels: {} MB".format(int(round(sys.getsizeof(self.reformatted_qrels)/1024**2))))
-            
+
             logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
             logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
-            
+
             extra_qids = set(self.qids) - set(self.qrels.keys())
             if len(extra_qids) > 0:  # fail early if there are missing labels
                 err_str = "{} query IDs in the specified '{}' dataset do not exist in '{}'!".format(len(extra_qids), mode, qrels_path)
@@ -673,13 +673,13 @@ class MYMARCO_Dataset(Dataset):
             # Prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
             # while ensuring that they are only included once.
             # We can limit the number of injected documents from the label source with `max_inj_relevant`, to make space for negatives (e.g. dynamic)
-            # Because of sorting, g.t. positives may be excluded when target_scores are provided, 
+            # Because of sorting, g.t. positives may be excluded when target_scores are provided,
             # if their score is not high enough to receive a rank < max_inj_relevant
             # NOTE: modified to convert to int IDs - remove int() if entire code is modified to use str IDs!
             rel_cands, rel_scores = zip(*sorted(((int(docid), score) for docid, score in label_source[qid].items() if score >= self.include_at_level), key=itemgetter(1), reverse=True)[:self.max_inj_relevant])
             rel_cands = list(rel_cands)
             if self.label_normalization is not None:
-                rel_scores = np.asarray(normalize_batch(torch.tensor(rel_scores, dtype=torch.float16), self.label_normalization), dtype=np.float16) # (len(rel_scores),) tensor
+                rel_scores = np.asarray(normalize_batch(torch.tensor(rel_scores, dtype=torch.float32), self.label_normalization), dtype=np.float16) # (len(rel_scores),) tensor
             else:
                 rel_scores = np.asarray(rel_scores, dtype=np.float16)
 
@@ -687,7 +687,7 @@ class MYMARCO_Dataset(Dataset):
                 # Applies score boosting function (i.e. a score multiplier) to rel_scores, based on the relevance of the corresponding doc_ids
                 pid2relevance = {pid: relevance for pid, relevance in self.qrels[qid].items() if relevance >= self.relevant_at_level}
                 rel_scores = self.score_booster.boost_func(rel_scores, pid2relevance)
-            
+
             # also covers case of dynamic candidates, in which initially doc_ids = [] and then doc_ids = rel_cands
             new_cand_ids = (rel_cands + [candid for candid in doc_ids if candid not in set(rel_cands)])
             doc_ids = new_cand_ids  # direct assignment wouldn't work in line above
@@ -895,7 +895,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
         # Pack 3D tensors: candidate embeddings and corresponding padding mask
         # Tensors are padded NOT to a standard length (transformer input length), but to the max_len in the batch
         data['doc_emb'], data['doc_padding_mask'] = pack_candidate_embeddings(doc_ids, emb_collection, batch_size, max_cands_per_query)
-        
+
     if mode != 'eval':
         # Prepare labels
         if label_format == 'scores':

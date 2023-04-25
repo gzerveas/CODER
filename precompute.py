@@ -190,7 +190,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Creates memmap files containing embedding vectors of a document "
                                                  "collection and/or queries.")
     ## Required parameters
-    parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer', 'huggingface'], default='mdstransformer',
+    parser.add_argument("--model_type", type=str, choices=['repbert', 'huggingface'], default='huggingface',
                         help="""Type of the entire (end-to-end) information retrieval model""")
     parser.add_argument("--encoder_from", type=str,
                         default="sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco",
@@ -199,7 +199,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer_from", type=str, default=None,
                         help="""Optional: name of built-in Huggingface tokenizer, or for `model_type` 'huggingface' it can also be 
                         a directory. If not specified, it will be the same as `encoder_from`.""")
-    parser.add_argument("--load_checkpoint", type=str,
+    parser.add_argument("--load_checkpoint", type=str, default=None,
                         help="A path of a pre-trained model directory, `model_type` OTHER THAN 'huggingface'.")
     parser.add_argument("--output_dir", type=str, default=".",
                         help="Directory where embedding memmaps will be created.")
@@ -249,7 +249,7 @@ if __name__ == "__main__":
         model = AutoModel.from_pretrained(args.encoder_from)
         model.to(args.device)
 
-        if args.model_type == 'mdstransformer':  # parameter loading for 'CODER' checkpoint
+        if args.load_checkpoint is not None:  # parameter loading for 'CODER' checkpoint
             logger.info("Loading encoder weights from: '{}' ...".format(args.load_checkpoint))
             model = utils.load_encoder(model, args.load_checkpoint, device)
             

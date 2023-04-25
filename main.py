@@ -171,11 +171,14 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     # score_params = [(name, p) for name, p in model.named_parameters() if name.startswith('score')]
     epoch_iterator = trange(start_epoch, int(args.num_epochs), desc="Epochs")
 
+    should_stop = False # flag to stop training
     batch_times = utils.Timer()  # average time for the model to train (forward + backward pass) on a single batch of queries
     for epoch_idx in epoch_iterator:
         epoch_start_time = time.time()
         batch_iterator = tqdm(train_dataloader, desc="Batches")
         for step, (model_inp, _, _) in enumerate(batch_iterator):  # step can be a "sub-step", if grad. accum. > 1
+            if should_stop:
+                break
             if args.resume and ((epoch_idx * epoch_steps) + step < args.grad_accum_steps * global_step):
                 # TODO: one can set a state train_dataloader.dataset.skip = True, which will cause the __getitem__ to immediately return None
                 continue  # this is done to continue dataloader from the correct step, when using args.resume
@@ -276,10 +279,11 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         HARD_TOLERANCE = 0.001
                         if len(best_steps) and ((global_step - best_steps[-1]) > HARD_PATIENCE):  # countdown
                         #if (global_step > HARD_PATIENCE) and (running_metrics[0][metric2ind[args.key_metric]] - best_metrics[args.key_metric]) < HARD_TOLERANCE):
-                            return best_metrics
+                            logger.info('Hard patience reached, stopping training')
+                            should_stop = True
 
-                        # if trial.should_prune():  # early stopping
-                        #     raise optuna.exceptions.TrialPruned()
+                        if trial.should_prune():  # early stopping
+                            raise optuna.exceptions.TrialPruned()
 
                 if (args.save_steps and (global_step % args.save_steps == 0)) or global_step == total_training_steps:
                     # Save model checkpoint

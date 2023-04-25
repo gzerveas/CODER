@@ -1,4 +1,5 @@
 import random
+import time
 
 import optuna
 from optuna.samplers import TPESampler, GridSampler
@@ -16,17 +17,37 @@ OPTIM_METRIC = 'loss' # 'MRR', 'nDCG@10'
 NEG_METRICS = ['loss']
 
 
+# Different settings depending on target score type
+sim_type = 'jaccard' # SET HERE    #trial.suggest_categorical("sim_type", ['jaccard', 'geometric', 'mixed'])
+if sim_type == 'jaccard':
+    smoothing_study_name = 'recipNN_smooth_labels_JaccOnly_study'
+    exp_name_prefix = 'AUTO_JaccOnly'
+    boost_factor_raw_max = 10
+    boost_factor_norm_max = 10
+elif sim_type == 'geometric':
+    smoothing_study_name = 'recipNN_smooth_labels_GeomOnly_study'
+    exp_name_prefix = 'AUTO_GeomOnly'
+    boost_factor_raw_max = 1.1
+    boost_factor_norm_max = 3
+else:
+    smoothing_study_name = 'recipNN_smooth_labels_study'
+    exp_name_prefix = 'AUTO_RNN-r67'
+    boost_factor_raw_max = 1.2
+    boost_factor_norm_max = 5
+
+
+
 def recipNN_rerank_objective(trial):
     random.seed()  # re-randomize seed (it's fixed inside `main`), because it's needed for dir name suffix
     args = reciprocal_compute.run_parse_args()  # `argsparse` object
     args = reciprocal_compute.setup(args)
-    
+
 
     ## Optuna overrides
     args.sim_mixing_coef = trial.suggest_float('sim_mixing_coef', 1e-3, 1, log=True)
     args.k = trial.suggest_int('k', 3, 30)
     args.trust_factor = trial.suggest_categorical("trust_factor", [0, 0.5])
-    args.k_exp = trial.suggest_int('k_exp', 1, 10) 
+    args.k_exp = trial.suggest_int('k_exp', 1, 10)
     args.normalize = trial.suggest_categorical("normalize", ['max', 'mean', 'None']) #[NORMALIZATION])  # constant
     args.weight_func = trial.suggest_categorical("weight_func", ['exp', 'linear']) #[WEIGHT_FUNC])  # constant
     if args.weight_func == 'exp':
@@ -47,11 +68,10 @@ def smooth_labels_e2e_objective(trial):
     # Setup label smoothing
     args_rNN = reciprocal_compute.run_parse_args()  # `argsparse` object
     args_rNN = reciprocal_compute.setup(args_rNN)
-    
 
     # Optuna overrides
     # args_rNN.sim_mixing_coef = trial.suggest_float('sim_mixing_coef', 1e-3, 1, log=True)
-    
+
     args_rNN.rel_aggregation = trial.suggest_categorical("rel_aggregation", ['max', 'mean'])
     args_rNN.redistribute = trial.suggest_categorical("redistribute", ['fully', 'partially', 'radically'])
     args_rNN.norm_relevances = trial.suggest_categorical("norm_relevances", ['max', 'minmax', 'None', 'std'])
@@ -63,7 +83,7 @@ def smooth_labels_e2e_objective(trial):
     # Run main function (and optionally, hyperparam optimization) for training
     args = options.run_parse_args()  # `argsparse` object for training
     args.target_scores_path = args_rNN.out_filepath  # the file used to store smoothened labels becoms the input labels file for training
-    
+
     # Optuna overrides for main training
     # config = utils.load_config(args)  # config dictionary, which potentially comes from a JSON file
     # args = utils.dict2obj(config)  # convert back to args object
@@ -85,24 +105,30 @@ def smooth_labels_objective(trial):
 
     # Run main function hyperparam optimization for training
     args = options.run_parse_args()  # `argsparse` object for training
-    
+
     # Optuna overrides for main training
     config = utils.load_config(args)  # config dictionary, which potentially comes from a JSON file
     args = utils.dict2obj(config)  # convert back to args object
     args.config_filepath = None  # the contents of a JSON file (if specified) have been loaded already, so prevent the `main.setup` from overwriting the Optuna overrides
-    
+
+    args. num_epochs = 10
+
+    # Hyperparameters
     args.boost_relevant = "constant"
     args.label_normalization = trial.suggest_categorical("label_normalization", ['maxmin', 'maxminmax', 'std', 'None'])
+
+    if args.label_normalization in {'None', 'maxminmax'}:   # large magnitude boost factors are not needed for these normalizations
+        args.boost_factor = trial.suggest_float("boost_factor", 1.0, boost_factor_raw_max, log=True)  # 1.2 max for mixed geometric/Jaccard, 10 for Jaccard only
+    else:
+        args.boost_factor = trial.suggest_float("boost_factor", 1.0, boost_factor_norm_max, log=True)
+
+    args.max_inj_relevant = trial.suggest_int("max_inj_relevant", 3, 100, log=True)
+
     if args.label_normalization == 'None':
         args.label_normalization = None # the actual expected value in the code is None, not 'None'
-        args.boost_factor = trial.suggest_float("boost_factor", 1.0, 1.4, log=True)
-    else:
-        args.boost_factor = trial.suggest_float("boost_factor", 1.0, 2, log=True)
-    
-    args.max_inj_relevant = trial.suggest_int("max_inj_relevant", 3, 100, log=True)
-    
+
     # Set name of experiment
-    args.experiment_name = f'AUTO_RNNr67_CODER-TASB-IZc_rboost{round(args.boost_factor, 3)}_norm-{args.label_normalization}_top{args.max_inj_relevant}'
+    args.experiment_name = exp_name_prefix + f'_rboost{round(args.boost_factor, 3)}_norm-{args.label_normalization}_top{args.max_inj_relevant}' + '_CODER-TASB-IZc'
 
     config = main.setup(args)  # Setup main training session
     best_values = main.main(config, trial)  # best metrics found during evaluation
@@ -114,22 +140,24 @@ def smooth_labels_objective(trial):
 
 
 if __name__ == '__main__':
-    
+
+    wait_time = random.randint(0, 30)  # random wait time in seconds to avoid writing to DB exactly at the same time
+    time.sleep(wait_time)
+
     task = 'smooth_labels'  # 'rerank', 'smooth_labels', 'smooth_labels_e2e'
     dataset = 'MSMARCO'  # 'TripClick'
-    
+
     if task == 'rerank':
         study_name = 'recipNN_postprocess_reranking_study_normalization'  # This name is shared across jobs/processes
         objective = recipNN_rerank_objective
-        storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{dataset}_optuna.db'
     elif task == 'smooth_labels':
-        study_name = 'recipNN_smooth_labels_study'  # This name is shared across jobs/processes
+        study_name = smoothing_study_name  # This name is shared across jobs/processes
         objective = smooth_labels_objective
-        storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{task}_{dataset}_optuna.db'
     elif task == 'smooth_labels_e2e':
         study_name = 'recipNN_smooth_labels_e2e_study'  # This name is shared across jobs/processes
         objective = smooth_labels_e2e_objective
-        storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{task}_{dataset}_optuna.db'
+
+    storage = f'sqlite:////gpfs/data/ceickhof/gzerveas/RecipNN/recipNN_{task}_{dataset}_optuna.db'
 
     n_trials = 200
     sampler = TPESampler()  # TPESampler(**TPESampler.hyperopt_parameters())
@@ -138,11 +166,11 @@ if __name__ == '__main__':
     study = optuna.create_study(study_name=study_name, storage=storage, load_if_exists=True, direction=direction,
                                 sampler=sampler,
                                 pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=80000, interval_steps=1))
-    
+
     # fixed_params = {"y": best_params["y"]}
     # partial_sampler = optuna.samplers.PartialFixedSampler(fixed_params, study.sampler)
     # study.sampler = partial_sampler
-    
+
     trials_df = study.trials_dataframe()  #(attrs=('number', 'value', 'params', 'state'))
     print(trials_df)
     study.optimize(objective, n_trials=n_trials, gc_after_trial=True)  # last argument does garbage collection to avoid memory leak

@@ -14,15 +14,16 @@ import utils
 
 
 
-parser = argparse.ArgumentParser("Convert one file format to another. The defaults correspond to converting a tsv scores file to a HDF5 file used for training.")
+parser = argparse.ArgumentParser("Convert one file format to another. The defaults correspond to converting a tsv scores file to a pickle file used for training.")
 # Run from config fule
 parser.add_argument('--from', dest='orig_filepath', required=True,
                     help='Source file path')
 parser.add_argument('--to', dest='dest_filepath',
-                    help='Destination file path. If not specified, it will be the same as the source file path, but with the opposite extension (.tsv or .hdf5).')
+                    help='Destination file path, whose extention will determine the destination format. '
+                    'If this argument is not specified, it will be the same as the source file path, but with the opposite extension (.tsv or .pickle).')
 parser.add_argument('--score_type', choices=['int', 'float'], default='float',
                     help='Type of destination (prediction or label) scores')
-parser.add_argument('--id_type', choices=['int', 'str'], default='str',
+parser.add_argument('--id_type', choices=['int', 'str'], default='int',
                     help='Type of destination query or document IDs')
 parser.add_argument('--is_qrels', action='store_true',
                     help="If the destination 'tsv' file is meant to be in a qrels format (including a 'Q0' column and no rank column).")
@@ -70,24 +71,30 @@ class Converter(object):
         """
         self.orig_filepath = orig_filepath
         self.dest_filepath = dest_filepath
-        self.score_type = score_type
-        self.id_type = id_type
+        self.score_type = __builtins__.int if score_type =='int' else __builtins__.float
+        self.id_type = __builtins__.int if id_type =='int' else __builtins__.str  # for pickle format
         self.is_qrels = is_qrels
         self.num_top = num_top
         self.norm_relevances = norm_relevances
         
+        # Determine the source and destination formats
         orig_main_filename, self.orig_ext = os.path.splitext(self.orig_filepath)
-        if self.orig_ext == '.pickle' or self.orig_ext == '.hdf5':
-            self.dest_format = 'tsv'
-            self.score_type = __builtins__.int if score_type =='int' else __builtins__.float
+        if self.dest_filepath is not None:  # when specified, the destination format is determined by the extension
+            self.dest_format = os.path.splitext(self.dest_filepath)[1][1:]  # [1:] to remove the dot
         else:
-            self.dest_format = 'pickle' #'hdf5'
-            self.score_type = __builtins__.int if score_type =='int' else __builtins__.float
-            self.id_type = __builtins__.str  # only string keys are supported in HDF5 format
-            #self.id_type = __builtins__.int if id_type =='int' else __builtins__.str  # for pickle format
-            self.is_qrels = False
-        if self.dest_filepath is None:
+            if self.orig_ext == '.pickle' or self.orig_ext == '.hdf5':  # default conversion when origin not .tsv
+                self.dest_format = 'tsv'
+            else: # default conversion for origin '.tsv'
+                self.dest_format = 'pickle' #'hdf5'
             self.dest_filepath = orig_main_filename + '.' + self.dest_format
+        
+        # Set the types of the IDs according to the destination format
+        if self.dest_format == 'pickle':
+            self.is_qrels = False
+        elif self.dest_format == 'hdf5':
+            self.id_type = __builtins__.str  # only string keys are supported in HDF5 format
+            self.is_qrels = False
+            
         return
 
     def convert(self):
@@ -95,7 +102,7 @@ class Converter(object):
         and writes it to a new binary or tsv file, according to the specified format."""
         
         logger.info("Reading scores from {} ...".format(self.orig_filepath))
-        if self.dest_format == '.hdf5' or '.pickle':
+        if self.orig_ext == '.tsv':
             scores = utils.load_qrels(self.orig_filepath, relevance_level=0, rel_type=self.score_type, id_type=self.id_type) # dict{qID: dict{pID: relevance}}
         elif self.orig_ext == '.pickle': 
             with open(self.orig_filepath, 'rb') as f:
