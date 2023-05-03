@@ -58,7 +58,7 @@ def normalize_scores(scores, normalize):
 
 
 class Converter(object):
-    
+
     def __init__(self, orig_filepath, dest_filepath=None, score_type='float', id_type='int', is_qrels=False, num_top=None, norm_relevances='None'):
         """
         :param orig_filepath: input/origin file path
@@ -76,7 +76,7 @@ class Converter(object):
         self.is_qrels = is_qrels
         self.num_top = num_top
         self.norm_relevances = norm_relevances
-        
+
         # Determine the source and destination formats
         orig_main_filename, self.orig_ext = os.path.splitext(self.orig_filepath)
         if self.dest_filepath is not None:  # when specified, the destination format is determined by the extension
@@ -87,31 +87,31 @@ class Converter(object):
             else: # default conversion for origin '.tsv'
                 self.dest_format = 'pickle' #'hdf5'
             self.dest_filepath = orig_main_filename + '.' + self.dest_format
-        
+
         # Set the types of the IDs according to the destination format
         if self.dest_format == 'pickle':
             self.is_qrels = False
         elif self.dest_format == 'hdf5':
             self.id_type = __builtins__.str  # only string keys are supported in HDF5 format
             self.is_qrels = False
-            
+
         return
 
     def convert(self):
-        """Reads a file with scored candidate documents for each query into a dictionary {qid: {passageid: relevance}} 
+        """Reads a file with scored candidate documents for each query into a dictionary {qid: {passageid: relevance}}
         and writes it to a new binary or tsv file, according to the specified format."""
-        
+
         logger.info("Reading scores from {} ...".format(self.orig_filepath))
         if self.orig_ext == '.tsv':
             scores = utils.load_qrels(self.orig_filepath, relevance_level=0, rel_type=self.score_type, id_type=self.id_type) # dict{qID: dict{pID: relevance}}
-        elif self.orig_ext == '.pickle': 
+        elif self.orig_ext == '.pickle':
             with open(self.orig_filepath, 'rb') as f:
                 scores = pickle.load(f)  # dict{qID: dict{pID: relevance}}
         else:
             with h5py.File(self.orig_filepath, 'r') as f:
                 # scores = utils.read_dict_hdf5(f)  # dict{qID: dict{pID: relevance}}
                 scores = {qid: {pid: self.score_type(relevance) for pid, relevance in f[qid].items()} for qid in f}
-    
+
         if self.num_top is not None or self.norm_relevances != 'None':
             if self.num_top is not None:
                 logger.info("Will keep only the top {} passages for each query".format(self.num_top))
@@ -128,18 +128,18 @@ class Converter(object):
                     # scores[qid][first_docid] /= 2
                 else:
                     scores[qid] = dict(sorted(scores[qid].items(), key=itemgetter(1), reverse=True)[:end])
-            
+
         logger.info("Writing labels/scores to {} ...".format(self.dest_filepath))
         utils.write_predictions(self.dest_filepath, scores, format=self.dest_format, score_type=self.score_type, is_qrels=self.is_qrels)
 
         return
 
-    
+
 def convert_tsv_to_pickle(input_path, output_path, score_type, id_type, num_top=None):
     """
-    Reads a file with scored candidate documents for each query into a 
+    Reads a file with scored candidate documents for each query into a
     dictionary {qid: {passageid: relevance}} and writes it to a new binary file.
-    
+
     :param input_path: input tsv file path
     :param output_path: output pickle file path
     :param score_type: Only for format 'tsv': the type of the written scores (int or float).
@@ -151,7 +151,7 @@ def convert_tsv_to_pickle(input_path, output_path, score_type, id_type, num_top=
 
     logger.info("Reading scores from {} ...".format(input_path))
     scores = utils.load_qrels(input_path, relevance_level=0, rel_type=score_type, id_type=id_type)
-    
+
     if num_top is not None:
         logger.info("Keeping only the top {} passages for each query ...".format(num_top))
         for qid in scores:
@@ -159,7 +159,7 @@ def convert_tsv_to_pickle(input_path, output_path, score_type, id_type, num_top=
             # NOTE: to remove boost factor from first passage score. RESTORE BY REMOVING BELOW!
             # first_docid = next(iter(scores[qid].items()))[0]
             # scores[qid][first_docid] /= 2
-        
+
     logger.info("Writing labels/scores to {} ...".format(output_path))
     utils.write_predictions(output_path, scores, format="pickle")
     return
@@ -167,9 +167,9 @@ def convert_tsv_to_pickle(input_path, output_path, score_type, id_type, num_top=
 
 def convert_pickle_to_tsv(input_path, output_path, score_type, is_qrels, num_top=None):
     """
-    Reads a binary file containing a dictionary {qid: {passageid: relevance}} with scored candidate documents 
+    Reads a binary file containing a dictionary {qid: {passageid: relevance}} with scored candidate documents
      and writes it to a new tsv file.
-    
+
     :param input_path: input pickle file path
     :param output_path: output tsv file path
     :param score_type: Only for format 'tsv': the type of the written scores (int or float).
@@ -182,21 +182,21 @@ def convert_pickle_to_tsv(input_path, output_path, score_type, is_qrels, num_top
     logger.info("Reading scores from {} ...".format(input_path))
     with open(input_path, 'rb') as f:
         scores = pickle.load(f)  # dict{qID: dict{pID: relevance}}
-    
+
     if num_top is not None:
         logger.info("Keeping only the top {} passages for each query ...".format(num_top))
         for qid in scores:
             scores[qid] = dict(sorted(scores[qid].items(), key=itemgetter(1), reverse=True)[:num_top])
-        
+
     logger.info("Writing labels/scores to {} ...".format(output_path))
     utils.write_predictions(output_path, scores, format="tsv", score_type=score_type, is_qrels=is_qrels)
     return
 
 
 if __name__ == "__main__":
-    
-    converter = Converter(args.orig_filepath, args.dest_filepath, 
+
+    converter = Converter(args.orig_filepath, args.dest_filepath,
                           args.score_type, args.id_type, args.is_qrels, args.num_top, args.norm_relevances)
     converter.convert()
-            
+
     logger.info("Done!")

@@ -10,7 +10,11 @@ POS_METRICS.extend(m + '@' for m in POS_METRICS[:])
 METRICS = NEG_METRICS + POS_METRICS
 
 
-def run_parse_args():
+def run_parse_args(args=None):
+    """
+    By default, `args` will be the command-line arguments. However, `args` can be a list of strings,
+    to allow initialization from within a Python script (e.g. hyperparameter optimization).
+    """
     parser = argparse.ArgumentParser(description='Run a complete training or evaluation. Optionally, a JSON configuration '
                                                  'file can be used, to overwrite command-line arguments.')
     ## Run from config file
@@ -46,7 +50,14 @@ def run_parse_args():
     parser.add_argument('--output_dir', type=str, default='./output',
                         help='Root output directory. Must exist. Time-stamped directories will be created inside.')
     parser.add_argument("--qrels_path", type=str,
-                        help="Path of the text file or directory with the ground truth relevance labels, qrels")
+                        help="Path of the text file or directory with the ground truth relevance labels (qrels). "
+                             "If a directory, it is assumed that it contains the files: 'qrels.{train,dev}.tsv'."
+                             "If `eval_qrels_path` is not provided, it is assumed that this file or directory contains "
+                             "the qrels for evaluation as well.")
+    parser.add_argument("--eval_qrels_path", type=str,
+                        help="Path of the *text file* with the ground truth relevance labels (qrels) for evaluation. If not provided, "
+                        "it is assummed that `qrels_path` is a file that contains the qrels for evaluation as well, "
+                        "or a dir containing the files: 'qrels.{train,dev}.tsv'.")
     parser.add_argument("--target_scores_path", type=str, #e.g. "my/path/scores_train*.pickle"
                         help="Optional: Path to a pickle or tsv file (or pattern matching multiple files) containing relevance scores "
                              "which will be used as training labels instead of qrels, which will be used only for evaluation.")
@@ -317,9 +328,9 @@ def run_parse_args():
     parser.add_argument('--bias_regul_cutoff', type=int, default=100,
                         help='Bias term is calculated according to the top-X predicted results')
 
-    args = parser.parse_args()
+    out_args = parser.parse_args(args)
 
-    return args
+    return out_args
 
 
 def check_args(config):
@@ -338,6 +349,9 @@ def check_args(config):
 
     if config['eval_query_tokens_path'] is None:
         config['eval_query_tokens_path'] = config['tokenized_path']
+        
+    if config['eval_qrels_path'] is None:
+        config['eval_qrels_path'] = config['qrels_path']
 
     # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
     components = config['key_metric'].split('@')

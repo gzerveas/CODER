@@ -195,14 +195,16 @@ def eval_results(run_file_path,
     return mrr
 
 
-def set_seed(args):
-    """the seed state is shared across the entire program, regardless of module
+def set_seed(seed=None, has_gpu=False):
+    """the seed state is shared across the entire program through importing `utils`, regardless of module
     (confirmed for Python random, but most likely true for the others too). Numpy is likely not thread safe."""
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if args.n_gpu > 0:
-        torch.cuda.manual_seed_all(args.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if seed is None:
+        seed = random.randint(0, 2**32-1)
+    torch.manual_seed(seed)
+    if has_gpu:
+        torch.cuda.manual_seed_all(seed)
 
 
 def save_HF_model_and_args(model, output_dir, save_name, args):

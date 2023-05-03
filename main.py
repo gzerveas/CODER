@@ -225,8 +225,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                     tb_writer.add_scalar('train/batch time', avg_batch_time, global_step)
                     if model.score_cands.temperature is not None:
                         tb_writer.add_scalar('train/temperature', model.score_cands.temperature, global_step)
-                        tb_writer.add_scalar('train/score_bias', model.score_cands.b, global_step) 
-                    
+                        tb_writer.add_scalar('train/score_bias', model.score_cands.b, global_step)
+
                     logger.info("Mean loss over {} steps: {:.5f}".format(args.logging_steps, cur_loss))
                     if args.debug:
                         for i, s in enumerate(scheduler.get_last_lr()):
@@ -261,7 +261,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         except:
                             logger.error('Histogram not possible!')
                         # Export histogram of ranks of relevant documents
-                        utils.write_columns_to_csv(os.path.join(args.output_dir, "rank_histogram.csv"), 
+                        utils.write_columns_to_csv(os.path.join(args.output_dir, "rank_histogram.csv"),
                                                    columns=(bins_orig, freqs_orig, freqs_best),
                                                    header=('rank', 'Original', 'Reranked'))
                         # Export predictions per query and document
@@ -355,7 +355,7 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_
         ind = bisect.bisect_right(best_values, metric_value)  # index where to insert in sorted list in ascending order
     else:
         ind = utils.reverse_bisect_right(best_values, metric_value)  # index where to insert in sorted list in descending order
-    
+
     condition = (ind < args.num_keep_best) and (global_step > STEP_THRESHOLD)  # NOTE: the second condition is because fairness is initially always bad but performance at its best
     if condition:
         best_values.insert(ind, metric_value)
@@ -366,7 +366,7 @@ def validate(args, model, val_dataloader, tensorboard_writer, best_values, best_
             os.remove(os.path.join(args.save_dir, 'model_best_{}.pth'.format(best_steps[-1])))
             best_values = best_values[:args.num_keep_best]
             best_steps = best_steps[:args.num_keep_best]
-        
+
         # Export metrics to a file accumulating best records from the current experiment
         rec_filepath = os.path.join(args.pred_dir, 'training_session_records.xls')
         utils.register_record(rec_filepath, args.initial_timestamp, args.experiment_name, val_metrics)
@@ -440,7 +440,7 @@ def evaluate(args, model, dataloader, fairrmetric=None):
 
     if labels_exist:
         # try:
-        # eval_metrics = get_retrieval_metrics(scores, qrels=dataloader.dataset.reformatted_qrels, cutoff_values=(5, args.metrics_k), 
+        # eval_metrics = get_retrieval_metrics(scores, qrels=dataloader.dataset.reformatted_qrels, cutoff_values=(5, args.metrics_k),
         #                                          relevance_level=dataloader.dataset.relevant_at_level, verbose=False)  # {metric_name: metric_value}
         eval_metrics = calculate_metrics(relevances, num_relevant, args.metrics_k) # aggregate metrics for the entire dataset
         # except Exception as x:
@@ -502,11 +502,12 @@ def get_dataset(args, eval_mode, tokenizer):
     """Initialize and return evaluation dataset object based on args"""
 
     if args.model_type == 'repbert':
+        raise NotImplementedError('RepBERT evaluation is no longer supported. To restore backward compatibility, fix MSMARCODataset.')
         return MSMARCODataset(eval_mode, args.msmarco_dir, args.collection_memmap_dir, args.tokenized_path,
                               args.max_query_length, args.max_doc_length, limit_size=args.eval_limit_size)
     else:
         return MYMARCO_Dataset(eval_mode, args.embedding_memmap_dir, args.eval_query_tokens_path,
-                               args.eval_candidates_path, qrels_path=args.qrels_path, query_ids_path=args.eval_query_ids,
+                               args.eval_candidates_path, qrels_path=args.eval_qrels_path, query_ids_path=args.eval_query_ids,
                                tokenizer=tokenizer, max_query_length=args.max_query_length,
                                num_candidates=None,  # Always use ALL candidates for evaluation
                                limit_size=args.eval_limit_size,
@@ -604,7 +605,7 @@ def setup(args):
     with open(os.path.join(output_dir, 'configuration.json'), 'w') as fp:
         json.dump(config, fp, indent=4, sort_keys=True)
     logger.info("Stored configuration file in '{}'".format(output_dir))
-    
+
     # Rest of configuration (does not need to be saved as a JSON config file)
     info_dict = {'initial_timestamp': formatted_timestamp,
                  'output_dir': output_dir,
@@ -612,12 +613,12 @@ def setup(args):
                  'pred_dir': os.path.join(output_dir, 'predictions'),
                  'tensorboard_dir': os.path.join(output_dir, 'tb_summaries')}
     config.update(info_dict)
-    
+
     args = utils.dict2obj(config)  # Convert config dict to args object
-    
+
     # Create subdirectories
     utils.create_dirs([args.save_dir, args.pred_dir, args.tensorboard_dir])
-    
+
     # Setup CUDA, GPU
     args.n_gpu = len(args.cuda_ids)
     if torch.cuda.is_available():
@@ -627,7 +628,7 @@ def setup(args):
             args.device = torch.device("cuda:%d" % args.cuda_ids[0])
     else:
         args.device = torch.device("cpu")
-        
+
     # Add file logging besides stdout
     file_handler = logging.FileHandler(os.path.join(args.output_dir, 'output.log'))
     logger.addHandler(file_handler)
@@ -646,7 +647,7 @@ def setup(args):
     if args.device.type == 'cuda':
         info_dict['cuda device'] = torch.cuda.get_device_name(0)
         info_dict['cuda memory'] = total_mem_mb
-    
+
     info_dict['Code path'] = os.path.abspath(__file__)
     info_dict['Git hash'] = utils.get_git_revision_short_hash()
     git_diff = utils.get_git_diff()
@@ -657,9 +658,9 @@ def setup(args):
     else:
         info_dict['Git diff'] = "No changes"
     info_dict['experiment_name'] = args.experiment_name
-    
+
     utils.write_columns_to_csv(os.path.join(output_dir, "info.txt"), rows=info_dict.items(), delimiter='\t')
-    
+
     utils.write_conda_env(os.path.join(output_dir, "conda_env.yml"))
 
     return args
@@ -688,7 +689,7 @@ def main(args, trial=None):  # trial is an Optuna hyperparameter optimization ob
     # ##### TODO: HACK TO DEBUG hyperparam_optim
 
     # Set seed
-    utils.set_seed(args)
+    utils.set_seed(args.seed, has_gpu=args.n_gpu > 0)
 
     # Get tokenizer
     tokenizer = get_tokenizer(args)
@@ -772,7 +773,7 @@ def main(args, trial=None):  # trial is an Optuna hyperparameter optimization ob
         for k, v in eval_metrics.items():
             print_str += '{}: {:8f} | '.format(k, v)
         logger.info(print_str)
-        
+
         try:
             freqs, bins = utils.plot_rank_barplot(eval_dataloader.dataset.qrels, pred_scores=predictions, save_as=os.path.join(args.pred_dir, "rank_historgram.pdf"))
         except:
@@ -791,9 +792,9 @@ def main(args, trial=None):  # trial is an Optuna hyperparameter optimization ob
         # Export record metrics to a file accumulating records from all experiments
         utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
                               eval_metrics, comment=args.comment)
-        
+
         # Export histogram of ranks of relevant documents to a file
-        utils.write_columns_to_csv(os.path.join(args.output_dir, "rank_histogram.csv"), 
+        utils.write_columns_to_csv(os.path.join(args.output_dir, "rank_histogram.csv"),
                                columns=(bins, freqs),
                                header=('rank', 'Counts'))
 

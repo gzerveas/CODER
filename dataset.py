@@ -7,7 +7,6 @@ from itertools import chain
 from operator import itemgetter
 import time
 import sys
-import numbers
 
 import numpy as np
 from tqdm import tqdm
@@ -31,7 +30,7 @@ retrieve_candidates_times = utils.Timer()
 
 
 def nanstd(x, dim=-1):
-    """Returns std of Tensor x along specified dimension, ignoring NaN values""" 
+    """Returns std of Tensor x along specified dimension, ignoring NaN values"""
     return torch.sqrt(torch.nanmean(torch.pow(x - torch.nanmean(x, dim=dim).unsqueeze(dim), 2), dim=dim))
 
 
@@ -59,11 +58,11 @@ def normalize_batch(relevances, norm_type):
         # to ignore -inf values, we first make a copy of new_relevances where we replace non-valid values with +inf, and then we take the min along each row
         min_relev = torch.min(torch.where(not_valid, torch.full_like(relevances, float('inf')), relevances), dim=-1).values
         relevances = (relevances - min_relev.unsqueeze(-1)) / (max_relev - min_relev).unsqueeze(-1)
-        if norm_type == 'maxminmax':  # even wider dynamic range for "uniform" initial scores, but in [0, mean(row)]
+        if norm_type == 'maxminmax':  # even wider dynamic range for "uniform" initial scores, but in [0, max(row)]
             relevances = max_relev.unsqueeze(-1) * relevances
         elif norm_type == 'maxminbatchmean':  # wide dynamic range for "uniform" initial scores, while reducing variance across queries; in [0, mean(batch)]
             relevances = torch.nanmean(torch.where(not_valid, torch.full_like(relevances, float('nan')), relevances)) * relevances
-    elif norm_type == 'std': # even wider dynamic range for "uniform" initial scores, but in [0, f], with f > 1
+    elif norm_type == 'std':  # even wider dynamic range for "uniform" initial scores, but in [0, f], with f > 1
         # to ignore -inf values for std, we follow the same approach as with min, but use NaN. There is a special torch function ignoring NaN
         min_relev = torch.min(torch.where(not_valid, torch.full_like(relevances, float('inf')), relevances), dim=-1).values
         relev_std = nanstd(torch.where(not_valid, torch.full_like(relevances, float('nan')), relevances), dim=-1).unsqueeze(-1)
@@ -360,7 +359,7 @@ def load_qrels(filepath, relevance_thr=1, score_mapping=None):
 def load_query_ids(filepath):
     """Loads query IDs from a file which contains 1 ID per line (and possibly more fields on its right, separated by whitespace)"""
     query_ids = []
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
             qid, *_ = line.strip().split()  # read first field, ignore the rest, if any exist
             query_ids.append(int(qid))
@@ -658,18 +657,20 @@ class MYMARCO_Dataset(Dataset):
                 num_safety_docs = 100  # to account for non-unique randomly sampled documents
                 # For MSMARCO, self.emb_collection.ids can be replaced with len(self.emb_collection) -- when replace=True, x10000 faster!???
                 if self.emb_collection.id2ind is None:  # if document IDs are ordinal numbers:
-                    doc_ids = list(set(np.random.choice(len(self.emb_collection), size=(self.num_candidates+num_safety_docs), replace=True)))
+                    doc_ids = list(set(np.random.choice(len(self.emb_collection), size=(self.num_candidates + num_safety_docs), replace=True)))
                 else:  # x2 faster than if replace=False
-                    doc_ids = list(set(np.random.choice(self.emb_collection.ids, size=(self.num_candidates+num_safety_docs), replace=True)))
+                    doc_ids = list(set(np.random.choice(self.emb_collection.ids, size=(self.num_candidates + num_safety_docs), replace=True)))
             retrieve_candidates_times.update(time.perf_counter() - tic)
         else:  # will be retrieved per-batch for efficiency (in collate_fn)
             doc_ids = []
 
         if self.mode == "train" or self.inject_ground_truth:
-            if self.target_scores is not None:
+            label_source = self.qrels
+            if (self.target_scores is not None) and (qid in self.target_scores):
+                # first condition cannot be true in case of 'dev' mode (see __init__, loading of target_scores)
+                # second condition allows using usual qrels (instead of soft labels) when target_scores are not provided for all qids
                 label_source = self.target_scores
-            else:
-                label_source = self.qrels
+
             # Prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
             # while ensuring that they are only included once.
             # We can limit the number of injected documents from the label source with `max_inj_relevant`, to make space for negatives (e.g. dynamic)
@@ -740,8 +741,7 @@ class MYMARCO_Dataset(Dataset):
 
         qrels = None
         if (label_format == 'indices') and \
-                ((relevant_at_level != self.include_at_level) or
-                 (self.mode == 'dev' and not self.inject_ground_truth)):
+                ((relevant_at_level != self.include_at_level) or (self.mode == 'dev' and not self.inject_ground_truth)):
             qrels = self.qrels  # in this case the shortcut cannot be used, and qrels is required
 
         return partial(collate_function, emb_collection=self.emb_collection, mode=self.mode, pad_token_id=self.pad_id,
@@ -891,7 +891,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
 
     max_cands_per_query = min(max_candidates, max(len(cands) for cands in doc_ids))  # length used for padding
 
-    if num_random_neg == 0: # Will only use retrieved candidates (either as negatives or for evaluation)
+    if num_random_neg == 0:  # Will only use retrieved candidates (either as negatives or for evaluation)
         # Pack 3D tensors: candidate embeddings and corresponding padding mask
         # Tensors are padded NOT to a standard length (transformer input length), but to the max_len in the batch
         data['doc_emb'], data['doc_padding_mask'] = pack_candidate_embeddings(doc_ids, emb_collection, batch_size, max_cands_per_query)

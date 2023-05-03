@@ -54,37 +54,37 @@ for filename in filepaths:
             else:
                 num_trailing_parts += 1
         trailing_part = '.'.join(filename_parts[-num_trailing_parts:])  # e.g. "dev.small.tsv"
-        
+
         qrels_filename += '.' + trailing_part
-    
+
     logger.info(f"Evaluating '{filename}' using '{qrels_filename}' :")
-    
+
     if qrels_filename != old_qrels_filename:
         logger.info(f"Loading qrels from '{qrels_filename}' ...")
         qrels = utils.load_qrels(qrels_filename, relevance_level=args.relevance_level)
-        old_qrels_filename = qrels_filename    
-    
+        old_qrels_filename = qrels_filename
+
     logger.info("Reading scores from {} ...".format(filename))
     if filename.endswith('.tsv'):
         results = utils.load_predictions(filename)
-    elif filename.endswith('.pickle'):    
+    elif filename.endswith('.pickle'):
         with open(filename, 'rb') as f:
             results = pickle.load(f)  # dict{qID: dict{pID: relevance}}
     else:
         raise ValueError(f"Unknown file format: {filename}")
-    
+
     perf_metrics = utils.get_retrieval_metrics(results, qrels)
-    
+
     if args.write_to_json:
         eval_filename = '.'.join(filename_parts[:-1]) + '.json'
         with open(eval_filename, 'w') as fp:
             json.dump(perf_metrics, fp)
-    
+
     print(perf_metrics)
-    
+
     if args.parameters == 'empty':  # parameter columns will be created but empty
         perf_metrics['time'] = ''
-        
+
         WEIGHT_FUNC = ''
         WEIGHT_FUNC_PARAM = ''
         NORMALIZATION = ''
@@ -104,7 +104,7 @@ for filename in filepaths:
         except:
             logger.error(f"Could not parse parameters dictionary from string: {args.parameters}")
             parameters = None
-        
+
     # Export record metrics to a file accumulating records from all experiments
     if args.records_file != 'None':
         utils.register_record(args.records_file, '', os.path.basename(filename), perf_metrics, parameters=parameters)
