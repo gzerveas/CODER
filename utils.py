@@ -13,6 +13,8 @@ import traceback
 import resource
 import time
 import pickle
+import logging
+logging.getLogger('matplotlib').setLevel(logging.ERROR)
 from matplotlib import pyplot as plt
 from typing import Dict, List, Tuple
 import csv
@@ -31,7 +33,6 @@ import pytrec_eval
 
 import metrics
 
-import logging
 logging.basicConfig(format='%(asctime)s | %(levelname)s : %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -433,20 +434,20 @@ def get_ranks_of_top(qrels, score_dict, hit=1000):
 def get_ranks_of_all_relevant(qrels, score_dict, relevance_thr=1):
     """For each query, returns the ranks (starting from 1) of all corresponding ground-truth documents (or -1, if not found) as a list.
     Thus, the returned object is a list of lists."""
-    
+
     def find(iterable, target):
         """Returns first index of target within iterable; if not found, returns -1"""
         for i, item in enumerate(iterable):
             if target == item:
                 return i
         return -1
-    
+
     return [[int(1 + find(score_dict[qid].keys(), docid)) for docid in qrels[qid] if qrels[qid][docid] >= relevance_thr] for qid in score_dict]
 
 
 def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', bins=None, relevance_thr=1, save_as='ranks.pdf'):
     """
-    Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved 
+    Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved
     based on the predicted model scores in `pred_scores`.
 
     :param qrels: dict {qID : {pID: score}, g.t. relevance
@@ -455,11 +456,11 @@ def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_groun
         If given, it will be superimposed on the plot for reference.
     :param include_ground_truth: if 'all', the histogram will include the ranks of all g.t. documents per query
         (naturally, only one of them can have rank 1). If 'top', the histogram will only include the ranks of the top-scored g.t. document.
-    :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant 
+    :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant
     :param save_as: _description_, defaults to 'ranks.pdf'
     :return: (freqs, bin_edges) tuple of counts/frequencies and bin edges of pred_scores historgram
     """
-    
+
     if include_ground_truth == 'all':
         title_str = 'Ranks of all ground-truth documents per query'
         pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_all_relevant(qrels, pred_scores, relevance_thr=relevance_thr))), dtype=np.int16)
@@ -470,7 +471,7 @@ def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_groun
         pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, pred_scores))), dtype=np.int16)
         if type(base_pred_scores) is dict:
             base_pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, base_pred_scores))), dtype=np.int16)
-    
+
     bins= list(range(50)) + list(range(50, 1050, 50))
     # bin_labels = ["[{}, {})".format(bins[i], bins[i + 1]) for i in range(len(bins) - 1)] + ["[{}, inf)".format(bins[-1])]
     plt.figure(figsize=(30, 10))
@@ -491,9 +492,9 @@ def plot_rank_histogram(qrels, pred_scores, base_pred_scores=None, include_groun
 
 def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_truth='all', bins=None, relevance_thr=1, orient_bars='vertical', save_as='ranks.pdf'):
     """
-    Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved 
+    Plots a histogram with the rank that ground-truth relevant documents ain `qrels` achieved
     based on the predicted model scores in `pred_scores`. The difference with `plot_rank_histogram` is that
-    the histogram is plotted as a horizontal barplot (i.e. bar the width is not proportional to the actual bin widths), 
+    the histogram is plotted as a horizontal barplot (i.e. bar the width is not proportional to the actual bin widths),
     with the y-axis being the rank and the x-axis being the frequency.
 
     :param qrels: dict {qID : {pID: score}, g.t. relevance
@@ -503,12 +504,12 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
     :param include_ground_truth: if 'all', the histogram will include the ranks of all g.t. documents per query
         (naturally, only one of them can have rank 1). If 'top', the histogram will only include the ranks of the top-scored g.t. document.
     :param bins: iterable of length 69; the bins to use for the histogram. If None, the default bins will be used.
-    :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant 
+    :param relevance_thr: the relevance score that a document in qrels must have in order to be g.t. considered relevant
     :param orient_bars: orientation of bars; 'vertical' or 'horizontal', defaults to 'vertical'.
     :param save_as: filepath to save figure, defaults to 'ranks.pdf'
     :return: (freqs, bin_edges) tuple of counts/frequencies and bin edges of pred_scores historgram
     """
-    
+
     if include_ground_truth == 'all':
         title_str = 'Ranks of all ground-truth documents per query'
         pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_all_relevant(qrels, pred_scores, relevance_thr=relevance_thr))), dtype=np.int16)
@@ -519,16 +520,16 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
         pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, pred_scores))), dtype=np.int16)
         if type(base_pred_scores) is dict:
             base_pred_ranks = np.array(list(chain.from_iterable(get_ranks_of_top(qrels, base_pred_scores))), dtype=np.int16)
-    
+
     if bins is None:
         bins = list(range(1, 50)) + list(range(50, 1050, 50))
     bin_labels = ["[{}, {})".format(bins[i], bins[i + 1]) for i in range(len(bins) - 1)] #+ ["[{}, inf)".format(bins[-1])]
-    
+
     if orient_bars == 'horizontal':
         fig, ax = plt.subplots(figsize=(10, 30))
     else:
         fig, ax = plt.subplots(figsize=(30, 10))
-    
+
     if base_pred_scores is not None:
         if type(base_pred_scores) is dict:
             freqs, bin_edges = np.histogram(base_pred_ranks, bins=bins)
@@ -540,10 +541,10 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
             ax.barh(np.arange(len(freqs)), freqs, height=1, align='edge', alpha=0.2, color='red', edgecolor='gray', label='Original')
         else:
             ax.bar(np.arange(len(freqs)), freqs, width=1, align='edge', alpha=0.2, color='red', edgecolor='gray', label='Original')
-    
+
     freqs, bin_edges = np.histogram(pred_ranks, bins=bins)
     # plt.hist(bin_edges[:-1], bins=bin_edges, weights=freqs, alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
-    
+
     # Prepare labels for the bars
     if base_pred_scores is None:
         label_vals = freqs
@@ -553,9 +554,9 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
         label_vals = freqs - orig_freqs
         # ax.bar_label(hbars, fmt='%d', labels=labels, padding=10)  # Requires matplotlib 3.4.0+
         axis_lim = max(max(freqs), max(orig_freqs))
-    
+
     axis_pos = np.arange(len(freqs))
-    
+
     if orient_bars == 'horizontal':
         rects = ax.barh(axis_pos, freqs, height=1, align='edge', alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
         ax.set_yticks(axis_pos)
@@ -563,27 +564,27 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
         ax.invert_yaxis()  # labels read top-to-bottom
         ax.set_xlabel('Counts')
 
-        # Put labels on the right side of bars    
+        # Put labels on the right side of bars
         for rect, label_val in zip(rects, label_vals):
             width = rect.get_width()
             color = 'red' if label_val < 0 else 'blue'
             ax.text(width + 0.1*axis_lim, rect.get_y() + rect.get_height() / 2, str(label_val), ha="center", va="center", color=color)
-        
+
         ax.set_xlim(right=1.2*axis_lim)  # adjust xlim to fit labels
     else:
         rects = ax.bar(axis_pos, freqs, width=1, align='edge', alpha=0.2, color='blue', edgecolor='gray', label='Reranked')
         ax.set_xticks(axis_pos)
         ax.set_xticklabels(bin_labels, rotation=90)
         ax.set_ylabel('Counts')
-        
+
         # Put labels on top of bars
         for rect, label_val in zip(rects, label_vals):
             height = rect.get_height()
             color = 'red' if label_val < 0 else 'blue'
             ax.text(rect.get_x() + rect.get_width() / 2, height + 0.1*axis_lim, str(label_val), ha="center", va="center", color=color)
-        
+
         ax.set_ylim(top=1.2*axis_lim)  # adjust ylim to fit labels
-   
+
     ax.legend()
     ax.set_title(title_str)
     plt.savefig(save_as)
@@ -591,24 +592,24 @@ def plot_rank_barplot(qrels, pred_scores, base_pred_scores=None, include_ground_
 
 
 def write_columns_to_csv(filename, columns=None, rows=None, header=None, delimiter=','):
-    """Writes the given columns (iterable of iterables of same length) XOR rows (iterable of iterables of arbitrary length) 
+    """Writes the given columns (iterable of iterables of same length) XOR rows (iterable of iterables of arbitrary length)
     to a csv file by making use of the CSV writer module.
     If header is not None, it is written as the first line."""
-    
+
     if columns is not None:
         if rows is not None:
             logger.warning('Both columns and rows were specified. Ignoring rows!')
         rows = zip(*columns)
     else:
         assert rows is not None, 'Either columns or rows must be specified!'
-    
+
     with open(filename, 'w') as f:
         csvwriter = csv.writer(f, dialect='excel', delimiter=delimiter)
         if header is not None:
             csvwriter.writerow(header)
         csvwriter.writerows(rows)
     return
-            
+
 
 class Obj(object):
     def __init__(self, dict_):
@@ -767,10 +768,10 @@ def register_record(filepath, timestamp, experiment_name, best_metrics, final_me
 
 #from https://github.com/beir-cellar/beir/blob/main/beir/retrieval/evaluation.py
 class EvaluateRetrieval:
-    
+
     @staticmethod
-    def evaluate(qrels: Dict[str, Dict[str, int]], 
-                 results: Dict[str, Dict[str, float]], 
+    def evaluate(qrels: Dict[str, Dict[str, int]],
+                 results: Dict[str, Dict[str, float]],
                  k_values: List[int],
                 #  relevance_level=1,
                  ignore_identical_ids: bool=True,
@@ -782,9 +783,9 @@ class EvaluateRetrieval:
         # :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant
         :param ignore_identical_ids: ignore identical query and document ids (default)
         :param verbose: it True, will use logger config to print metrics
-        :return: Dict[str, float] value for each metric (determined by `k_values`) 
+        :return: Dict[str, float] value for each metric (determined by `k_values`)
         """
-        
+
         if ignore_identical_ids:
             # logging.info('For evaluation, we ignore identical query and document ids (default), please explicitly set ``ignore_identical_ids=False`` to ignore this.')
             popped = []
@@ -798,27 +799,27 @@ class EvaluateRetrieval:
         _map = {}
         recall = {}
         precision = {}
-        
+
         for k in k_values:
             ndcg[f"NDCG@{k}"] = 0.0
             _map[f"MAP@{k}"] = 0.0
             recall[f"Recall@{k}"] = 0.0
             precision[f"P@{k}"] = 0.0
-        
+
         map_string = "map_cut." + ",".join([str(k) for k in k_values])
         ndcg_string = "ndcg_cut." + ",".join([str(k) for k in k_values])
         recall_string = "recall." + ",".join([str(k) for k in k_values])
         precision_string = "P." + ",".join([str(k) for k in k_values])
         evaluator = pytrec_eval.RelevanceEvaluator(qrels, {map_string, ndcg_string, recall_string, precision_string}) #relevance_level=relevance_level) aparrently gives error
         scores = evaluator.evaluate(results)
-        
+
         for query_id in scores.keys():
             for k in k_values:
                 ndcg[f"NDCG@{k}"] += scores[query_id]["ndcg_cut_" + str(k)]
                 _map[f"MAP@{k}"] += scores[query_id]["map_cut_" + str(k)]
                 recall[f"Recall@{k}"] += scores[query_id]["recall_" + str(k)]
                 precision[f"P@{k}"] += scores[query_id]["P_"+ str(k)]
-        
+
         for k in k_values:
             ndcg[f"NDCG@{k}"] = round(ndcg[f"NDCG@{k}"]/len(scores), 5)
             _map[f"MAP@{k}"] = round(_map[f"MAP@{k}"]/len(scores), 5)
@@ -832,31 +833,31 @@ class EvaluateRetrieval:
                     logging.info("{}: {:.4f}".format(k, eval[k]))
 
         return ndcg, _map, recall, precision
-    
+
     @staticmethod
-    def evaluate_custom(qrels: Dict[str, Dict[str, int]], 
-                 results: Dict[str, Dict[str, float]], 
-                 k_values: List[int], 
-                 metric: str,
-                 relevance_level=1,
-                 verbose=True) -> Tuple[Dict[str, float]]:
-        
+    def evaluate_custom(qrels: Dict[str, Dict[str, int]],
+                        results: Dict[str, Dict[str, float]],
+                        k_values: List[int],
+                        metric: str,
+                        relevance_level=1,
+                        verbose=True) -> Tuple[Dict[str, float]]:
+
         if metric.lower() in ["mrr", "mrr@k", "mrr_cut"]:
             return metrics.mrr(qrels, results, k_values, relevance_level=relevance_level, verbose=verbose)
         else:
             raise NotImplementedError(f"Metric '{metric}' not implemented")
         # elif metric.lower() in ["recall_cap", "r_cap", "r_cap@k"]:
         #     return recall_cap(qrels, results, k_values)
-        
+
         # elif metric.lower() in ["hole", "hole@k"]:
         #     return hole(qrels, results, k_values)
-        
+
         # elif metric.lower() in ["acc", "top_k_acc", "accuracy", "accuracy@k", "top_k_accuracy"]:
         #     return top_k_accuracy(qrels, results, k_values)
 
 
 def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000), relevance_level=1, verbose=True):
-    """Compute retrieval performance metrics with parity to the official TREC implementation. 
+    """Compute retrieval performance metrics with parity to the official TREC implementation.
 
     :param results: dict of method's predictions per query, {str qID: {str pID: float score}}
     :param qrels: dict of ground truth relevance judgements per query, {str qID: {str pID: int relevance}}
@@ -864,16 +865,16 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     :param relevance_level: relevance score in qrels which a doc should at least have in order to be considered relevant. Only for MRR
     :return: dict of aggregate metrics, {"metric@k": avg. metric value}
     """
-    
+
     intersect_qids = results.keys() & qrels.keys()
     if len(intersect_qids) < len(qrels) or len(intersect_qids) < len(results):
         logger.warning(f"qrels file contains rel. labels for {len(qrels)} queries, while {len(results)} "
-                    f"queries were evaluated! Performance metrics will only consider the intersection ({len(intersect_qids)} queries)!")
+                       f"queries were evaluated! Performance metrics will only consider the intersection ({len(intersect_qids)} queries)!")
         logger.warning("{} queries in reference but not in predictions".format(len(qrels.keys() - results.keys())))
         logger.warning("{} queries in predictions but not in reference".format(len(results.keys() - qrels.keys())))
         qrels = {qid: qrels[qid] for qid in intersect_qids}
         results = {qid: results[qid] for qid in intersect_qids}
-    
+
     logger.info("Computing metrics ...")
     start_time = time.perf_counter()
     # Evaluate using pytrec_eval for comparison with BEIR benchmarks
@@ -882,13 +883,14 @@ def get_retrieval_metrics(results, qrels, cutoff_values=(1, 3, 5, 10, 100, 1000)
     mrr = EvaluateRetrieval.evaluate_custom(qrels, results, cutoff_values, 'MRR', relevance_level=relevance_level, verbose=verbose)
     metrics_time = time.perf_counter() - start_time
     logger.info("Time to calculate performance metrics: {:.3f} s".format(metrics_time))
-    
+
     # Merge all dicts into a single OrderedDict and sort by k for guaranteed consistency
     perf_metrics = OrderedDict()  # to also work with Python 3.6
     for met_dict in (mrr, ) + metric_dicts: #TODO: RESTORE
-        perf_metrics.update(sorted(met_dict.items(), key=lambda x: 0 if not '@' in x[0] else int(x[0].split('@')[1])))
+        perf_metrics.update(sorted(met_dict.items(), key=lambda x: 0 if '@' not in x[0] else int(x[0].split('@')[1])))
 
     return perf_metrics
+
 
 class Printer(object):
     """Class for printing output by refreshing the same line in the console, e.g. for indicating progress of a process"""
@@ -991,7 +993,7 @@ def get_current_memory_usage():
     """RSS Memory usage in MB"""
     with open('/proc/self/status') as f:
         memusage = f.read().split('VmRSS:')[1].split('\n')[0][:-3]
-    return int(memusage.strip())/1024
+    return int(memusage.strip()) / 1024
 
 
 def get_current_memory_usage2():
@@ -1038,7 +1040,7 @@ def load_qrels(filepath, relevance_level=1, score_mapping=None, rel_type=builtin
     :return:
         qid2relevance (dict): dictionary mapping from query_id to relevant passages (dict {passageid : relevance})
     """
-    
+
     qid2relevance = defaultdict(dict)
     with open(filepath, 'r') as f:
         for line in tqdm(f, desc="Line: "):
@@ -1083,20 +1085,20 @@ def load_predictions(filepath, seperator=None):
             except IndexError:
                 score = 0.999 * score  # ensures score will be decreasing
             qid_to_candidate_passages[qid][pid] = score
-    
+
     return qid_to_candidate_passages
 
 
 def merge_qrels_dictionaries(dicts, overwrite_queries=False):
     """Merge multiple qrel dictionaries, in a way that new documents can be added to existing shared queries,
     and if for the same query a passage is present in multiple dictionaries, the value from the last will be used.
-    
+
     :param dicts: iterable of qrels dictionaries to merge. Each is a dict of the form {qid: {pid: rel}}
     :param overwrite_queries: if True, queries that are present in multiple dictionaries will be overwritten by the last;
         otherwise, they will be merged such that new passages can be added to existing queries (and shared passages will be overwritten).
     """
     merged = defaultdict(dict)
-    
+
     if overwrite_queries:
         for d in dicts:
             merged.update(d)
@@ -1114,6 +1116,9 @@ def load_qrels_from_pickles(path_pattern, overwrite_queries=False):
         otherwise, they will be merged such that new passages can be added to existing queries (and shared passages will be overwritten).
     """
     qrels = defaultdict(dict)
+    paths = glob.glob(path_pattern)
+    if len(paths) == 0:
+        raise IOError("No pickle files found for pattern: '{}'".format(path_pattern))
     for path in glob.glob(path_pattern):
         with open(path, 'rb') as f:
             if overwrite_queries:
@@ -1131,6 +1136,9 @@ def load_qrels_from_hdf5(path_pattern, overwrite_queries=False):
         otherwise, they will be merged such that new passages can be added to existing queries (and shared passages will be overwritten).
     """
     qrels = defaultdict(dict)
+    paths = glob.glob(path_pattern)
+    if len(paths) == 0:
+        raise IOError("No HDF5 files found for pattern: '{}'".format(path_pattern))
     for path in glob.glob(path_pattern):
         with h5py.File(path, "r") as f:
             if overwrite_queries:

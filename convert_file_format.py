@@ -5,13 +5,13 @@ logger = logging.getLogger()
 import os
 import argparse
 import pickle
+import builtins
 
 import torch
 import h5py
 from tqdm import tqdm
 
 import utils
-
 
 
 parser = argparse.ArgumentParser("Convert one file format to another. The defaults correspond to converting a tsv scores file to a pickle file used for training.")
@@ -30,7 +30,7 @@ parser.add_argument('--is_qrels', action='store_true',
 parser.add_argument('--num_top', type=int, default=None,
                     help="If set, will write only the `num_top` documents for each query (in descending order of score).")
 parser.add_argument('--norm_relevances', type=str, choices=['None', 'max', 'maxmin', 'std'], default='None',
-                        help="How to normalize the relevance scores. Supposed to increase dynamic range and/or limit absolute range.")
+                    help="How to normalize the relevance scores. Supposed to increase dynamic range and/or limit absolute range.")
 args = parser.parse_args()
 
 
@@ -49,7 +49,7 @@ def normalize_scores(scores, normalize):
     elif normalize == 'maxmin':  # increases dynamic range for "uniform" initial scores, while still in [0, 1]
         min_relev = torch.min(scores)
         scores = (scores - min_relev) / (torch.max(scores) - min_relev)
-    elif normalize == 'std': # even wider dynamic range for "uniform" initial scores, but in [0, f], with f > 1
+    elif normalize == 'std':  # even wider dynamic range for "uniform" initial scores, but in [0, f], with f > 1
         relev_std = torch.std(scores)
         scores = (scores - torch.min(scores)) / relev_std
     elif normalize != 'None':  # 'None' results in arbitrary range of scores, with potentially flat "distribution".
@@ -71,8 +71,8 @@ class Converter(object):
         """
         self.orig_filepath = orig_filepath
         self.dest_filepath = dest_filepath
-        self.score_type = __builtins__.int if score_type =='int' else __builtins__.float
-        self.id_type = __builtins__.int if id_type =='int' else __builtins__.str  # for pickle format
+        self.score_type = builtins.int if score_type == 'int' else builtins.float
+        self.id_type = builtins.int if id_type == 'int' else builtins.str  # for pickle format
         self.is_qrels = is_qrels
         self.num_top = num_top
         self.norm_relevances = norm_relevances
@@ -84,7 +84,7 @@ class Converter(object):
         else:
             if self.orig_ext == '.pickle' or self.orig_ext == '.hdf5':  # default conversion when origin not .tsv
                 self.dest_format = 'tsv'
-            else: # default conversion for origin '.tsv'
+            else:  # default conversion for origin '.tsv'
                 self.dest_format = 'pickle' #'hdf5'
             self.dest_filepath = orig_main_filename + '.' + self.dest_format
 
@@ -92,7 +92,7 @@ class Converter(object):
         if self.dest_format == 'pickle':
             self.is_qrels = False
         elif self.dest_format == 'hdf5':
-            self.id_type = __builtins__.str  # only string keys are supported in HDF5 format
+            self.id_type = builtins.str  # only string keys are supported in HDF5 format
             self.is_qrels = False
 
         return
@@ -103,7 +103,7 @@ class Converter(object):
 
         logger.info("Reading scores from {} ...".format(self.orig_filepath))
         if self.orig_ext == '.tsv':
-            scores = utils.load_qrels(self.orig_filepath, relevance_level=0, rel_type=self.score_type, id_type=self.id_type) # dict{qID: dict{pID: relevance}}
+            scores = utils.load_qrels(self.orig_filepath, relevance_level=0, rel_type=self.score_type, id_type=self.id_type)  # dict{qID: dict{pID: relevance}}
         elif self.orig_ext == '.pickle':
             with open(self.orig_filepath, 'rb') as f:
                 scores = pickle.load(f)  # dict{qID: dict{pID: relevance}}
@@ -146,8 +146,8 @@ def convert_tsv_to_pickle(input_path, output_path, score_type, id_type, num_top=
     :param id_type: type of query and passage IDs (int or str)
     """
 
-    score_type = __builtins__.int if score_type =='int' else __builtins__.float
-    id_type = __builtins__.int if id_type =='int' else __builtins__.str
+    score_type = builtins.int if score_type == 'int' else builtins.float
+    id_type = builtins.int if id_type == 'int' else builtins.str
 
     logger.info("Reading scores from {} ...".format(input_path))
     scores = utils.load_qrels(input_path, relevance_level=0, rel_type=score_type, id_type=id_type)
@@ -176,8 +176,8 @@ def convert_pickle_to_tsv(input_path, output_path, score_type, is_qrels, num_top
     :param is_qrels: Only for format 'tsv': if True, will write 'tsv' file in qrels format with a column 'Q0' and no rank.
     """
 
-    score_type = __builtins__.int if score_type =='int' else __builtins__.float
-    # id_type = __builtins__.int if id_type =='int' else __builtins__.str
+    score_type = builtins.int if score_type == 'int' else builtins.float
+    # id_type = builtins.int if id_type == 'int' else builtins.str
 
     logger.info("Reading scores from {} ...".format(input_path))
     with open(input_path, 'rb') as f:

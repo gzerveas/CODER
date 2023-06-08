@@ -187,7 +187,7 @@ class ReciprocalNearestNeighbors(object):
         the respective embeddings of the query and candidate documents.
 
         :param qid: ID of the query
-        :param hit: maximum number of candidates to be considered
+        :param hit: maximum number of candidates to be considered; limits num_cands (which comes from the candidates file)
         :param normalization: how to normalize the similarity scores, defaults to 'None'.
                               Other options are 'max' (divide by maximum value per row) and 'mean' (divide by mean value per row).
         :return pwise_sims: (num_cands+1, num_cands+1) float tensor of pair-wise similarities, including the query (row 0, column 0)
@@ -256,7 +256,7 @@ class ReciprocalNearestNeighbors(object):
         for qid in tqdm(query_ids, desc="query "):
             start_total = time.perf_counter()
 
-            pwise_sims, doc_ids = self.get_pairwise_similarities(qid, hit, normalization) # tuple: (num_cands+1, num_cands+1) float tensor, (num_cands,) array string IDs
+            pwise_sims, doc_ids = self.get_pairwise_similarities(qid, hit, normalization)  # tuple: (num_cands+1, num_cands+1) float tensor, (num_cands,) array string IDs
 
             jaccard_sims = compute_jaccard_similarities(pwise_sims, k=k, trust_factor=trust_factor, k_exp=k_exp,
                                                         weight_func=weight_func, weight_func_param=weight_func_param,
@@ -288,7 +288,8 @@ class ReciprocalNearestNeighbors(object):
     # TODO: consider whether similarities with respect to the query should also be taken into account when building new labels
     def compute_smooth_labels(self, query_ids, hit=1000,
                               normalization='None', k=20, trust_factor=0.5, k_exp=6, weight_func='exp', weight_func_param=2.4, orig_coef=0.3,
-                              rel_aggregation='mean', redistribute='fully', redistr_prt=0.2, norm_relevances='None', boost_factor=1.0, return_top=None):
+                              rel_aggregation='mean', redistribute='fully', redistr_prt=0.2, norm_relevances='None', boost_factor=1.0,
+                              return_top=None, id_type='int'):
         """
         Extends existing ground-truth relevant judgements by using  *within the context of the query* each g.t. relevant document
         as a probe to find its reciprocal nearest neighbors and compute its similarity to those as a combination between
@@ -297,7 +298,7 @@ class ReciprocalNearestNeighbors(object):
         for a query, the similarity vectors of each are combined by a specified function.
 
         :param query_ids: iterable of query IDs; for each query, candidate relevance labels w.r.t. ground truth will be computed
-        :param hit: int, number of (top) candidates to consider for each query
+        :param hit: int, number of (top) candidates to consider for each query.
         :param normalization: str, how to normalize the original geometric similarity scores, defaults to 'None'
         :param k: int, number of Nearest Neighbors, defaults to 20
         :param trust_factor: If > 0, will build an extended set of reciprocal neighbors, by considering neighbors of neighbors.
@@ -338,32 +339,42 @@ class ReciprocalNearestNeighbors(object):
         """
 
         smooth_labels = {}  # recomputed labels dict: {qID: dict{passageid: relevance}}
+        id_func = builtins.int if id_type == 'int' else builtins.str
 
         for qid in tqdm(query_ids, desc="query "):
             start_total = time.perf_counter()
-
+            # hit limits num_cands, which comes from the number of candidates per query in the candidates file
             pwise_sims, doc_ids = self.get_pairwise_similarities(qid, hit, normalization)  # tuple: (num_cands+1, num_cands+1) float tensor, (num_cands,) array string IDs
             # NOTE: assumes all embeddings of g.t. rel. docs are prepended right after the query embedding and before the rest of the candidates
             # This requires that self.inject_ground_truth == True
-            relevant_inds = list(range(1, len(self.qrels[qid]) + 1))
+            num_max_relevant = min(len(self.qrels[qid]), hit)  # min() to avoid indexing out of bounds when there are more g.t. rel. docs than `hit`
+            relevant_inds = list(range(1, num_max_relevant + 1))  # indices of g.t. relevant documents in `pwise_sims`
 
             # Compute similarities of candidate documents with respect to g.t. relevant documents
             jaccard_sims = compute_jaccard_similarities(pwise_sims, inds=relevant_inds, k=k, trust_factor=trust_factor, k_exp=k_exp,
                                                         weight_func=weight_func, weight_func_param=weight_func_param,
                                                         device=self.device)  # (num_relevant, num_cands+1) includes query similarity at column index 0
 
+            if torch.isnan(jaccard_sims).any():
+                logger.error(f"NaNs in Jaccard similarities for query {qid}.")
+                logger.error(f"pwise_sims: {pwise_sims}")
+                logger.error(f"jaccard_sims: {jaccard_sims}")
+                raise ValueError(f"NaNs in Jaccard similaritie for query {qid}. This is probably caused because of using exponential weight function with large similarity scores.")
+
             final_sims = combine_similarities(pwise_sims[relevant_inds, :], jaccard_sims, orig_coef=orig_coef)  # (num_relevant, num_cands+1)
 
-            orig_relevances = torch.tensor(list(self.qrels[qid].values()), dtype=torch.float32)  # (num_relevant,) g.t. relevance score for each g.t. relevant document
+            orig_relevances = torch.tensor(list(self.qrels[qid].values())[:num_max_relevant], dtype=torch.float32)  # (num_relevant,) g.t. relevance score for each g.t. relevant document
             new_relevances = self.recompute_relevances(final_sims, orig_relevances,
-                                                       rel_aggregation, redistribute, redistr_prt, norm_relevances, boost_factor).cpu().numpy()  # (num_cands,) recomputed relevances
+                                                       rel_aggregation, redistribute, redistr_prt, norm_relevances, boost_factor)  # (num_cands,) recomputed relevances
 
-            if return_top is not None:
+            # candidates are sorted when training (__get_item__ of MYMARCO_Dataset in dataset.py). Here we sort them only when returning fewer
+            if (return_top is not None) and (return_top < hit):
                 new_relevances, top_indices = torch.topk(new_relevances, k=return_top, largest=True)
                 doc_ids = doc_ids[top_indices.cpu()]
-                new_relevances = new_relevances.cpu().numpy()
 
-            smooth_labels[qid] = dict((docid, float(new_relevances[i])) for i, docid in enumerate(doc_ids))
+            new_relevances = new_relevances.cpu().numpy()
+
+            smooth_labels[id_func(qid)] = dict((id_func(docid), float(new_relevances[i])) for i, docid in enumerate(doc_ids))
 
             global total_times
             total_times.update(time.perf_counter() - start_total)
@@ -430,7 +441,7 @@ class ReciprocalNearestNeighbors(object):
         if redistribute.endswith('fully'):
             # Here we redistribute a pre-specified proportion of weight among non-ground-truth candidates,
             # proportionally to their relative similarities to the g.t. document(s).
-            new_relevances = torch.zeros_like(agg_relevances, dtype=torch.float32) # (num_candidates,)
+            new_relevances = torch.zeros_like(agg_relevances, dtype=torch.float32)  # (num_candidates,)
             new_relevances[:num_relevant] = (1 - redistr_prt) * orig_relevances
             if redistribute == 'partially':
                 # Only part of the pre-specified proportion is redestributed, considering the magnitude of the candidates' similarity
@@ -514,15 +525,20 @@ def recip_NN_rerank(args):
         perf_metrics = utils.get_retrieval_metrics(reranked_scores, recipn.qrels)
         perf_metrics['time'] = total_times.get_average()
         # NOTE: Order of keys is guaranteed in Python 3.7+ (but informally also in 3.6)
-        parameters = {'sim_mixing_coef': args.sim_mixing_coef,
+        parameters = {'hit': args.hit,
+                      'sim_mixing_coef': args.sim_mixing_coef,
                       'k': args.k,
+                      'k_exp': args.k_exp,
                       'trust_factor': args.trust_factor,
                       'normalize': args.normalize,
                       'weight_func': args.weight_func,
                       'weight_func_param': args.weight_func_param}
 
         # Export record metrics to a file accumulating records from all experiments
-        utils.register_record(args.records_file, args.formatted_timestamp, args.out_name, perf_metrics, parameters=parameters)
+        try:
+            utils.register_record(args.records_file, args.formatted_timestamp, args.out_name, perf_metrics, parameters=parameters)
+        except Exception as x:
+            logger.warning(f"Failed to register record: {x}")
 
     return perf_metrics
 
@@ -563,7 +579,8 @@ def extend_relevances(args):
                                                      args.normalize, args.k, args.trust_factor, args.k_exp,
                                                      args.weight_func, args.weight_func_param, args.sim_mixing_coef,
                                                      args.rel_aggregation, args.redistribute, args.redistr_prt,
-                                                     args.norm_relevances, args.boost_factor, args.return_top)
+                                                     args.norm_relevances, args.boost_factor,
+                                                     args.return_top, args.id_type)
 
     total_runtime = time.time() - start_time
     logger.info("Total runtime: {} hours, {} minutes, {} seconds\n".format(*utils.readable_time(total_runtime)))
@@ -597,10 +614,7 @@ def setup(args):
     # config = options.check_args(config)  # check validity of settings and make necessary conversions
 
     output_dir = config['output_dir']
-    if not os.path.isdir(output_dir):
-        raise IOError(
-            "'{}' is not an existing root directory! "
-            "'output_dir' must be an existing root directory where the directory of the experiment will be created".format(output_dir))
+    os.makedirs(output_dir, exist_ok=True)
 
     # Create output directory and subdirectories
     initial_timestamp = datetime.now()
@@ -629,7 +643,7 @@ def setup(args):
     if args.task == 'smooth_labels':
         suffix = '_labels'
         if args.write_to_file is None:
-            args.write_to_file = 'hdf5'  # force writing to file, otherwise task is meaningless
+            args.write_to_file = 'tsv'  # force writing to file, otherwise task is meaningless
 
     if args.write_to_file:
         args.out_filepath = os.path.join(output_dir, args.out_name + f'_top{args.hit}' + suffix + '.' + args.write_to_file)
@@ -692,6 +706,8 @@ def run_parse_args():
     parser.add_argument("--return_top", type=int, default=None,
                         help="If set, only the top `return_top` documents based on recomputed relevance "
                         "with respect to the g.t. document(s) will be returned for each query.")
+    parser.add_argument('--id_type', choices=['int', 'str'], default='int',
+                        help='Type of destination (e.g. pickle file) query and document IDs')
 
     # I/O
     parser.add_argument("--output_dir", type=str, default='.',
@@ -745,7 +761,7 @@ def run_parse_args():
                                         is the value of the relevance label.
                                 'sum': each candidate receives a score that is the weighted sum of scores from each g.t. positive, where the weight
                                         is the value of the relevance label (unlike 'mean', there is no division by the cumulative weight.)""")
-    parser.add_argument('--redistribute', type=str, choices=['fully', 'partially', 'radically'], default='fully',
+    parser.add_argument('--redistribute', type=str, choices=['fully', 'partially', 'radically'], default='radically',
                         help="""How to redistribute the labels weight. Options:
                             'fully': We fully redistribute a proportion of label weight (`redistr_prt`) among non-ground-truth candidates,
                                      proportionally to their relative similarities to the g.t. document(s), regardless of how candidates'

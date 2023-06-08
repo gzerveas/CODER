@@ -634,7 +634,7 @@ class MYMARCO_Dataset(Dataset):
             qid: (int) query ID
             query_token_ids: list of token IDs corresponding to query (unpadded, includes start/stop tokens)
             doc_ids: iterable of candidate document/passage IDs in order of relevance,
-                of variable length (depends on number of relevant and static candidates)  # GEO: consider fixing
+                of variable length (depends on number of relevant and static candidates)  # GEO: consider fixing the length
             rel_scores: list of ground truth relevance scores (labels) for each element in doc_ids[:len(rel_scores)]
                 Can have shorter length than doc_ids when injecting positives. None if mode == 'eval'
         """
@@ -666,9 +666,12 @@ class MYMARCO_Dataset(Dataset):
 
         if self.mode == "train" or self.inject_ground_truth:
             label_source = self.qrels
-            if (self.target_scores is not None) and (qid in self.target_scores):
+            if (self.target_scores is not None):  #and (qid in self.target_scores):
                 # first condition cannot be true in case of 'dev' mode (see __init__, loading of target_scores)
-                # second condition allows using usual qrels (instead of soft labels) when target_scores are not provided for all qids
+                # WARNING: second condition allows using usual qrels (instead of soft labels) when target_scores are not provided for all qids.
+                # It may be better to fail in case of missing target_scores, as applying the same transformation to qrels and target_scores is probably undesirable
+                if qid not in self.target_scores:
+                    raise ValueError("qid {} not found in target_scores".format(qid))
                 label_source = self.target_scores
 
             # Prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,

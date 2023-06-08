@@ -1,9 +1,6 @@
 import logging
-
-import options
-
 logging.basicConfig(format='%(asctime)s | %(name)-8s - %(levelname)s : %(message)s', level=logging.INFO)
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 logger.info("Loading packages ...")
 import os
 import sys
@@ -26,6 +23,7 @@ from transformers import BertConfig, AutoTokenizer, AutoModel
 import optuna
 
 # Package modules
+import options
 from options import *
 from modeling import RepBERT_Train, CODER, get_loss_module
 from dataset import MYMARCO_Dataset
@@ -147,8 +145,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     ranked_filepath = os.path.join(args.pred_dir, 'original_top1000.dev.' + args.write_predictions)
     utils.write_predictions(ranked_filepath, predictions, format=args.write_predictions)
     freqs_orig, bins_orig = utils.plot_rank_barplot(val_dataloader.dataset.reformatted_qrels, predictions,
-                                relevance_thr=args.eval_relevant_at_level,
-                                save_as=os.path.join(args.output_dir, "orig_rank_historgram.pdf"))
+                                                    relevance_thr=args.eval_relevant_at_level,
+                                                    save_as=os.path.join(args.output_dir, "orig_rank_historgram.pdf"))
 
     # Train
     logger.info("\n\n***** START TRAINING *****\n\n")
@@ -171,7 +169,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     # score_params = [(name, p) for name, p in model.named_parameters() if name.startswith('score')]
     epoch_iterator = trange(start_epoch, int(args.num_epochs), desc="Epochs")
 
-    should_stop = False # flag to stop training
+    should_stop = False  # flag to stop training
     batch_times = utils.Timer()  # average time for the model to train (forward + backward pass) on a single batch of queries
     for epoch_idx in epoch_iterator:
         epoch_start_time = time.time()
@@ -223,6 +221,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                     tb_writer.add_scalar('train/loss', cur_loss, global_step)
                     avg_batch_time = batch_times.get_average()
                     tb_writer.add_scalar('train/batch time', avg_batch_time, global_step)
+                    tb_writer.add_scalar('train/epoch', epoch_idx, global_step)
                     if model.score_cands.temperature is not None:
                         tb_writer.add_scalar('train/temperature', model.score_cands.temperature, global_step)
                         tb_writer.add_scalar('train/score_bias', model.score_cands.b, global_step)
@@ -239,9 +238,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         logger.debug("Average prep. docids time: {} s /samp".format(prep_docids_times.get_average()))
                         logger.debug("Average sample fetching time: {} s /samp".format(sample_fetching_times.get_average()))
                         logger.debug("Average collation time: {} s /batch".format(collation_times.get_average()))
+                        # logger.debug("Score parameters: {}".format(score_params))
                     logger.info("Average total batch processing time: {} s /batch".format(avg_batch_time))
-
-                        # logger.debug("Score parameters: {}".format(score_params))  # TODO: DEBUG
 
                     logging_loss = train_loss
 
@@ -255,9 +253,9 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
                         best_metrics = val_metrics.copy()
                         try:
                             freqs_best, _ = utils.plot_rank_barplot(val_dataloader.dataset.reformatted_qrels, predictions,
-                                                      base_pred_scores=(freqs_orig, bins_orig),
-                                                      relevance_thr=args.eval_relevant_at_level,
-                                                      save_as=os.path.join(args.output_dir, "best_rank_historgram.pdf"))
+                                                                    base_pred_scores=(freqs_orig, bins_orig),
+                                                                    relevance_thr=args.eval_relevant_at_level,
+                                                                    save_as=os.path.join(args.output_dir, "best_rank_historgram.pdf"))
                         except:
                             logger.error('Histogram not possible!')
                         # Export histogram of ranks of relevant documents
@@ -275,8 +273,8 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
 
                     if trial is not None:  # used for hyperparameter optimization
                         trial.report(best_metrics[args.key_metric], global_step)
-                        HARD_PATIENCE = 60000
-                        HARD_TOLERANCE = 0.001
+                        HARD_PATIENCE = 60000  # TODO: Deactivated! int(1e10)
+                        # HARD_TOLERANCE = 0.001
                         if len(best_steps) and ((global_step - best_steps[-1]) > HARD_PATIENCE):  # countdown
                         #if (global_step > HARD_PATIENCE) and (running_metrics[0][metric2ind[args.key_metric]] - best_metrics[args.key_metric]) < HARD_TOLERANCE):
                             logger.info('Hard patience reached, stopping training')
@@ -297,7 +295,7 @@ def train(args, model, val_dataloader, tokenizer=None, fairrmetric=None, trial=N
     # Export evolution of metrics over epochs
     header = metrics_names
     metrics_filepath = os.path.join(args.output_dir, "metrics_" + args.experiment_name + ".xls")
-    book = utils.export_performance_metrics(metrics_filepath, running_metrics, header, sheet_name="metrics")
+    _ = utils.export_performance_metrics(metrics_filepath, running_metrics, header, sheet_name="metrics")
 
     # Export record metrics to a file accumulating records from all experiments
     utils.register_record(args.records_file, args.initial_timestamp, args.experiment_name,
@@ -795,8 +793,8 @@ def main(args, trial=None):  # trial is an Optuna hyperparameter optimization ob
 
         # Export histogram of ranks of relevant documents to a file
         utils.write_columns_to_csv(os.path.join(args.output_dir, "rank_histogram.csv"),
-                               columns=(bins, freqs),
-                               header=('rank', 'Counts'))
+                                   columns=(bins, freqs),
+                                   header=('rank', 'Counts'))
 
         return eval_metrics
 
