@@ -198,10 +198,10 @@ In the following, we will show how to train and evaluate a CODER model using [TA
 
 Because of numerous options, CODER is best trained and evaluated using a configuration file, as follows:
 ```bash
-python ~/coder/main.py --config ~/coder/configurations/<coder_tasb_train_config>.json
+python ~/coder/main.py --config ~/coder/configs/<coder_tasb_train_config>.json
 ```
 
-We include the configuration files for training and evaluating CODER(TAS-B) in `~coder\configurations`.
+We include the configuration files for training and evaluating CODER(TAS-B) in `~coder\configs`.
 
 However, it is also possible to use commandline options, either instead of a configuration file, 
 or to override some options with the option `--override`, e.g.: 
@@ -220,7 +220,7 @@ python ~/coder/main.py --help
 
 We can use CODER(TAS-B) for reranking TAS-B on `dev.small` by running:
 ```bash
-python ~/coder/main.py --config ~/coder/configurations/TEST_<coder_tasb_eval_config>.json
+python ~/coder/main.py --config ~/coder/configs/TEST_<coder_tasb_eval_config>.json
 ```
 
 This will output CODER's rankings for each query inside `~/Experiments/DEMO_NAME/predictions`, and also display several evaluation metrics.

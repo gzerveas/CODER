@@ -98,19 +98,19 @@ def run_parse_args(args=None):
                              'of the optimizer/scheduler. To resume training, additionally set the flag `--resume`.')
     # The following are currently used only if `model_type` is NOT 'repbert'
     parser.add_argument("--query_encoder_from", type=str, default="bert-base-uncased",
-                        help="""A string used to initialize the query encoder weights and config object: 
+                        help="""A string used to initialize the query encoder weights and config object:
                         can be either a pre-defined HuggingFace transformers string (e.g. "bert-base-uncased"), or
                         a path of a directory containing weights and config file.""")
     parser.add_argument("--query_encoder_config", type=str, default=None,
                         help="""Optional: A string used to define the query encoder configuration.
-                        Used for flexibility, in case only the weights should be initialized by `query_encoder_from`. 
+                        Used for flexibility, in case only the weights should be initialized by `query_encoder_from`.
                         Can be either a pre-defined HuggingFace transformers string (e.g. "bert-base-uncased"), or
                         a path of a directory containing the config file, or directly the JSON config path.""")
     parser.add_argument("--tokenizer_from", type=str, default=None,
                         help="""Optional: Path to a directory containing a saved custom tokenizer (vocabulary and added tokens)
-                        for queries, or a HuggingFace built-in string. Only used if for whatever reason 
+                        for queries, or a HuggingFace built-in string. Only used if for whatever reason
                         the query tokenizer should differ from what is specified by `query_encoder_from` and `query_encoder_config`""")
-    
+
 
     ## Dataset
     parser.add_argument('--train_limit_size', type=float, default=None,
@@ -154,7 +154,7 @@ def run_parse_args(args=None):
                              " Below this level, documents will not be considered relevant (but may still count towards nDCG)"
                              "Should be at least as high as `include_at`, and is typically > 0.")
     parser.add_argument('--max_inj_relevant', type=int, default=1000,
-                        help="Maximum number of 'relevant' candidates to inject per query when training (whether they come from qrels or target scores)")    
+                        help="Maximum number of 'relevant' candidates to inject per query when training (whether they come from qrels or target scores)")
     parser.add_argument("--relevance_labels_mapping", type=str, default=None,
                         help="Optional: A string used to define a dictionary used to override/map relevance scores as "
                              "given in `qrels_path` to a new value, e.g. {1: 0.333}")
@@ -239,7 +239,7 @@ def run_parse_args(args=None):
     parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer'], default='mdstransformer',
                         help="""Type of the entire (end-to-end) information retrieval model""")
     parser.add_argument("--query_aggregation", type=str, choices=['mean', 'first'], default='first',
-                        help="""How to aggregate the individual final encoder embeddings corresponding to query tokens into 
+                        help="""How to aggregate the individual final encoder embeddings corresponding to query tokens into
                         a single vector.""")
     # parser.add_argument('--token_type_ids', action='store_true',
     #                     help="If set, a tensor of 0s will be passed to the HuggingFace query encoder as an input "
@@ -320,7 +320,7 @@ def run_parse_args(args=None):
     ## Debiasing (bias/neutrality regularization)
     parser.add_argument("--collection_neutrality_path", type=str,
                         help="path to the file containing neutrality values of documents in tsv format (docid [tab] score)")
-    parser.add_argument("--background_set_runfile_path", type=str, 
+    parser.add_argument("--background_set_runfile_path", type=str,
                         default="fair_retrieval/resources/msmarco_fair.background_run.txt",
                         help="path to the TREC run file containing the documents of the background set")
     parser.add_argument('--bias_regul_coeff', type=float, default=0.0,
@@ -349,7 +349,7 @@ def check_args(config):
 
     if config['eval_query_tokens_path'] is None:
         config['eval_query_tokens_path'] = config['tokenized_path']
-        
+
     if config['eval_qrels_path'] is None:
         config['eval_qrels_path'] = config['qrels_path']
 

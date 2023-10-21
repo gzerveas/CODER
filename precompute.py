@@ -192,15 +192,15 @@ if __name__ == "__main__":
                                                  "collection and/or queries.")
     ## Required parameters
     parser.add_argument("--model_type", type=str, choices=['repbert', 'huggingface'], default='huggingface',
-                        help="""Type of the entire (end-to-end) information retrieval model. CODER models are 'huggingface' 
-                        regardless of whether they were initialized from RepBERT weights. Only models of RepBERT class 
+                        help="""Type of the entire (end-to-end) information retrieval model. CODER models are 'huggingface'
+                        regardless of whether they were initialized from RepBERT weights. Only models of RepBERT class
                         should use the 'repbert' option!""")
     parser.add_argument("--encoder_from", type=str,
                         default="sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco",
-                        help="""Name of built-in Huggingface encoder, or for `model_type` 'huggingface' it can also be 
+                        help="""Name of built-in Huggingface encoder, or for `model_type` 'huggingface' it can also be
                         a directory (e.g. CODER-fine-tuned checkpoint). 'repbert' always uses 'bert-base-uncased'.""")
     parser.add_argument("--tokenizer_from", type=str, default=None,
-                        help="""Optional: name of built-in Huggingface tokenizer, or for `model_type` 'huggingface' it can also be 
+                        help="""Optional: name of built-in Huggingface tokenizer, or for `model_type` 'huggingface' it can also be
                         a directory. If not specified, it will be the same as `encoder_from`.""")
     parser.add_argument("--load_checkpoint", type=str, default=None,
                         help="A path of a pre-trained model directory, `model_type` OTHER THAN 'huggingface'.")
@@ -223,10 +223,10 @@ if __name__ == "__main__":
                              "and 1s a document sequence.")
     parser.add_argument("--per_gpu_batch_size", default=100, type=int)
     args = parser.parse_args()
-    
+
     logger.info(args)
 
-    # Setup CUDA, GPU 
+    # Setup CUDA, GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
