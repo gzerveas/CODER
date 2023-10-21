@@ -66,7 +66,6 @@ series = {SIGIR '22}
 5. [Training with evidence-based label smoothing](#training-with-evidence-based-label-smoothing)
 6. [Training for bias mitigation](#training-for-bias-mitigation)
 
-
 ## Setup
 
 _Instructions refer to Unix-based systems (e.g. Linux, MacOS)._
