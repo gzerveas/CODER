@@ -162,6 +162,7 @@ def generate_embeddings(args, model, dataset):
     # multi-gpu inference
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)  # automatically splits the batch into chunks for each process/GPU
+
     model.eval()
 
     # Inference
@@ -190,29 +191,32 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Creates memmap files containing embedding vectors of a document "
                                                  "collection and/or queries.")
     ## Required parameters
-    parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer', 'huggingface'], default='mdstransformer',
-                        help="""Type of the entire (end-to-end) information retrieval model""")
+    parser.add_argument("--model_type", type=str, choices=['repbert', 'huggingface'], default='huggingface',
+                        help="""Type of the entire (end-to-end) information retrieval model. CODER models are 'huggingface' 
+                        regardless of whether they were initialized from RepBERT weights. Only models of RepBERT class 
+                        should use the 'repbert' option!""")
     parser.add_argument("--encoder_from", type=str,
                         default="sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco",
                         help="""Name of built-in Huggingface encoder, or for `model_type` 'huggingface' it can also be 
-                        a directory. 'repbert' always uses 'bert-base-uncased'.""")
+                        a directory (e.g. CODER-fine-tuned checkpoint). 'repbert' always uses 'bert-base-uncased'.""")
     parser.add_argument("--tokenizer_from", type=str, default=None,
                         help="""Optional: name of built-in Huggingface tokenizer, or for `model_type` 'huggingface' it can also be 
                         a directory. If not specified, it will be the same as `encoder_from`.""")
-    parser.add_argument("--load_checkpoint", type=str,
+    parser.add_argument("--load_checkpoint", type=str, default=None,
                         help="A path of a pre-trained model directory, `model_type` OTHER THAN 'huggingface'.")
     parser.add_argument("--output_dir", type=str, default=".",
                         help="Directory where embedding memmaps will be created.")
     parser.add_argument("--collection_memmap_dir", type=str, default=None,
-                        help="""Contains memmap files of tokenized/numerized collection of documents. If specified, will 
-                        generate corresponding document embeddings.""")
+                        help="Contains memmap files of tokenized/numerized collection of documents. If specified, will "
+                             "generate corresponding document embeddings.")
     parser.add_argument("--tokenized_queries", type=str, default=None,
                         help="""JSON file of tokenized/numerized queries. If specified, will generate corresponding
                          query embeddings""")
     parser.add_argument("--max_query_length", type=int, default=32)
     parser.add_argument("--max_doc_length", type=int, default=256)
     parser.add_argument("--aggregation", type=str, choices=['first', 'mean'], default='first',
-                        help="How to aggregate individual token embeddings")
+                        help="How to aggregate individual token embeddings. RepBERT already aggregates them, "
+                             "so this setting only applies to 'huggingface' models.")
     parser.add_argument("--token_type_ids", action='store_true',
                         help="If set, it will include a tensor of 'token_type_ids' when 'model_type' is not 'repbert', "
                              "to be used as input in a huggingface encoder. 0s denote a query sequence, "
@@ -232,28 +236,36 @@ if __name__ == "__main__":
     logger.warning("Device: %s, n_gpu: %s", device, args.n_gpu)
 
     # Get tokenizer and model
-    if args.model_type == 'repbert':  # for 'RepBERT' model class
+    if args.model_type == 'repbert':  # for 'RepBERT' class model  - NOT CODER initialized from RepBERT!
         if not(os.path.exists(args.load_checkpoint)):
             raise IOError("For 'repbert', `load_model` should point to a directory with a checkpoint.")
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         logger.info("Loaded tokenizer: {}".format(tokenizer))
-        config = BertConfig.from_pretrained(args.load_checkpoint)
+        try:
+            config = BertConfig.from_pretrained(args.load_checkpoint)
+        except Exception as x:
+            logger.error("Could not load config from checkpoint! Are you sure this is a RepBERT checkpoint?")
+            raise x
         model = None
     else:
         if args.tokenizer_from is None:
             args.tokenizer_from = args.encoder_from  # for example, "sebastian-hofstaetter/distilbert-dot-tas_b-b256-msmarco"
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_from)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_from)
+        except Exception as x:
+            logger.error(f"Could not load tokenizer from: '{args.tokenizer_from}' "
+                         "If you are using `--encoder_from` with a directory as an argument instead of a HF model name, "
+                         "make sure that it contains a tokenizer.json file or set the `--tokenizer_from` option explicitly.")
         logger.info("Loaded tokenizer: {}".format(tokenizer))
 
         logger.info("Loading encoder from: '{}' ...".format(args.encoder_from))
         model = AutoModel.from_pretrained(args.encoder_from)
         model.to(args.device)
 
-        if args.model_type == 'mdstransformer':  # parameter loading for 'MDSTransformer' checkpoint
+        if args.load_checkpoint is not None:  # parameter loading for 'CODER' checkpoint
+            logger.warning(f"`--load_checkpoint` argument used! It will override the `--encoder_from` argument: {args.encoder_from}")
             logger.info("Loading encoder weights from: '{}' ...".format(args.load_checkpoint))
             model = utils.load_encoder(model, args.load_checkpoint, device)
-            
-        model.eval()
 
     if args.tokenized_queries:
         if args.model_type == 'repbert':

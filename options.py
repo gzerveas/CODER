@@ -10,7 +10,11 @@ POS_METRICS.extend(m + '@' for m in POS_METRICS[:])
 METRICS = NEG_METRICS + POS_METRICS
 
 
-def run_parse_args():
+def run_parse_args(args=None):
+    """
+    By default, `args` will be the command-line arguments. However, `args` can be a list of strings,
+    to allow initialization from within a Python script (e.g. hyperparameter optimization).
+    """
     parser = argparse.ArgumentParser(description='Run a complete training or evaluation. Optionally, a JSON configuration '
                                                  'file can be used, to overwrite command-line arguments.')
     ## Run from config file
@@ -32,7 +36,7 @@ def run_parse_args():
                         help="'train' is used to train the model (and validate on a validation set specified by `eval_candidates_path`).\n"
                              "'dev' is used for evaluation when labels are available: this allows to calculate metrics, "
                              "plot histograms, inject ground truth relevant document in set of candidates to be reranked.\n"
-                             "'eval' mode is used for evaluation ONLY if NO labels are available.\n"
+                             "'eval' mode is used for evaluation/inference ONLY if NO labels are available.\n"
                              "'inspect' is used to interactively examine an existing ranked candidates file/memmap "
                              "specified by `eval_candidates_path`, together with "
                              "the respective original queries and documents, reconstructed tokenizations, embeddings, "
@@ -46,7 +50,17 @@ def run_parse_args():
     parser.add_argument('--output_dir', type=str, default='./output',
                         help='Root output directory. Must exist. Time-stamped directories will be created inside.')
     parser.add_argument("--qrels_path", type=str,
-                        help="Path of the text file or directory with the ground truth relevance labels, qrels")
+                        help="Path of the text file or directory with the ground truth relevance labels (qrels). "
+                             "If a directory, it is assumed that it contains the files: 'qrels.{train,dev}.tsv'."
+                             "If `eval_qrels_path` is not provided, it is assumed that this file or directory contains "
+                             "the qrels for evaluation as well.")
+    parser.add_argument("--eval_qrels_path", type=str,
+                        help="Path of the *text file* with the ground truth relevance labels (qrels) for evaluation. If not provided, "
+                        "it is assummed that `qrels_path` is a file that contains the qrels for evaluation as well, "
+                        "or a dir containing the files: 'qrels.{train,dev}.tsv'.")
+    parser.add_argument("--target_scores_path", type=str, #e.g. "my/path/scores_train*.pickle"
+                        help="Optional: Path to a pickle or tsv file (or pattern matching multiple files) containing relevance scores "
+                             "which will be used as training labels instead of qrels, which will be used only for evaluation.")
     parser.add_argument("--train_candidates_path", type=str, default="~/data/MS_MARCO/BM25_top1000.in_qrels.train.tsv",
                         help="Text file of candidate (retrieved) documents/passages per query. This can be produced by e.g. Anserini."
                              " If not provided, candidates will be sampled at random from the entire collection.")
@@ -61,7 +75,7 @@ def run_parse_args():
                              "If dir, it should contain: queries.train.json. Otherwise (i.e. if a file), "
                              "it will be used for training and `eval_query_tokens_path` should also be set.")
     parser.add_argument("--eval_query_tokens_path", type=str, default=None,
-                        help="Contains pre-tokenized/numerized eval queries in JSON format. When not used, "
+                        help="Contains pre-tokenized/numerized eval queries in JSON format. If NOT used, "
                              "`tokenized_path` should be a *directory* containing: queries.{train,dev,eval}.json")
     parser.add_argument("--raw_queries_path", type=str,
                         help="Optional: .tsv file which contains raw text queries (ID <tab> text). Used only for 'inspect' mode.")
@@ -120,17 +134,34 @@ def run_parse_args():
     parser.add_argument('--num_random_neg', type=int, default=0,
                         help="Number of negatives to randomly sample from other queries in the batch for training. "
                              "If 0, only documents in `train_candidates_path` will be used as negatives.")
-    parser.add_argument('--include_zero_labels', action='store_true',
-                        help="If set, it will include documents with a zero relevance score from "
-                             " `qrels_path` in the set of candidate documents (as negatives). "
-                             "Typically set if one expects these to be 'good quality' negatives.")
+    parser.add_argument('--include_at_level', default=1,
+                        help="The relevance score that candidates in `qrels_path` (after mapping) or in `target_scores_path` should at least have "
+                             "in order to be included in the set of candidate documents (as positives/negatives) for *training*. "
+                             "Below this level, the target relev. probability will be 0. "
+                             " Typically only set to 0 if one wishes to explicitly inject reliable negatives from qrels.")
+    parser.add_argument('--relevant_at_level', default=1,
+                        help="The relevance score that candidates in `qrels_path` or in `target_scores_path` should at least have "
+                             "in order to be considered relevant in *training*."
+                             " Below this level, the target relev. probability will be 0."
+                             "Currently this filter is applied *after* any potential label normalization")
+    parser.add_argument('--eval_include_at_level', default=1,
+                        help="The relevance score that candidates in `qrels_path` should at least have (after mapping) "
+                             "in order to be included in the set of candidate documents (as positives/negatives) for *evaluation* "
+                             "Typically only set to 0 if one expects these to be reliable negatives.")
+    parser.add_argument('--eval_relevant_at_level', default=1,
+                        help="The relevance score that candidates in `qrels_path` should at least have (after mapping) "
+                             "in order to be considered relevant in *evaluation* (incl. metrics calculation)."
+                             " Below this level, documents will not be considered relevant (but may still count towards nDCG)"
+                             "Should be at least as high as `include_at`, and is typically > 0.")
+    parser.add_argument('--max_inj_relevant', type=int, default=1000,
+                        help="Maximum number of 'relevant' candidates to inject per query when training (whether they come from qrels or target scores)")    
     parser.add_argument("--relevance_labels_mapping", type=str, default=None,
                         help="Optional: A string used to define a dictionary used to override/map relevance scores as "
                              "given in `qrels_path` to a new value, e.g. {1: 0.333}")
 
     ## System
     parser.add_argument('--debug', action='store_true', help="Activate debug mode (displays more information)")
-    parser.add_argument('--gpu_id', action='store', dest='cuda_ids', type=str, default="0",
+    parser.add_argument('--cuda_ids', action='store', dest='cuda_ids', type=str, default="0",
                         help="Optional cuda device ids for single/multi gpu setting, like '0' or '0,1,2,3' ", required=False)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument("--data_num_workers", default=0, type=int,
@@ -144,9 +175,9 @@ def run_parse_args():
     parser.add_argument("--load_collection_to_memory", action='store_true',
                         help="If true, will load entire doc. embedding array as np.array to memory, instead of memmap! "
                         "Needs ~26GB for MSMARCO (~50GB project total), but is faster.")
-    parser.add_argument("--no_predictions", action='store_true',
-                        help="If true, will not write predictions (ranking of candidates in evaluation set) to disk. "
-                             "Used to save storage, e.g. when optimizing hyperparameters. (~300MB for 10k queries)")
+    parser.add_argument("--write_predictions", choices=['pickle', 'tsv', 'None'], default='pickle',
+                        help="If not 'None', will write predictions (ranking of candidates in evaluation set) to disk in the specified format. "
+                             "Used to save storage, e.g. when optimizing hyperparameters. (tsv takes ~300MB for 10k queries)")
 
     ## Training process
     parser.add_argument("--per_gpu_eval_batch_size", default=32, type=int)
@@ -207,7 +238,7 @@ def run_parse_args():
     ## Model
     parser.add_argument("--model_type", type=str, choices=['repbert', 'mdstransformer'], default='mdstransformer',
                         help="""Type of the entire (end-to-end) information retrieval model""")
-    parser.add_argument("--query_aggregation", type=str, choices=['mean', 'first'], default='mean',
+    parser.add_argument("--query_aggregation", type=str, choices=['mean', 'first'], default='first',
                         help="""How to aggregate the individual final encoder embeddings corresponding to query tokens into 
                         a single vector.""")
     # parser.add_argument('--token_type_ids', action='store_true',
@@ -249,14 +280,23 @@ def run_parse_args():
                                  'dot_product', 'dot_product_gelu', 'dot_product_softmax',
                                  'cosine', 'cosine_gelu', 'cosine_softmax'},
                         default='raw', help='Scoring function to map the final embeddings to scores')
+    parser.add_argument('--temperature', default=None,
+                        help="A float parameter by which to divide the final scores. If set to 'learnable', will be learned during training.")
+    parser.add_argument('--label_normalization', choices=['max', 'maxmin', 'maxminmax', 'maxminbatchmean', 'std'], default=None,
+                        help='Normalization applied to the ground truth labels (target scores) before computing the loss.')
+    parser.add_argument('--boost_relevant', choices=["constant"], default=None,
+                        help="If not None, will boost the target scores of ground-truth relevant candidates using the specified policy. ")
+    parser.add_argument('--boost_factor', default=1.0,
+                        help="If `boost_factor` is 'constant', this factor will be multiplied with the score of the ground-truth candidates after label normalization, if any.")
     parser.add_argument('--loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier'},
-                        default='multilabelmargin', help='Loss applied to document scores')
+                        default='listent', help='Loss applied to document scores')
     parser.add_argument('--aux_loss_type', choices={'multilabelmargin', 'crossentropy', 'listnet', 'multitier', None},
                         default=None,
                         help='Auxiliary loss (optional). If specified, it will be multiplied by `aux_loss_coeff` and '
                              'added to the main loss.')
     parser.add_argument('--aux_loss_coeff', type=float, default=0,
                         help="Coefficient of auxiliary loss term specified by `aux_loss_type`.")
+    # Multitier loss
     parser.add_argument('--num_tiers', type=int, default=4,
                         help="Number of relevance tiers for `loss_type` 'multitier'. "
                              "Ground truth documents are not considered a separate tier.")
@@ -288,9 +328,9 @@ def run_parse_args():
     parser.add_argument('--bias_regul_cutoff', type=int, default=100,
                         help='Bias term is calculated according to the top-X predicted results')
 
-    args = parser.parse_args()
+    out_args = parser.parse_args(args)
 
-    return args
+    return out_args
 
 
 def check_args(config):
@@ -309,6 +349,9 @@ def check_args(config):
 
     if config['eval_query_tokens_path'] is None:
         config['eval_query_tokens_path'] = config['tokenized_path']
+        
+    if config['eval_qrels_path'] is None:
+        config['eval_qrels_path'] = config['qrels_path']
 
     # User can enter e.g. 'MRR@', indicating that they want to use the provided metrics_k for the key metric
     components = config['key_metric'].split('@')
@@ -347,5 +390,8 @@ def check_args(config):
 
     if config['relevance_labels_mapping'] is not None:
         config['relevance_labels_mapping'] = eval(config['relevance_labels_mapping'])  # convert string to dict
+
+    if config['eval_relevant_at_level'] < config['eval_include_at_level']:
+        raise ValueError("'eval_relevant_at_level should be at least as high as 'eval_include_at_level'")
 
     return config

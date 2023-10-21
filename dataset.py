@@ -10,7 +10,6 @@ import sys
 
 import numpy as np
 from tqdm import tqdm
-from transformers import BertTokenizer
 import torch
 from torch.utils.data import Dataset
 
@@ -19,7 +18,7 @@ import utils
 logger = logging.getLogger(__name__)
 
 BERT_BASE_DIM = 768
-# NOTE: MAX_DOCS should depend on the GPU memory, but maybe it's better to crush
+# NOTE: MAX_DOCS should depend on the GPU memory, but maybe it's better to crash
 # rather than silently scoring fewer documents than the user specified
 MAX_DOCS = int(1e12)  # 1000
 
@@ -28,6 +27,50 @@ sample_fetching_times = utils.Timer()
 collation_times = utils.Timer()
 prep_docids_times = utils.Timer()
 retrieve_candidates_times = utils.Timer()
+
+
+def nanstd(x, dim=-1):
+    """Returns std of Tensor x along specified dimension, ignoring NaN values"""
+    return torch.sqrt(torch.nanmean(torch.pow(x - torch.nanmean(x, dim=dim).unsqueeze(dim), 2), dim=dim))
+
+
+def normalize_batch(relevances, norm_type):
+    """
+    Normalize relevances for each query in a batch, ignoring padding (assumed to be -inf).
+    Also works for a (num_candidates,) vector of relevances with respect to a single query.
+    Normalization is supposed to help dealing with the variety of relevance score ranges resulting from different hyperparameter combinations.
+    Ultimately, a KL divergence between the model-predicted score distribution (possibly tempered by temperature)
+    and the target relevance distribution will be computed, which will be obtained by applying a softmax on relevances computed here.
+
+    :param relevances: (batch_size, num_candidates) tensor of target relevances. Also supports (num_candidates,)
+    :param norm_type: str. One of 'max', 'maxmin', 'std'
+    :return: (batch_size, num_candidates) tensor of normalized target relevances
+    """
+
+    if norm_type == 'max':  # in [0, 1]. May result in fairly flat "distribution" close to 1.
+        # max is not affected by -inf values
+        return relevances / torch.max(relevances, dim=-1).values.unsqueeze(-1)
+
+    not_valid = (relevances == float('-inf'))  # -inf is used as padding
+    if norm_type.startswith('maxmin'):  # increases inter-document dynamic range for "uniform" initial scores, while still in [0, 1]
+        # max is not affected by -inf values
+        max_relev = torch.max(relevances, dim=-1).values
+        # to ignore -inf values, we first make a copy of new_relevances where we replace non-valid values with +inf, and then we take the min along each row
+        min_relev = torch.min(torch.where(not_valid, torch.full_like(relevances, float('inf')), relevances), dim=-1).values
+        relevances = (relevances - min_relev.unsqueeze(-1)) / (max_relev - min_relev).unsqueeze(-1)
+        if norm_type == 'maxminmax':  # even wider dynamic range for "uniform" initial scores, but in [0, max(row)]
+            relevances = max_relev.unsqueeze(-1) * relevances
+        elif norm_type == 'maxminbatchmean':  # wide dynamic range for "uniform" initial scores, while reducing variance across queries; in [0, mean(batch)]
+            relevances = torch.nanmean(torch.where(not_valid, torch.full_like(relevances, float('nan')), relevances)) * relevances
+    elif norm_type == 'std':  # even wider dynamic range for "uniform" initial scores, but in [0, f], with f > 1
+        # to ignore -inf values for std, we follow the same approach as with min, but use NaN. There is a special torch function ignoring NaN
+        min_relev = torch.min(torch.where(not_valid, torch.full_like(relevances, float('inf')), relevances), dim=-1).values
+        relev_std = nanstd(torch.where(not_valid, torch.full_like(relevances, float('nan')), relevances), dim=-1).unsqueeze(-1)
+        relevances = (relevances - min_relev.unsqueeze(-1)) / relev_std
+    else:
+        raise ValueError(f"Unknown relevance score normalization option '{norm_type}'")
+    return relevances
+
 
 # only used by RepBERT and `precompute.py`
 class CollectionDataset:
@@ -201,7 +244,7 @@ class CandidatesDataset:
         ind = self.qid2ind[qid]
         return self.doc_ids[ind, :self.lengths[ind]]
 
-
+# only used in Inspect mode
 def load_original_sequences(seq_path):
     """
     For a specified collection or queries file, loads original sequence IDs and respective text into a dictionary. Used for 'inspect' mode.
@@ -231,55 +274,56 @@ def load_query_tokenids(query_tokenids_path):
 
 
 # only used by RepBERT
-def load_querydoc_pairs(msmarco_dir, mode):
-    """
-    Has 2 separate modes with very different behavior
-    :param msmarco_dir: dir containing qidpidtriples.train.small.tsv, qrels.train.tsv, top1000.{mode}
-    :param mode:
-        if "train", reads train triples file, then qrels.train file (GEO: why here?),
-        and returns a qrels dict: {qID : set of relevant pIDs}, and aligned lists of qids, pids, labels (0 or 1).
-        Within these 3 lists, each triple is broken into 2  successive elements:
-        qids = [..., qid1, qid1, ...], pids = [..., pid1_pos, pid1_neg, ...], labels = [..., 1, 0, ...]
-        if "dev", returns aligned qids, pids lists of (randomly ranked) MSMARCO top1000.dev BM25 results read from top1000.dev file
-    """
-    qrels = defaultdict(set)  # dict: {qID : set of relevant pIDs}
-    qids, pids, labels = [], [], []
-    if mode == "train":  # GEO: this triples file does not exist. RepBERT team made it
-        for line in tqdm(open(f"{msmarco_dir}/qidpidtriples.train.small.tsv"), desc="load train triples"):
-            qid, pos_pid, neg_pid = line.split("\t")
-            qid, pos_pid, neg_pid = int(qid), int(pos_pid), int(neg_pid)
-            qids.append(qid)
-            pids.append(pos_pid)
-            labels.append(1)
-            qids.append(qid)
-            pids.append(neg_pid)
-            labels.append(0)
-        for line in open(f"{msmarco_dir}/qrels.train.tsv"):
-            qid, _, pid, _ = line.split()  # the _ account for uninformative placeholders in TREC format
-            qrels[int(qid)].add(int(pid))
-    else:
-        for line in open(f"{msmarco_dir}/top1000.{mode}"):
-            qid, pid, _, _ = line.split("\t")  # the _ account for query and passage text (not used)
-            qids.append(int(qid))
-            pids.append(int(pid))
-    qrels = dict(qrels)  # GEO: why need to convert to simple dict?! especially here and not within previous `if` !?
-    if not mode == "train":
-        labels, qrels = None, None  # qrels and labels NOT loaded for either "dev" or "eval"
-    # each query ID is contained 2 consecutive times in qids, once corresponding to the positive and once to the negative pid
-    return qids, pids, labels, qrels
+# def load_querydoc_pairs(msmarco_dir, mode):
+#     """
+#     Has 2 separate modes with very different behavior
+#     :param msmarco_dir: dir containing qidpidtriples.train.small.tsv, qrels.train.tsv, top1000.{mode}
+#     :param mode:
+#         if "train", reads train triples file, then qrels.train file (GEO: why here?),
+#         and returns a qrels dict: {qID : set of relevant pIDs}, and aligned lists of qids, pids, labels (0 or 1).
+#         Within these 3 lists, each triple is broken into 2  successive elements:
+#         qids = [..., qid1, qid1, ...], pids = [..., pid1_pos, pid1_neg, ...], labels = [..., 1, 0, ...]
+#         if "dev", returns aligned qids, pids lists of (randomly ranked) MSMARCO top1000.dev BM25 results read from top1000.dev file
+#     """
+#     qrels = defaultdict(set)  # dict: {qID : set of relevant pIDs}
+#     qids, pids, labels = [], [], []
+#     if mode == "train":  # GEO: this triples file does not exist. RepBERT team made it
+#         for line in tqdm(open(f"{msmarco_dir}/qidpidtriples.train.small.tsv"), desc="load train triples"):
+#             qid, pos_pid, neg_pid = line.split("\t")
+#             qid, pos_pid, neg_pid = int(qid), int(pos_pid), int(neg_pid)
+#             qids.append(qid)
+#             pids.append(pos_pid)
+#             labels.append(1)
+#             qids.append(qid)
+#             pids.append(neg_pid)
+#             labels.append(0)
+#         for line in open(f"{msmarco_dir}/qrels.train.tsv"):
+#             qid, _, pid, _ = line.split()  # the _ account for uninformative placeholders in TREC format
+#             qrels[int(qid)].add(int(pid))
+#     else:
+#         for line in open(f"{msmarco_dir}/top1000.{mode}"):
+#             qid, pid, _, _ = line.split("\t")  # the _ account for query and passage text (not used)
+#             qids.append(int(qid))
+#             pids.append(int(pid))
+#     qrels = dict(qrels)  # GEO: why need to convert to simple dict?! especially here and not within previous `if` !?
+#     if not mode == "train":
+#         labels, qrels = None, None  # qrels and labels NOT loaded for either "dev" or "eval"
+#     # each query ID is contained 2 consecutive times in qids, once corresponding to the positive and once to the negative pid
+#     return qids, pids, labels, qrels
 
 
-def load_qrels(filepath, include_zeros=False, score_mapping=None):
+def load_qrels(filepath, relevance_thr=1, score_mapping=None):
     """Load ground truth relevant passages from file. Can handle several levels of relevance.
     Assumes that if a passage is not listed for a query, it is non-relevant.
     :param filepath: path to file of ground truth relevant passages in the following format:
         "qID1 \t Q0 \t pID1 \t 2\n
          qID1 \t Q0 \t pID2 \t 0\n
          qID1 \t Q0 \t pID3 \t 1\n..."
-    :param include_zeros: whether to include passages which have explicitly a relevance score of 0
+    :param relevance_thr: only include candidates which have at least the specified relevance threshold score
+        (after potential mapping)
     :param score_mapping: dictionary mapping relevance scores in qrels file to a different value (e.g. 1 -> 0.03)
     :return:
-        qid2relevance (dict): dictionary mapping from query_id (int) to relevant passages (dict {passageid : relevance})
+        qid2relevance (dict): dictionary mapping from int query_id to int passage IDs with g.t. relevance judgement (dict {passageid : relevance})
     """
     qid2relevance = defaultdict(dict)
     with open(filepath, 'r') as f:
@@ -289,7 +333,7 @@ def load_qrels(filepath, include_zeros=False, score_mapping=None):
                 relevance = float(relevance)
                 if (score_mapping is not None) and (relevance in score_mapping):
                     relevance = score_mapping[relevance]  # map score to new value
-                if include_zeros or (relevance > 0):  # include only if relevance is not 0, unless explicitly allowed
+                if relevance >= relevance_thr:  # include only if score >= specified relevance threshold level
                     qid2relevance[int(qid)][int(pid)] = relevance
             except Exception as x:
                 print(x)
@@ -315,11 +359,39 @@ def load_qrels(filepath, include_zeros=False, score_mapping=None):
 def load_query_ids(filepath):
     """Loads query IDs from a file which contains 1 ID per line (and possibly more fields on its right, separated by whitespace)"""
     query_ids = []
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
             qid, *_ = line.strip().split()  # read first field, ignore the rest, if any exist
             query_ids.append(int(qid))
     return query_ids
+
+
+class ScoreBooster(object):
+
+    def __init__(self, boost_mode, boost_factor=1.2):
+
+        try:
+            boost_factor = float(boost_mode)
+            boost_mode = "constant"
+        except ValueError:
+            pass
+
+        self.boost_mode = boost_mode
+        self.boost_factor = boost_factor
+
+        if boost_mode == "constant":
+            self.boost_func = self.constant_boost
+        else:
+            raise ValueError(f"Unknown boost mode: {boost_mode}")
+
+    def constant_boost(self, scores, pid2relevance):
+        """Boost scores of all relevant passages of a single query by a constant factor
+        :param scores: (num_candidates,) numpy array of target scores for a single query
+        :param pid2relevance: either list of tuples (pid, score) or dict mapping from passage IDs to relevance scores *for a single query*
+        """
+        num_relevant = len(pid2relevance)
+        scores[:num_relevant] *= self.boost_factor
+        return scores
 
 
 class MYMARCO_Dataset(Dataset):
@@ -335,10 +407,14 @@ class MYMARCO_Dataset(Dataset):
         4. qrels file of ground truth relevant passages (if used for training or validation)
     """
     def __init__(self, mode,
-                 embedding_memmap_dir, queries_tokenids_path, candidates_path=None, qrels_path=None,
-                 tokenizer=None, max_query_length=64, num_candidates=None, candidate_sampling=None,
+                 embedding_memmap_dir, queries_tokenids_path, candidates_path=None,
+                 qrels_path=None, target_scores_path=None, query_ids_path=None,
+                 tokenizer=None, max_query_length=64,
+                 num_candidates=None, candidate_sampling=None, dynamic_candidates=None,
                  limit_size=None, emb_collection=None, load_collection_to_memory=False, inject_ground_truth=False,
-                 include_zero_labels=True, relevance_labels_mapping=None, collection_neutrality_path=None, query_ids_path=None):
+                 relevance_labels_mapping=None, include_at_level=1, relevant_at_level=1, max_inj_relevant=1000,
+                 label_normalization=None, boost_relevant=None, boost_factor=1.0,
+                 collection_neutrality_path=None):
         """
         :param mode: 'train', 'dev' or 'eval'
         :param embedding_memmap_dir: directory containing (num_docs_in_collection, doc_emb_dim) memmap array of doc
@@ -348,10 +424,13 @@ class MYMARCO_Dataset(Dataset):
             corresponding query IDs, and the number of candidates per query in two more memmpap files
         :param qrels_path: dir or path to file of ground truth relevant passages in the following format:
             "qID1 \t Q0 \t pID1 \t 1\n qID1 \t Q0 \t pID2 \t 1\n ..."
+        :param target_scores_path: Optional. Path to a file containing relevance scores which will be used as training labels
+            (instead of qrels, which will be used only for evaluation).
+        :param query_ids_path: Optional. Path to a file containing a subset of externally provided query IDs to be used in dataset.
         :param tokenizer: HuggingFace Tokenizer object. Must be the same as the one used for pre-tokenizing queries.
         :param max_query_length: max. number of query tokens, excluding special tokens
         :param num_candidates: number of document IDs to sample from all document IDs corresponding to a query and found
-            in `candidates_path` file. If None, all found document IDs will be used
+            in `candidates_path` file. If None, all found document IDs will be used.
         :param candidate_sampling: method to use for sampling candidates. If None, the top `num_candidates` will be used
         :param limit_size: If set, limit dataset size to a smaller subset, e.g. for debugging. If in [0,1], it will
             be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
@@ -361,24 +440,55 @@ class MYMARCO_Dataset(Dataset):
             reading matrix from `embedding_memmap_dir`
         :param inject_ground_truth: if True, during evaluation the ground truth relevant documents will be always included in the
             candidate documents, even if they weren't part of the original candidates. (Helps isolate effect of first-stage recall)
-        :param include_zero_labels: whether to include documents with a zero relevance score
-            inside the file specified by `qrels_path` in the set of candidate documents (as negatives). Typically set
-            to True if one expects these to be "good quality" negatives.
         :param relevance_labels_mapping: dict mapping from relevance scores inside `qrels_path` to new (overriding) values
+        :param include_at_level: candidate with a score >= this level will be included in qrels and injected candidates
+        :param relevant_at_level: candidate with a score >= this level will be included in injected candidates and
+            keep their respective scores as target scores (if `label_format` is `scores`).
+        :param max_inj_relevant: maximum number of 'relevant' candidates to inject per query when training
+            (whether they come from qrels or target scores)
+        :param label_normalization: if not None, will normalize the target scores according to the specified method:
+            'max', 'maxmin', 'std'.
+        :param boost_relevant: if not None, will boost the target scores of ground-truth relevant candidates by the specified factor.
+            This factor will be applied after normalization, if any.
         :param collection_neutrality_path: path to file containing neutrality scores, in the format: docID \t score\n
         :param query_ids_path: Path to a file containing the query IDs to be used for this dataset, 1 in each line.
             If not provided, the IDs in the memmap inside `candidates_path` will be used.
             If that is also not provided, the IDs inside `queries_tokenids_path` will be used.
         """
         self.mode = mode  # "train", "dev", "eval"
-        self.documents_neutrality = None
-        if collection_neutrality_path is not None:
-            logger.info("Loading document neutrality scores ...")
-            # TODO: wrap this in separate function
-            self.documents_neutrality = {}
-            for line in open(collection_neutrality_path):
-                vals = line.strip().split('\t')
-                self.documents_neutrality[int(vals[0])] = float(vals[1])    
+
+        logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+        logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
+        if target_scores_path is not None:
+            if self.mode != 'train':
+                raise ValueError("Continuous target scores are not supposed to used for evaluation, only for training")
+            logger.info("Loading target scores (training labels) for documents from '{}' ...".format(target_scores_path))
+            # target_scores: dict{qID: dict{pID: relevance}} continuous (float) label scores used for training
+            if target_scores_path.endswith('.hdf5'):
+                self.target_scores = utils.load_qrels_from_hdf5(target_scores_path, overwrite_queries=True) # string query/doc IDs
+            elif target_scores_path.endswith('.pickle'):
+                self.target_scores = utils.load_qrels_from_pickles(target_scores_path, overwrite_queries=True)
+            else:
+                self.target_scores = load_qrels(target_scores_path, relevance_thr=include_at_level)
+            logger.info("Size of target scores: {} MB".format(int(round(sys.getsizeof(self.target_scores)/1024**2))))
+            logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+            logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
+        else:
+            self.target_scores = None
+
+        self.label_normalization = label_normalization  # if not None, will normalize *training* labels (usually, self.target_scores)
+
+        if boost_relevant is not None:
+            self.score_booster = ScoreBooster(boost_relevant, boost_factor)
+        else:
+            self.score_booster = None
+
+        self.include_at_level = include_at_level
+        self.relevant_at_level = relevant_at_level
+        self.max_inj_relevant = max_inj_relevant  # limits the number of documents considered "relevant" that will be injected (e.g. to leave space for dynamic negatives)
+
         self.inject_ground_truth = inject_ground_truth  # if True, during evaluation the ground truth relevant documents will be always part of the candidate documents
         if self.inject_ground_truth:
             if self.mode == 'dev':
@@ -405,12 +515,13 @@ class MYMARCO_Dataset(Dataset):
             self.qids = load_query_ids(query_ids_path)  # query IDs used for this dataset
             logger.info("Loaded {} query IDs from: '{}'".format(len(self.qids), query_ids_path))
 
+        self.dynamic_candidates = dynamic_candidates
         if candidates_path is not None:  # this is the typical case
             start_time = time.time()
             logger.info("Opening retrieved candidates for queries memmap in '{}' ...".format(candidates_path))
             self.candidates = CandidatesDataset(candidates_path, load_to_memory=True)
             logger.info("Done in {:.3f} sec".format(time.time() - start_time))
-            logger.info("Size of candidates: {} MB".format(round(sys.getsizeof(self.candidates.doc_ids)/1024**2)))
+            logger.info("Size of candidates: {} MB".format(int(round(sys.getsizeof(self.candidates.doc_ids)/1024**2))))
 
             if self.qids is None:  # this is the typical case
                 self.qids = self.candidates.qids  # assign memmap array of qIDs as found in retrieved candidates file
@@ -418,11 +529,18 @@ class MYMARCO_Dataset(Dataset):
                 # NOTE: the following is done for efficiency, but is probably unnecessary
                 self.update_candidates(self.qids)
 
-        else:  # if no candidate documents are provided, they will be randomly sampled from the collection
-            logger.warning("Will randomly sample all documents for this dataset!")
+        else:
+            # if no candidate documents are provided, they will be either dynamically retrieved
+            # or randomly sampled from the collections
             self.candidates = None
             if self.qids is None:  # Since no candidates file is provided, unless query IDs are explicitly given,
                 self.qids = list(self.queries.keys())  # the IDs from the tokenized queries file will be used
+            logger.warning("No static candidates will be used for '{}' dataset".format(self.mode))
+            if not self.dynamic_candidates and self.mode != 'train':
+                raise ValueError("Evaluation set was initialized with random candidates!")
+
+        logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+        logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
 
         self.limit_dataset_size(limit_size)  # Potentially trims self.qids, self.candidates
 
@@ -430,8 +548,21 @@ class MYMARCO_Dataset(Dataset):
             if os.path.isdir(qrels_path):
                 qrels_path = os.path.join(qrels_path, "qrels.{}.tsv".format(mode))
             logger.info("Loading ground truth documents (labels) in '{}' ...".format(qrels_path))
-            self.include_zero_labels = include_zero_labels
-            self.qrels = load_qrels(qrels_path, include_zeros=include_zero_labels, score_mapping=relevance_labels_mapping)  # dict{qID: dict{pID: relevance}}
+            # relevance level for qrels can be different from the one used for injection (and metrics evaluation)
+            self.qrels = load_qrels(qrels_path, relevance_thr=include_at_level, score_mapping=relevance_labels_mapping)  # dict{int qID: dict{int pID: float relevance}}
+            logger.info("Size of g.t. labels (qrels): {} MB".format(int(round(sys.getsizeof(self.qrels)/1024**2))))
+
+            logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+            logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
+            # pytrec_eval requires conversion to *str IDs* and *int relevance* for qrels
+            logger.info('Making a reformatted copy of qrels ...')
+            self.reformatted_qrels = {str(qid): {str(pid): int(score) for pid, score in pdict.items()} for qid, pdict in self.qrels.items()}
+            logger.info("Size of reformatted qrels: {} MB".format(int(round(sys.getsizeof(self.reformatted_qrels)/1024**2))))
+
+            logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+            logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
             extra_qids = set(self.qids) - set(self.qrels.keys())
             if len(extra_qids) > 0:  # fail early if there are missing labels
                 err_str = "{} query IDs in the specified '{}' dataset do not exist in '{}'!".format(len(extra_qids), mode, qrels_path)
@@ -441,8 +572,9 @@ class MYMARCO_Dataset(Dataset):
         else:
             self.qrels = None
 
-        if tokenizer is None:  # TODO: for backwards compatibility. Consider removing
-            tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        logger.info("Current memory usage: {} MB".format(int(np.round(utils.get_current_memory_usage()))))
+        logger.info("Max memory usage: {} MB".format(int(np.ceil(utils.get_max_memory_usage()))))
+
         self.tokenizer = tokenizer
         self.cls_id = tokenizer.cls_token_id
         self.sep_id = tokenizer.sep_token_id
@@ -452,6 +584,16 @@ class MYMARCO_Dataset(Dataset):
 
         self.num_candidates = num_candidates
         self.candidate_sampling = candidate_sampling
+
+        # Bias mitigation
+        self.documents_neutrality = None
+        if collection_neutrality_path is not None:
+            logger.info("Loading document neutrality scores ...")
+            # TODO: wrap this in separate function
+            self.documents_neutrality = {}
+            for line in open(collection_neutrality_path):
+                vals = line.strip().split('\t')
+                self.documents_neutrality[int(vals[0])] = float(vals[1])
 
     def limit_dataset_size(self, limit_size):
         """Changes dataset to a smaller subset, e.g. for debugging"""
@@ -491,8 +633,10 @@ class MYMARCO_Dataset(Dataset):
         :return:
             qid: (int) query ID
             query_token_ids: list of token IDs corresponding to query (unpadded, includes start/stop tokens)
-            doc_ids: iterable of candidate document/passage IDs in order of relevance
-            rel_docs: set of ground truth relevant passage IDs corresponding to query ID; None if mode == 'eval'
+            doc_ids: iterable of candidate document/passage IDs in order of relevance,
+                of variable length (depends on number of relevant and static candidates)  # GEO: consider fixing the length
+            rel_scores: list of ground truth relevance scores (labels) for each element in doc_ids[:len(rel_scores)]
+                Can have shorter length than doc_ids when injecting positives. None if mode == 'eval'
         """
         global retrieve_candidates_times, prep_docids_times, lookup_times, sample_fetching_times
 
@@ -502,42 +646,84 @@ class MYMARCO_Dataset(Dataset):
         query_token_ids = query_token_ids[:self.max_query_length]
         query_token_ids = [self.cls_id] + query_token_ids + [self.sep_id]
 
-        tic = time.perf_counter()
-        if self.candidates is not None:  # typical case
-            doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of estimated relevance
-            doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids
-        else:  # if no candidates are provided, randomly samples from entire collection
-            # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
-            # Sampling time does not depend on the number of sampled values; only on the size of the population set!
-            num_safety_docs = 100  # to account for non-unique randomly sampled documents
-            # For MSMARCO, self.emb_collection.ids can be replaced with len(self.emb_collection) -- when replace=True, x10000 faster!???
-            if self.emb_collection.id2ind is None:  # if document IDs are ordinal numbers:
-                doc_ids = list(set(np.random.choice(len(self.emb_collection), size=(self.num_candidates+num_safety_docs), replace=True)))
-            else:  # x2 faster than if replace=False
-                doc_ids = list(set(np.random.choice(self.emb_collection.ids, size=(self.num_candidates+num_safety_docs), replace=True)))
-        retrieve_candidates_times.update(time.perf_counter() - tic)
-
-        if self.mode == "eval":
-            rel_docs = None
-        else:
+        if not self.dynamic_candidates:
             tic = time.perf_counter()
-            if self.include_zero_labels:  # otherwise this step is unnecessary, as qrels would only contain rel. > 0
-                docs_from_qrels = [docid for docid, score in sorted(self.qrels[qid].items(), key=itemgetter(1), reverse=True)]  # can contain docs with 0 relevance
-                rel_docs = {docid for docid in docs_from_qrels if self.qrels[qid][docid] > 0}  # only relevance > 0
-            else:
-                rel_docs = self.qrels[qid].keys()  # only relevance > 0
-                docs_from_qrels = rel_docs
+            if self.candidates is not None:  # typical case
+                doc_ids = self.candidates[qid]  # iterable of candidate document/passage IDs in order of estimated relevance
+                doc_ids = self.sample_candidates(doc_ids)  # sampled subset of candidate doc_ids. Enforces maximum self.num_candidates
+            else:  # if no candidates are provided, randomly samples from entire collection
+                # Sampling from 10M docs can take up to 1 sec, when sampling from IDs!
+                # Sampling time does not depend on the number of sampled values; only on the size of the population set!
+                num_safety_docs = 100  # to account for non-unique randomly sampled documents
+                # For MSMARCO, self.emb_collection.ids can be replaced with len(self.emb_collection) -- when replace=True, x10000 faster!???
+                if self.emb_collection.id2ind is None:  # if document IDs are ordinal numbers:
+                    doc_ids = list(set(np.random.choice(len(self.emb_collection), size=(self.num_candidates + num_safety_docs), replace=True)))
+                else:  # x2 faster than if replace=False
+                    doc_ids = list(set(np.random.choice(self.emb_collection.ids, size=(self.num_candidates + num_safety_docs), replace=True)))
+            retrieve_candidates_times.update(time.perf_counter() - tic)
+        else:  # will be retrieved per-batch for efficiency (in collate_fn)
+            doc_ids = []
 
-            if self.mode == "train" or self.inject_ground_truth:
-                # prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
-                # while ensuring that they are only included once
-                # num_candidates = len(doc_ids)
-                new_doc_ids = (list(docs_from_qrels) + [docid for docid in doc_ids if docid not in rel_docs])#[:num_candidates]
-                doc_ids = new_doc_ids  # direct assignment wouldn't work in line above
-            prep_docids_times.update(time.perf_counter() - tic)
+        if self.mode == "train" or self.inject_ground_truth:
+            label_source = self.qrels
+            if (self.target_scores is not None):  #and (qid in self.target_scores):
+                # first condition in above line cannot be true in case of 'dev' mode (see __init__, loading of target_scores)
+                # WARNING: second condition allows using usual qrels (instead of soft labels) when target_scores are not provided for all qids.
+                # It may be better to fail in case of missing target_scores, as applying the same transformation to qrels and target_scores is probably undesirable
+                if qid not in self.target_scores:
+                    raise ValueError("qid {} not found in target_scores".format(qid))
+                label_source = self.target_scores
+
+            # Prepend relevant documents at the beginning of doc_ids, whether pre-existing in doc_ids or not,
+            # while ensuring that they are only included once.
+            # We can limit the number of injected documents from the label source with `max_inj_relevant`, to make space for negatives (e.g. dynamic)
+            # Because of sorting, g.t. positives may be excluded when target_scores are provided,
+            # if their score is not high enough to receive a rank < max_inj_relevant
+            # NOTE: modified to convert to int IDs - remove int() if entire code is modified to use str IDs!
+            rel_cands, rel_scores = zip(*sorted(((int(docid), score) for docid, score in label_source[qid].items() if score >= self.include_at_level), key=itemgetter(1), reverse=True)[:self.max_inj_relevant])
+            rel_cands = list(rel_cands)
+            if self.label_normalization is not None:
+                rel_scores = np.asarray(normalize_batch(torch.tensor(rel_scores, dtype=torch.float32), self.label_normalization), dtype=np.float16)  # (len,) array
+            else:
+                rel_scores = np.asarray(rel_scores, dtype=np.float16)  # (len,) tensor
+
+            if self.score_booster is not None:
+                # Applies score boosting function (i.e. a score multiplier) to rel_scores, based on the relevance of the corresponding doc_ids
+                pid2relevance = {pid: relevance for pid, relevance in self.qrels[qid].items() if relevance >= self.relevant_at_level}
+                rel_scores = self.score_booster.boost_func(rel_scores, pid2relevance)
+
+            ############ NOTE: This is only to test uniform smoothing!
+            # new_scores = torch.full((len(doc_ids),), float('-inf'), dtype=torch.float32)
+            # new_scores[:len(rel_scores)] = torch.tensor(rel_scores, dtype=torch.float32)
+            # rel_scores = np.asarray(torch.nn.Softmax(dim=0)(new_scores))
+            # if self.mode == 'train':
+            #     num_relevant = len(self.qrels[qid])  # assuming only > 0 labels contained (relevant_at_level > 0)
+            #     # Variant 1: uniformly redistribute transformed scores coming from rNN-based target scores
+            #     weight_gt_relevant = rel_scores[:num_relevant].sum()
+            #     rel_scores[:num_relevant] = weight_gt_relevant / num_relevant
+            #     rel_scores[num_relevant:] = (1 - weight_gt_relevant) / (len(rel_scores) - num_relevant)
+            #     # Variant 2: Uniformly redistribute equal proporion as above among max_inj_relevant randomly sampled candidates
+            #     weight_gt_relevant = rel_scores[:num_relevant].sum()
+            #     rel_scores[:num_relevant] = weight_gt_relevant / num_relevant
+            #     sampled_cand_inds = np.random.choice(np.arange(num_relevant, len(rel_scores)),
+            #                                          size=self.max_inj_relevant, replace=False)
+            #     rel_scores[sampled_cand_inds] = (1 - weight_gt_relevant) / self.max_inj_relevant
+            #     # Variant 3: uniformly redistribute fixed proportion of original scores
+            #     redistribution_factor = 0.99
+            #     rel_scores[:num_relevant] *= (1-redistribution_factor)
+            #     rel_scores[num_relevant:] = redistribution_factor / (len(rel_scores) - num_relevant)
+            ############ NOTE: Uniform smoothing above!
+
+            # also covers case of dynamic candidates, in which initially doc_ids = [] and then doc_ids = rel_cands
+            new_cand_ids = (rel_cands + [candid for candid in doc_ids if candid not in set(rel_cands)])
+            doc_ids = new_cand_ids  # direct assignment wouldn't work in line above
+        elif self.mode == 'dev':
+            rel_scores = [self.qrels[qid].get(candid, float('-inf')) for candid in doc_ids]
+        else:  # when mode == 'eval'
+            rel_scores = None
 
         sample_fetching_times.update(time.perf_counter() - sample_fetching_start)
-        return qid, query_token_ids, doc_ids, rel_docs
+        return qid, query_token_ids, doc_ids, rel_scores
 
     def sample_candidates(self, candidates):
         """
@@ -552,21 +738,41 @@ class MYMARCO_Dataset(Dataset):
         else:
             return candidates
 
-    def get_collate_func(self, num_random_neg=0, max_candidates=MAX_DOCS, n_gpu=1):
+    def get_collate_func(self, num_random_neg=0, max_candidates=MAX_DOCS, n_gpu=1,
+                         label_format='scores', relevant_at_level=None, label_normalization=None):
         """
         :param num_random_neg: number of negatives to randomly sample from other queries in the batch.
             Can only be > 0 if mode == 'train'
         :param max_candidates: maximum number of candidates per query to be scored by the model (capacity of model)
             `num_candidates` will be reduced accordingly, if necessary.
         :param n_gpu: number of GPUs used for data parallelism
+        :param label_format: 'indices' or 'scores'.
+            If 'scores', `labels` have the same formatting as `predictions`:
+                each position is a relevance score, -Inf for non-relevant and padding, e.g. [2.0 1.0 1.0 -Inf ... -Inf]
+            If 'indices', labels are num_relevant integer indices of relevant documents and padded with -1,
+                e.g. [0, 1, 2, -1, ..., -1]. Used with MaxMargin loss
+        :param relevant_at_level: relevance level to be considered relevant in labels (will use init default if None).
+            When `label_format` is 'indices', a candidate with a qrels score >= this level is considered relevant,
+            which means that all candidates with lower or unspecified g.t. score will be required to be scored lower than this candidate.
+            When `label_format` is `scores`, a score < this level will be converted to -Inf (non-relevant), while a score
+            >= this level will be considered a target score. For example, a score of 0 will receive some prob. weight.
         :return: function with a single argument, which corresponds to a list of individual sample data. Used by DataLoader
         """
         if self.mode != 'train':
             num_random_neg = 0
 
+        if relevant_at_level is None:
+            relevant_at_level = self.relevant_at_level  # set to the level defined in `__init__`
+
+        qrels = None
+        if (label_format == 'indices') and \
+                ((relevant_at_level != self.include_at_level) or (self.mode == 'dev' and not self.inject_ground_truth)):
+            qrels = self.qrels  # in this case the shortcut cannot be used, and qrels is required
+
         return partial(collate_function, emb_collection=self.emb_collection, mode=self.mode, pad_token_id=self.pad_id,
                        num_random_neg=num_random_neg, max_candidates=max_candidates, n_gpu=n_gpu,
-                       inject_ground_truth=self.inject_ground_truth,
+                       label_format=label_format, relevant_at_level=relevant_at_level, label_normalization=label_normalization,
+                       qrels=qrels,
                        documents_neutrality=self.documents_neutrality)
 
 
@@ -583,39 +789,51 @@ def get_docID_to_localind_mapping(doc_ids):
     return docID_to_localind
 
 
-def pack_tensor_2D(lstlst, default, dtype, length=None):
+def pack_tensor_2D(sequences, default, dtype, length=None):
     """
     Padds and/or truncates each sequence in the input list of sequences to the specified `length` or the max. sequence
     length in the list. Padded values are filled with `default`.
-    :param lstlst: list of sequences to be packed into a tensor (batch)
+    :param sequences: list of sequences to be packed into a tensor (batch)
     :param default: constant value to be used as padding
     :param dtype: type of tensor
     :param length: constant output length of all sequences in the batch;
         if None, the max. sequence length in `lstlst` will be used
-    :return: (len(lstlst), length) tensor of type dtype
+    :return: (len(sequences), length) tensor of type dtype
     """
-    batch_size = len(lstlst)
-    length = length if length is not None else max(len(l) for l in lstlst)
+    batch_size = len(sequences)
+    length = length if length is not None else max(len(seq) for seq in sequences)
     tensor = torch.full((batch_size, length), default, dtype=dtype)
-    for i, l in enumerate(lstlst):
-        tensor[i, :len(l)] = torch.tensor(l, dtype=dtype)  # casting to tensor required for assignment
+    for i, seq in enumerate(sequences):
+        end = min(len(seq), length)
+        tensor[i, :end] = torch.tensor(seq[:end], dtype=dtype)  # casting to tensor required for assignment
     return tensor
 
 
 def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_random_neg=0, max_candidates=MAX_DOCS,
-                     n_gpu=1, inject_ground_truth=False, documents_neutrality=None):
+                     n_gpu=1, label_format='scores', relevant_at_level=1, label_normalization=None, qrels=None,
+                     documents_neutrality=None):
     """
-    :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, rel_docs)
+    :param batch_samples: (batch_size) list of tuples (qids, query_token_ids, doc_ids, rel_scores)
     :param emb_collection: (collection_size, emb_dim) numpy.memmap of document collection embedding vectors.
-        Used to look up embedding vectors by doc_id
+                Used to look up embedding vectors by doc_id
     :param mode: 'train', 'dev', or 'eval'
     :param pad_token_id: ID of token used for padding queries
     :param num_random_neg: number of negatives to randomly sample from candidates of other queries in the batch.
-        Can only be > 0 if mode == 'train'
+                Can only be > 0 if mode == 'train'
     :param max_candidates: maximum number of candidates per query to be scored by the model (capacity of model)
     :param n_gpu: number of GPUs used for data parallelism
-    :param inject_ground_truth: If true, the ground truth document(s) will always be included in the set of documents
-        to be reranked for each query, even if it was not present in the candidates inside `batch_samples`."
+    :param label_format: 'indices' or 'scores'.
+              If 'scores', returned rows of `labels` have the same formatting as `predictions`:
+                  each position is a relevance score, -Inf for non-relevant and padding, e.g. [2.0 1.0 1.0 -Inf ... -Inf]
+              If 'indices', each row of `labels` is num_relevant integer indices of relevant documents and is padded with -1,
+                  e.g. [0, 1, 2, -1, ..., -1]. Used with MaxMargin loss
+    :param relevant_at_level: relevance level to be considered relevant in labels.
+        When `label_format` is 'indices', a candidate with a qrels score >= this level is considered relevant,
+        which means that all other candidates will be pushed to be scored lower than this level.
+        When `label_format` is `scores`, a score < this level will be converted to -Inf (non-relevant), while a score
+        >= this level will be considered a target score. For example, a score of 0 will receive some prob. weight.
+    :param qrels: (optional) {query ID: {candidate ID: relevance score}} mapping,
+        to be used when `label_format` == 'indices' and mode == 'dev' when 'inject_ground_truth' is False
     :return:
         qids: (batch_size) list of query IDs
         doc_ids: (batch_size) list of lists of candidate (retrieved) document IDs corresponding to a query in `qids`.
@@ -623,25 +841,24 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
         data: dict to serve as input to the model. Contains:
             query_token_ids: (batch_size, max_query_len) int tensor of query token IDs
             query_mask: (batch_size, max_query_len) bool tensor of padding mask corresponding to query; 1 use, 0 ignore
-            doc_padding_mask: (batch_size, max_docs_per_query) boolean tensor indicating padding (0) or valid (1) elements
+            doc_padding_mask: (batch_size, max_cands_per_query) boolean tensor indicating padding (0) or valid (1) elements
                 in `doc_emb` or `docinds`
             If num_random_neg > 0, additionally contains:
             local_emb_mat: (num_unique_docIDs, emb_dim) tensor of local doc embedding matrix containing emb. vectors
                 of all unique documents in the batch.  Used to lookup document vectors in nn.Embedding on the GPU
                 This is done to avoid replicating embedding vectors of in-batch negatives, thus sparing GPU bandwidth.
-            docinds: (batch_size, max_docs_per_query) local indices of documents corresponding to `local_emb_mat`
+            docinds: (batch_size, max_cands_per_query) local indices of documents corresponding to `local_emb_mat`
             else:
-            doc_emb: (batch_size, max_docs_per_query, emb_dim) float tensor of document embeddings corresponding
+            doc_emb: (batch_size, max_cands_per_query, emb_dim) float tensor of document embeddings corresponding
                 to the pool of candidates for each query
 
             If mode != 'eval', additionally contains:
-            labels: (batch_size, max_docs_per_query) int tensor which for each query (row) contains the indices of the
-                relevant documents within its corresponding pool of candidates, `doc_ids`. Padded with -1.
+            labels: (batch_size, max_cands_per_query) tensor of labels, the format of which depends on `label_format`
     """
     start_collation_time = time.perf_counter()
     batch_size = len(batch_samples)
 
-    qids, query_token_ids, doc_ids, rel_docs = zip(*batch_samples)
+    qids, query_token_ids, doc_ids, rel_scores = zip(*batch_samples)
     query_lengths = [len(seq) for seq in query_token_ids]
     max_query_length = max(query_lengths)
     query_masks = [[1] * ql for ql in query_lengths]  # 1 use, 0 ignore
@@ -650,7 +867,7 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
     data = {"query_token_ids": pack_tensor_2D(query_token_ids, default=pad_token_id, length=max_query_length, dtype=torch.int32),
             "query_mask": pack_tensor_2D(query_masks, default=0, length=max_query_length, dtype=torch.bool)}
 
-    if num_random_neg:  # only in 'train' mode
+    if num_random_neg:  # only in 'train' mode. Will include *random* (i.e. not retrieved) negatives
         # In this case, the doc embeddings are not packed here, but inside the model (on the GPU), in order
         # to avoid transferring replicas of document embeddings corresponding to in-batch negatives and thus spare GPU mem. bandwidth.
         # For this purpose, we pass a smaller local doc embedding matrix containing emb. vectors of all documents
@@ -697,63 +914,84 @@ def collate_function(batch_samples, mode, emb_collection, pad_token_id, num_rand
                                                                              padding_idx=local_emb_mat.shape[0]-1)
         data['local_emb_mat'] = local_emb_mat.repeat(n_gpu, 1)  # replicas passed to each split of multi-gpu
 
-    max_docs_per_query = min(max_candidates, max(len(cands) for cands in doc_ids))  # length used for padding
+    max_cands_per_query = min(max_candidates, max(len(cands) for cands in doc_ids))  # length used for padding
 
-    if num_random_neg == 0:
-        # Pack 3D tensors: doc embeddings and corresponding padding mask
-        doc_emb_tensor = torch.zeros(batch_size, max_docs_per_query, emb_collection.embedding_vectors.shape[-1])  # (batch_size, padded_length, emb_dim)
-        doc_emb_mask = torch.zeros(doc_emb_tensor.shape[:2], dtype=torch.bool)  # (batch_size, padded_length)
-        for i, docids in enumerate(doc_ids):
-            end = min(len(docids), max_docs_per_query)
-            tic = time.perf_counter()
-            doc_emb_tensor[i, :end, :] = torch.tensor(emb_collection[docids[:end]])
-            lookup_times.update(time.perf_counter() - tic)
-            doc_emb_mask[i, :end] = 1
-        data['doc_emb'] = doc_emb_tensor
-        data['doc_padding_mask'] = doc_emb_mask
+    if num_random_neg == 0:  # Will only use retrieved candidates (either as negatives or for evaluation)
+        # Pack 3D tensors: candidate embeddings and corresponding padding mask
+        # Tensors are padded NOT to a standard length (transformer input length), but to the max_len in the batch
+        data['doc_emb'], data['doc_padding_mask'] = pack_candidate_embeddings(doc_ids, emb_collection, batch_size, max_cands_per_query)
 
-    # TODO: wrap this in separate function?
-    if documents_neutrality is not None:
-        doc_neutscores = []
-        for doc_ids_batch in doc_ids:
-            doc_neutscores_batch = []
-            for doc_id in doc_ids_batch:
-                if doc_id in documents_neutrality:
-                    doc_neutscores_batch.append(documents_neutrality[doc_id])    
-                else:
-                    logger.debug("Document neutrality score of ID %d is not found (set to 1)" % doc_id)
-                    doc_neutscores_batch.append(1.0)
-            doc_neutscores.append(doc_neutscores_batch)
-
-        doc_neutscores_tensor = torch.zeros(batch_size, max_docs_per_query)  # (batch_size, padded_length)
-        for i, doc_neutscores_batch in enumerate(doc_neutscores):
-            end = min(len(doc_neutscores_batch), max_docs_per_query)
-            doc_neutscores_tensor[i, :end] = torch.tensor(doc_neutscores_batch)[:end]
-        data['doc_neutscore'] = doc_neutscores_tensor
-        
     if mode != 'eval':
-        if mode == "train" or inject_ground_truth:
-            # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
-            # In this case, it is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
-            # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
-            # that 1 or more positives (rel. docs) will be at the beginning of the list (and only there)
-            labels = [list(range(len(rd))) for rd in rel_docs]  # NOTE: rel_docs contains only non-0 scores
-        else:  # this is when 'dev', but not inject_ground_truth
-            labels = []
-            for i in range(batch_size):
-                query_labels = []
-                for ind in range(len(doc_ids[i])):
-                    if doc_ids[i][ind] in rel_docs[i]:  # NOTE: rel_docs contains only non-0 scores
-                        query_labels.append(ind)
-                labels.append(query_labels)
+        # Prepare labels
+        if label_format == 'scores':
+            # must be padded to have same dimensions as the transformer "decoder" output: (batch_size, max_cands_per_query)
+            # Because softmax(rel_scores) is used to derive the distribution, -Inf must be used such that prob. for all non-relevant is 0
+            # -Inf is also used for padding, and should also be used at the respective masked positions of predicted scores
+            labels = pack_tensor_2D(rel_scores, default=float('-inf'), dtype=torch.float32, length=max_cands_per_query)
+            if label_normalization is not None:
+                labels = normalize_batch(labels, label_normalization)
+            labels[labels < relevant_at_level] = float('-inf')  # necessary to enforce relevance threshold for loss computation
+            data['labels'] = labels
+        else:  # 'indices'
+            if qrels is None:
+                # faster variant (shortcut)
+                # valid when: (mode == "train" or inject_ground_truth) AND (relevant_at_level == include_at_level)
+                # `labels` holds for each query the indices of the relevant doc IDs within its corresponding pool of candidates, `doc_ids`
+                # In this case, it is guaranteed by the construction of doc_ids in MYMARCO_Dataset.__get_item__
+                # (and the fact that we are only randomly sampling negatives not already in the list of candidates for a given qID)
+                # that 1 or more positives (rel. docs) will be at the beginning of the list (and only there)
+                labels = [list(range(len(rd))) for rd in rel_scores]  # rel_scores contains only scores >= dataset.include_at_level
+            else:  # this is when 'dev', but not inject_ground_truth
+                labels = prepare_ind_labels(qids, doc_ids, qrels, relevance_level=relevant_at_level)
+            # must be padded with -1 to have same dimensions as the transformer "decoder" output: (batch_size, max_cands_per_query)
+            data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_cands_per_query)  # supports up to 32767 rel. documents per query
 
-        # must be padded with -1 to have same dimensions as the transformer "decoder" output: (batch_size, max_docs_per_query)
-        data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int16, length=max_docs_per_query)  # no more than a couple of rel. documents per query exist, so even uint8 could be used
+    # Bias mitigation
+    if documents_neutrality is not None:
+        data['doc_neutscore'] = prepare_neutrality_labels(doc_ids, documents_neutrality, max_cands_per_query)
 
     global collation_times
     collation_times.update(time.perf_counter() - start_collation_time)
 
     return data, qids, doc_ids
+
+
+def prepare_neutrality_labels(doc_ids, documents_neutrality, max_cands_per_query):
+    doc_neutscores = []
+    for doc_ids_batch in doc_ids:
+        doc_neutscores_batch = []
+        for doc_id in doc_ids_batch:
+            if doc_id in documents_neutrality:
+                doc_neutscores_batch.append(documents_neutrality[doc_id])
+            else:
+                logger.debug("Document neutrality score of ID %d is not found (set to 1)" % doc_id)
+                doc_neutscores_batch.append(1.0)
+        doc_neutscores.append(doc_neutscores_batch)
+
+    # TODO: use pack_tensor_2D?
+    doc_neutscores_tensor = torch.zeros(len(doc_ids), max_cands_per_query)  # (batch_size, padded_length)
+    for i, doc_neutscores_batch in enumerate(doc_neutscores):
+        end = min(len(doc_neutscores_batch), max_cands_per_query)
+        doc_neutscores_tensor[i, :end] = torch.tensor(doc_neutscores_batch)[:end]
+    return doc_neutscores_tensor
+
+
+def prepare_ind_labels(qids, doc_ids, qrels, relevance_level=1):
+    """
+    Prepare relevance labels for `label_format` == 'indices' (used for max margin losses).
+    This is necessary when mode == 'dev' and not `inject_ground_truth` - otherwise:
+        labels = [list(range(len(rd))) for rd in rel_scores]
+    :return: list, each item is a list of index locations (not necessarily sorted!) within doc_ids corresponding to g.t. relevant candidates.
+    """
+    labels = []
+    for i in range(len(qids)):
+        query_labels = []
+        for ind in range(len(doc_ids[i])):
+            score = qrels[qids[i]].get(doc_ids[i][ind], -1)
+            if score >= relevance_level:
+                query_labels.append(ind)
+        labels.append(query_labels)
+    return labels
 
 
 def prepare_docinds_and_mask(doc_ids, docID_to_localind, padding_idx, length=None):
@@ -776,6 +1014,23 @@ def prepare_docinds_and_mask(doc_ids, docID_to_localind, padding_idx, length=Non
         docinds[i, :len(docids)] = torch.tensor(local_docinds, dtype=torch.int32)  # casting to tensor required for assignment
         docinds_mask[i, :len(docids)] = True
     return docinds, docinds_mask
+
+
+def pack_candidate_embeddings(cand_ids, emb_collection, batch_size, max_len):
+    """Pack 3D tensors: candidate embeddings and corresponding padding mask"""
+
+    global lookup_times
+
+    cand_emb_tensor = torch.zeros(batch_size, max_len,
+                                  emb_collection.embedding_vectors.shape[-1])  # (batch_size, padded_length, emb_dim)
+    cand_emb_mask = torch.zeros(cand_emb_tensor.shape[:2], dtype=torch.bool)  # (batch_size, padded_length)
+    for i, candids in enumerate(cand_ids):
+        end = min(len(candids), max_len)
+        tic = time.perf_counter()
+        cand_emb_tensor[i, :end, :] = torch.tensor(emb_collection[candids[:end]])
+        lookup_times.update(time.perf_counter() - tic)
+        cand_emb_mask[i, :end] = 1
+    return cand_emb_tensor, cand_emb_mask
 
 
 # Not used! We use nn.Embedding instead! ~10 times faster!
@@ -804,89 +1059,89 @@ def prepare_docinds_and_mask(doc_ids, docID_to_localind, padding_idx, length=Non
 #     return doc_emb_tensor, doc_emb_mask
 
 
-# TODO: only used by RepBERT! (consider removing)
-class MSMARCODataset(Dataset):
-    def __init__(self, mode, msmarco_dir,
-                 collection_memmap_dir, queries_tokenids_path,
-                 max_query_length=20, max_doc_length=256, limit_size=None):
-        """
-        :param limit_size: If set, limit dataset size to a smaller subset, e.g. for debugging. If in [0,1], it will
-            be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
-        """
-        self.collection = CollectionDataset(collection_memmap_dir)
-        if os.path.isdir(queries_tokenids_path):
-            queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
-        self.queries = load_query_tokenids(queries_tokenids_path)  # dict: {qID : list of token IDs}
-        # qids, pids, labels: corresponding lists of query IDs, passage IDs, 1 / 0 relevance labels
-        # each query ID is contained 2 consecutive times in qids, once corresponding to the positive and once to the negative pid
-        # qrels is the ground truth dict: {qID : set of relevant pIDs}
-        self.qids, self.pids, self.labels, self.qrels = load_querydoc_pairs(msmarco_dir, mode)
-        self.mode = mode  # "train", "dev", "eval"
-        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-        self.cls_id = tokenizer.cls_token_id
-        self.sep_id = tokenizer.sep_token_id
-        self.max_query_length = max_query_length
-        self.max_doc_length = max_doc_length
-        self.limit_dataset_size(limit_size)
+# NOTE: only used by RepBERT! (consider removing)
+# class MSMARCODataset(Dataset):
+#     def __init__(self, mode, msmarco_dir,
+#                  collection_memmap_dir, queries_tokenids_path,
+#                  max_query_length=20, max_doc_length=256, limit_size=None):
+#         """
+#         :param limit_size: If set, limit dataset size to a smaller subset, e.g. for debugging. If in [0,1], it will
+#             be interpreted as a proportion of the dataset, otherwise as an integer absolute number of samples.
+#         """
+#         self.collection = CollectionDataset(collection_memmap_dir)
+#         if os.path.isdir(queries_tokenids_path):
+#             queries_tokenids_path = os.path.join(queries_tokenids_path, "queries.{}.json".format(mode))
+#         self.queries = load_query_tokenids(queries_tokenids_path)  # dict: {qID : list of token IDs}
+#         # qids, pids, labels: corresponding lists of query IDs, passage IDs, 1 / 0 relevance labels
+#         # each query ID is contained 2 consecutive times in qids, once corresponding to the positive and once to the negative pid
+#         # qrels is the ground truth dict: {qID : set of relevant pIDs}
+#         self.qids, self.pids, self.labels, self.qrels = load_querydoc_pairs(msmarco_dir, mode)
+#         self.mode = mode  # "train", "dev", "eval"
+#         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+#         self.cls_id = tokenizer.cls_token_id
+#         self.sep_id = tokenizer.sep_token_id
+#         self.max_query_length = max_query_length
+#         self.max_doc_length = max_doc_length
+#         self.limit_dataset_size(limit_size)
 
-    def limit_dataset_size(self, limit_size):
-        """Changes dataset to a smaller subset, e.g. for debugging"""
-        if limit_size is not None:
-            if limit_size > 1:
-                limit_size = int(limit_size)
-            else:  # interpret as proportion if in (0, 1]
-                limit_size = int(limit_size * len(self.qids))
-            if limit_size < len(self.qids):
-                self.qids = self.qids[:limit_size]
-                self.pids = self.pids[:limit_size]
-                self.labels = self.labels[:limit_size]
-                # self.candidates.lengths = self.candidates.lengths[:limit_size]
-                # self.candidates.get_qid_to_ind_mapping(self.qids)
-        return
+#     def limit_dataset_size(self, limit_size):
+#         """Changes dataset to a smaller subset, e.g. for debugging"""
+#         if limit_size is not None:
+#             if limit_size > 1:
+#                 limit_size = int(limit_size)
+#             else:  # interpret as proportion if in (0, 1]
+#                 limit_size = int(limit_size * len(self.qids))
+#             if limit_size < len(self.qids):
+#                 self.qids = self.qids[:limit_size]
+#                 self.pids = self.pids[:limit_size]
+#                 self.labels = self.labels[:limit_size]
+#                 # self.candidates.lengths = self.candidates.lengths[:limit_size]
+#                 # self.candidates.get_qid_to_ind_mapping(self.qids)
+#         return
 
-    def get_collate_function(self, n_gpu=1):  # TODO n_gpu is not handled in the function
-        def collate_function(batch):
-            input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]
-            token_type_ids_lst = [[0] * len(x["query_input_ids"]) + [1] * len(x["doc_input_ids"]) for x in batch]
-            valid_mask_lst = [[1] * len(input_ids) for input_ids in input_ids_lst]
-            position_ids_lst = [list(range(len(x["query_input_ids"]))) +
-                                list(range(len(x["doc_input_ids"]))) for x in batch]
+#     def get_collate_function(self, n_gpu=1):  # WARNING: n_gpu is not handled in the function! (must be updated for n_gpu>1)
+#         def collate_function(batch):
+#             input_ids_lst = [x["query_input_ids"] + x["doc_input_ids"] for x in batch]
+#             token_type_ids_lst = [[0] * len(x["query_input_ids"]) + [1] * len(x["doc_input_ids"]) for x in batch]
+#             valid_mask_lst = [[1] * len(input_ids) for input_ids in input_ids_lst]
+#             position_ids_lst = [list(range(len(x["query_input_ids"]))) +
+#                                 list(range(len(x["doc_input_ids"]))) for x in batch]
 
-            # The 2D tensors are padded NOT to a standard length (transformer seq. length), but to the max_len in the batch!
-            data = {
-                "input_ids": pack_tensor_2D(input_ids_lst, default=0, dtype=torch.int64),
-                # int64 is required by torch nn.Embedding :(
-                "token_type_ids": pack_tensor_2D(token_type_ids_lst, default=0, dtype=torch.int64),
-                "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
-                "position_ids": pack_tensor_2D(position_ids_lst, default=0, dtype=torch.int64),
-            }
-            qid_lst = [x['qid'] for x in batch]  # GEO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
-            docid_lst = [x['docid'] for x in batch]
-            if self.mode == "train":
-                # labels holds the in-batch indices of the relevant doc IDs for each query
-                labels = [[j for j in range(len(docid_lst)) if docid_lst[j] in x['rel_docs']] for x in batch]
-                data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int64, length=len(batch))
-            return data, qid_lst, docid_lst
+#             # The 2D tensors are padded NOT to a standard length (transformer seq. length), but to the max_len in the batch!
+#             data = {
+#                 "input_ids": pack_tensor_2D(input_ids_lst, default=0, dtype=torch.int64),
+#                 # int64 is required by torch nn.Embedding :(
+#                 "token_type_ids": pack_tensor_2D(token_type_ids_lst, default=0, dtype=torch.int64),
+#                 "valid_mask": pack_tensor_2D(valid_mask_lst, default=0, dtype=torch.int64),
+#                 "position_ids": pack_tensor_2D(position_ids_lst, default=0, dtype=torch.int64),
+#             }
+#             qid_lst = [x['qid'] for x in batch]  # GEO: this can be avoided by returning qid, docid as part of a tuple in __getitem__
+#             docid_lst = [x['docid'] for x in batch]
+#             if self.mode == "train":
+#                 # labels holds the in-batch indices of the relevant doc IDs for each query
+#                 labels = [[j for j in range(len(docid_lst)) if docid_lst[j] in x['rel_docs']] for x in batch]
+#                 data['labels'] = pack_tensor_2D(labels, default=-1, dtype=torch.int64, length=len(batch))
+#             return data, qid_lst, docid_lst
 
-        return collate_function
+#         return collate_function
 
-    def __len__(self):
-        return len(self.qids)
+#     def __len__(self):
+#         return len(self.qids)
 
-    def __getitem__(self, item):
-        qid, pid = self.qids[item], self.pids[item]
-        query_input_ids, doc_input_ids = self.queries[qid], self.collection[pid]
-        query_input_ids = query_input_ids[:self.max_query_length]
-        query_input_ids = [self.cls_id] + query_input_ids + [self.sep_id]
-        doc_input_ids = doc_input_ids[:self.max_doc_length]
-        doc_input_ids = [self.cls_id] + doc_input_ids + [self.sep_id]
+#     def __getitem__(self, item):
+#         qid, pid = self.qids[item], self.pids[item]
+#         query_input_ids, doc_input_ids = self.queries[qid], self.collection[pid]
+#         query_input_ids = query_input_ids[:self.max_query_length]
+#         query_input_ids = [self.cls_id] + query_input_ids + [self.sep_id]
+#         doc_input_ids = doc_input_ids[:self.max_doc_length]
+#         doc_input_ids = [self.cls_id] + doc_input_ids + [self.sep_id]
 
-        ret_val = {
-            "query_input_ids": query_input_ids,
-            "doc_input_ids": doc_input_ids,
-            "qid": qid,
-            "docid": pid
-        }
-        if self.mode == "train":
-            ret_val["rel_docs"] = self.qrels[qid]
-        return ret_val
+#         ret_val = {
+#             "query_input_ids": query_input_ids,
+#             "doc_input_ids": doc_input_ids,
+#             "qid": qid,
+#             "docid": pid
+#         }
+#         if self.mode == "train":
+#             ret_val["rel_docs"] = self.qrels[qid]
+#         return ret_val
