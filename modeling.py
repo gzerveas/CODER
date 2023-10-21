@@ -147,7 +147,7 @@ class Scorer(nn.Module):
     Directly scores final document representations in the "decoder".
     Exploits cross-attention between encoded query states and documents in the preceding decoder layer.
     The decoder creates its Queries from the layer below it, and takes the Keys and Values from the output of the encoder.
-    TODO: What is the effect of LayerNormalization? Doesn't it flatten the scores distribution?
+    NOTE: What is the effect of LayerNormalization? Doesn't it flatten the scores distribution?
     """
 
     def __init__(self, d_model, scoring_mode=None):
@@ -197,7 +197,7 @@ class CrossAttentionScorer(Scorer):
     """
     Applies multi-headed attention between query term embeddings and final document representations in the "decoder".
     Final document representations are used as Queries, (query) encoder representations are used as Keys and Values.
-    TODO: Experiment with the reverse? cand_emb as K, V, query_emb as Q
+    NOTE: Experiment with the reverse? cand_emb as K, V, query_emb as Q
     """
 
     def __init__(self, d_model, scoring_mode=None):
@@ -437,7 +437,7 @@ class RelevanceListnetLoss(BaseLoss):
 
         # NOTE: _labels_values = _labels_values / torch.sum(is_relevant, dim=1).unsqueeze(dim=1)
         # is equivalent but interestingly much slower than setting -Inf and computing Softmax; maybe due to CUDA Softmax code
-        labels_probs = torch.nn.Softmax(dim=1)(_labels_values)
+        labels_probs = torch.nn.Softmax(dim=1)(_labels_values)  #  _labels_values # TODO: RESTORE! this is only to test uniform smoothing
 
         if padding_mask is not None:
             # labels don't need to be masked, since they already get -Inf for padding in collate_fn
@@ -487,7 +487,7 @@ class BiasRegularizationLoss(BaseLoss):
 
 
 class MultiTierLoss(BaseLoss):
-    # TODO: This is designed to work with formatting=="indices". Needs to be updated
+    # NOTE: This is designed to work with formatting=="indices". Needs to be updated
     """
     Uses multiple tiers of relevance for candidate documents, determined by their ranking from the candidate retrieval method.
     Encourages that the similarity score between the query and all documents in each tier is higher than the similarity
@@ -552,7 +552,7 @@ class MultiTierLoss(BaseLoss):
         loop O(batch_size)
         Use `labels` to determine indices of ground truth and negative documents, and use them
         to call `compute_diffs`.
-        # TODO: relies on the easy-to-lift assumption that all g.t. are at the beginning
+        # NOTE: relies on the easy-to-lift assumption that all g.t. are at the beginning
 
         :param scores: (batch_size, num_cands) relevance scores for each candidate document and query.
         :param labels: (batch_size, num_cands) int tensor which for each query (row) contains the indices (positions) of the

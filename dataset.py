@@ -667,7 +667,7 @@ class MYMARCO_Dataset(Dataset):
         if self.mode == "train" or self.inject_ground_truth:
             label_source = self.qrels
             if (self.target_scores is not None):  #and (qid in self.target_scores):
-                # first condition cannot be true in case of 'dev' mode (see __init__, loading of target_scores)
+                # first condition in above line cannot be true in case of 'dev' mode (see __init__, loading of target_scores)
                 # WARNING: second condition allows using usual qrels (instead of soft labels) when target_scores are not provided for all qids.
                 # It may be better to fail in case of missing target_scores, as applying the same transformation to qrels and target_scores is probably undesirable
                 if qid not in self.target_scores:
@@ -683,14 +683,36 @@ class MYMARCO_Dataset(Dataset):
             rel_cands, rel_scores = zip(*sorted(((int(docid), score) for docid, score in label_source[qid].items() if score >= self.include_at_level), key=itemgetter(1), reverse=True)[:self.max_inj_relevant])
             rel_cands = list(rel_cands)
             if self.label_normalization is not None:
-                rel_scores = np.asarray(normalize_batch(torch.tensor(rel_scores, dtype=torch.float32), self.label_normalization), dtype=np.float16) # (len(rel_scores),) tensor
+                rel_scores = np.asarray(normalize_batch(torch.tensor(rel_scores, dtype=torch.float32), self.label_normalization), dtype=np.float16)  # (len,) array
             else:
-                rel_scores = np.asarray(rel_scores, dtype=np.float16)
+                rel_scores = np.asarray(rel_scores, dtype=np.float16)  # (len,) tensor
 
             if self.score_booster is not None:
                 # Applies score boosting function (i.e. a score multiplier) to rel_scores, based on the relevance of the corresponding doc_ids
                 pid2relevance = {pid: relevance for pid, relevance in self.qrels[qid].items() if relevance >= self.relevant_at_level}
                 rel_scores = self.score_booster.boost_func(rel_scores, pid2relevance)
+
+            ############ NOTE: This is only to test uniform smoothing!
+            # new_scores = torch.full((len(doc_ids),), float('-inf'), dtype=torch.float32)
+            # new_scores[:len(rel_scores)] = torch.tensor(rel_scores, dtype=torch.float32)
+            # rel_scores = np.asarray(torch.nn.Softmax(dim=0)(new_scores))
+            # if self.mode == 'train':
+            #     num_relevant = len(self.qrels[qid])  # assuming only > 0 labels contained (relevant_at_level > 0)
+            #     # Variant 1: uniformly redistribute transformed scores coming from rNN-based target scores
+            #     weight_gt_relevant = rel_scores[:num_relevant].sum()
+            #     rel_scores[:num_relevant] = weight_gt_relevant / num_relevant
+            #     rel_scores[num_relevant:] = (1 - weight_gt_relevant) / (len(rel_scores) - num_relevant)
+            #     # Variant 2: Uniformly redistribute equal proporion as above among max_inj_relevant randomly sampled candidates
+            #     weight_gt_relevant = rel_scores[:num_relevant].sum()
+            #     rel_scores[:num_relevant] = weight_gt_relevant / num_relevant
+            #     sampled_cand_inds = np.random.choice(np.arange(num_relevant, len(rel_scores)),
+            #                                          size=self.max_inj_relevant, replace=False)
+            #     rel_scores[sampled_cand_inds] = (1 - weight_gt_relevant) / self.max_inj_relevant
+            #     # Variant 3: uniformly redistribute fixed proportion of original scores
+            #     redistribution_factor = 0.99
+            #     rel_scores[:num_relevant] *= (1-redistribution_factor)
+            #     rel_scores[num_relevant:] = redistribution_factor / (len(rel_scores) - num_relevant)
+            ############ NOTE: Uniform smoothing above!
 
             # also covers case of dynamic candidates, in which initially doc_ids = [] and then doc_ids = rel_cands
             new_cand_ids = (rel_cands + [candid for candid in doc_ids if candid not in set(rel_cands)])
